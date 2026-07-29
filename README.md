@@ -19,7 +19,7 @@ conflict.
 | `runtime` | The generic runtime: plugin registration, the single-instance lease, and the run loop. |
 | `plugins/wasm` | The WASM execution domain. Currently a stub; the deterministic interpreter is a separate, larger effort. |
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
-| `internal/state` | (Empty) The L2 SMT state store and witnessing state accessor. |
+| `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
 | `internal/codec` | (Empty) The canonical binary encoding for every consensus-visible structure. |
 | `internal/ledger` | (Empty) The input pipeline: ledger following, canonical ordering, per-domain cursor. |
 | `internal/batch` | (Empty) The STF driver, batch slicing, commitment, and DA bundle builder. |
@@ -47,10 +47,15 @@ GitHub org, so `go.mod` currently `replace`s the canonical path with a pinned co
 `feature/merkle-state-root` branch (the SMT work this executor's state layer depends on):
 
 ```
-replace github.com/zenon-network/go-zenon => github.com/digitalSloth/go-zenon v0.0.0-20260728183455-2d3fff6bee7b
+replace github.com/zenon-network/go-zenon => github.com/digitalSloth/go-zenon v0.0.0-20260729090002-56ce2c384966
 ```
 
-To bump the pin to a later commit on that fork: `go get github.com/digitalSloth/go-zenon@<branch-or-commit>`, then
-`go mod edit -replace github.com/zenon-network/go-zenon=github.com/digitalSloth/go-zenon@<resolved-pseudo-version>`.
-Once the Settlement contract lands and both repos move to `zenon-network`, drop the `replace`
-entirely and pin `require github.com/zenon-network/go-zenon` directly.
+The fork's `go.mod` still declares itself `module github.com/zenon-network/go-zenon` (it hasn't been
+renamed), so `go get github.com/digitalSloth/go-zenon@<ref>` fails the module-path check — that
+command resolves the path directly, and `replace` only skips the check for its right-hand side
+target, not for a plain `go get`. To bump the pin: get the target commit's hash and UTC commit
+timestamp (`git log -1 --format='%H %cI' <ref>` in a checkout of the fork), build the pseudo-version
+`v0.0.0-<YYYYMMDDHHMMSS>-<first 12 hex chars of the hash>`, and set both the `require` and `replace`
+lines in `go.mod` to it directly, then run `go mod tidy`. Once the Settlement contract lands and
+both repos move to `zenon-network`, drop the `replace` entirely and pin
+`require github.com/zenon-network/go-zenon` directly.
