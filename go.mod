@@ -2,7 +2,7 @@ module github.com/digitalSloth/go-executor
 
 go 1.23
 
-require github.com/zenon-network/go-zenon v0.0.0-20260728183455-2d3fff6bee7b
+require github.com/zenon-network/go-zenon v0.0.0-20260729090002-56ce2c384966
 
 require (
 	github.com/btcsuite/btcd/btcutil v1.1.3 // indirect
@@ -30,4 +30,4 @@ require (
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
 )
 
-replace github.com/zenon-network/go-zenon => github.com/digitalSloth/go-zenon v0.0.0-20260728183455-2d3fff6bee7b
+replace github.com/zenon-network/go-zenon => github.com/digitalSloth/go-zenon v0.0.0-20260729090002-56ce2c384966
