@@ -20,7 +20,7 @@ conflict.
 | `plugins/wasm` | The WASM execution domain. Currently a stub; the deterministic interpreter is a separate, larger effort. |
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
 | `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
-| `internal/codec` | (Empty) The canonical binary encoding for every consensus-visible structure. |
+| `internal/codec` | The canonical binary encoding for every consensus-visible structure. |
 | `internal/ledger` | (Empty) The input pipeline: ledger following, canonical ordering, per-domain cursor. |
 | `internal/batch` | (Empty) The STF driver, batch slicing, commitment, and DA bundle builder. |
 | `internal/recovery` | (Empty) On-disk layout and the crash-recovery state machine. |
