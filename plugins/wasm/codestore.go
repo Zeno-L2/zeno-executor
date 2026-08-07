@@ -1,0 +1,151 @@
+package wasm
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/zenon-network/go-zenon/common/crypto"
+)
+
+// entryKind partitions the code store's flat key space into the four entry shapes §4
+// describes. Kind and key together identify a stored value.
+type entryKind uint8
+
+const (
+	// entryDeployChunk holds one chunk's raw bytes, keyed by (code_hash, chunk_index).
+	// Written by DecodeInput on an input_kind = 3; read by Apply on kind 4/5.
+	entryDeployChunk entryKind = iota
+	// entryPendingRecord holds a chunked deployment's {metadata_hash, total_size, chunk_count,
+	// deployer_l1_address}, keyed by code_hash. Written by DecodeInput on kind 2; read by Apply
+	// on kind 4/5.
+	entryPendingRecord
+	// entryAssembledModule holds the concatenated, pre-instrumentation module bytes, keyed by
+	// code_hash. Written by Apply on kind 4/5; read by Apply on kinds 0/1.
+	entryAssembledModule
+	// entryInstrumentedModule holds the post-instrumentation module bytes, keyed by CodeHash.
+	// Written by Apply on kind 4/5 and, on re-derivation, by Apply on kinds 0/1; read by Apply
+	// on kinds 0/1.
+	entryInstrumentedModule
+)
+
+func (k entryKind) dirName() string {
+	switch k {
+	case entryDeployChunk:
+		return "deploy-chunk"
+	case entryPendingRecord:
+		return "pending-record"
+	case entryAssembledModule:
+		return "assembled"
+	case entryInstrumentedModule:
+		return "instrumented"
+	default:
+		panic(fmt.Sprintf("wasm: code store: unknown entry kind %d", k))
+	}
+}
+
+var allEntryKinds = []entryKind{entryDeployChunk, entryPendingRecord, entryAssembledModule, entryInstrumentedModule}
+
+// codeStore is the local, non-consensus, checksummed disk tier the D21 carve-out permits
+// Apply and DecodeInput to read and memoize into. There is no in-memory byte tier: the OS page
+// cache is sufficient at this scale (§4). Every entry carries a SHA3-256 checksum of its own
+// bytes, and a checksum mismatch — corruption, or a write that never completed — is treated
+// exactly as absence; the caller's obligation to turn "absent" into a halt lives above this
+// type, not in it.
+type codeStore struct {
+	root string
+}
+
+// newCodeStore opens (creating if necessary) the disk-tier store rooted at root.
+func newCodeStore(root string) (*codeStore, error) {
+	if root == "" {
+		return nil, fmt.Errorf("wasm: code store: path is required")
+	}
+	for _, k := range allEntryKinds {
+		if err := os.MkdirAll(filepath.Join(root, k.dirName()), 0o755); err != nil {
+			return nil, fmt.Errorf("wasm: code store: %w", err)
+		}
+	}
+	return &codeStore{root: root}, nil
+}
+
+// path derives the on-disk location for (kind, key): a fixed-width digest of key under kind's
+// directory, so an arbitrary-length composite key (e.g. code_hash ‖ chunk_index) never
+// produces an invalid or colliding filename.
+func (s *codeStore) path(kind entryKind, key []byte) string {
+	digest := crypto.Hash(key)
+	return filepath.Join(s.root, kind.dirName(), hex.EncodeToString(digest))
+}
+
+// put writes value under (kind, key), appending a SHA3-256 checksum of value and committing
+// via a temp-file-then-rename so a process interrupted mid-write leaves the prior entry (or
+// absence) intact, never a partially-written file at the final path.
+func (s *codeStore) put(kind entryKind, key, value []byte) error {
+	checksum := crypto.Hash(value)
+	buf := make([]byte, 0, len(value)+len(checksum))
+	buf = append(buf, value...)
+	buf = append(buf, checksum...)
+
+	dst := s.path(kind, key)
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("wasm: code store: put: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename below succeeds
+
+	if _, err := tmp.Write(buf); err != nil {
+		tmp.Close()
+		return fmt.Errorf("wasm: code store: put: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("wasm: code store: put: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("wasm: code store: put: %w", err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("wasm: code store: put: %w", err)
+	}
+	return nil
+}
+
+// delete removes the entry at (kind, key), treating absence as success: the caller's contract is
+// "this entry must not exist afterwards", and a missing file already satisfies it. A non-nil
+// error means a genuine I/O fault, which the caller turns into a halt.
+func (s *codeStore) delete(kind entryKind, key []byte) error {
+	if err := os.Remove(s.path(kind, key)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("wasm: code store: delete: %w", err)
+	}
+	return nil
+}
+
+// get reads the entry at (kind, key). ok is false, with a nil error, for both a missing file
+// and a checksum mismatch — the two are indistinguishable by design, since a mismatch can only
+// mean corruption or an incomplete write, either of which is exactly "I do not have this
+// entry." A non-nil error means a genuine I/O fault distinct from absence.
+func (s *codeStore) get(kind entryKind, key []byte) (value []byte, ok bool, err error) {
+	b, err := os.ReadFile(s.path(kind, key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("wasm: code store: get: %w", err)
+	}
+
+	const checksumSize = 32 // SHA3-256
+	if len(b) < checksumSize {
+		return nil, false, nil
+	}
+	value, checksum := b[:len(b)-checksumSize], b[len(b)-checksumSize:]
+	if !bytes.Equal(checksum, crypto.Hash(value)) {
+		return nil, false, nil
+	}
+	return value, true, nil
+}
