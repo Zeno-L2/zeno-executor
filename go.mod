@@ -2,7 +2,10 @@ module github.com/digitalSloth/go-executor
 
 go 1.23
 
-require github.com/zenon-network/go-zenon v0.0.0-20260729090002-56ce2c384966
+require (
+	github.com/tetratelabs/wazero v1.8.2
+	github.com/zenon-network/go-zenon v0.0.0-20260729090002-56ce2c384966
+)
 
 require (
 	github.com/btcsuite/btcd/btcutil v1.1.3 // indirect

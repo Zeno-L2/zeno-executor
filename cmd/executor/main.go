@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/digitalSloth/go-executor/plugins/wasm"
@@ -16,10 +17,14 @@ func main() {
 	executorID := flag.String("executor-id", "", "bonded executor identity; keys the single-instance lease")
 	storagePath := flag.String("storage-path", "./data", "root directory for on-disk state")
 	domainID := flag.Uint("domain-id", 0, "execution domain served by this process")
+	network := flag.String("network", "", "network name (\"mainnet\" | \"testnet\" | a named devnet); fixes the WASM domain's chainID")
 	flag.Parse()
 
 	if *executorID == "" {
 		log.Fatal("executor: -executor-id is required")
+	}
+	if *network == "" {
+		log.Fatal("executor: -network is required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -30,7 +35,15 @@ func main() {
 		ExecutorID:  *executorID,
 		StoragePath: *storagePath,
 	})
-	exec.Register(wasm.New())
+
+	plugin, err := wasm.New(wasm.Config{
+		NetworkName:   *network,
+		CodeStorePath: filepath.Join(*storagePath, "wasm-code"),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	exec.Register(plugin)
 
 	if err := exec.Run(ctx); err != nil {
 		log.Fatal(err)

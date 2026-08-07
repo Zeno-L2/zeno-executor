@@ -8,6 +8,9 @@ import (
 	"context"
 
 	"github.com/zenon-network/go-zenon/common/trie"
+	"github.com/zenon-network/go-zenon/common/types"
+
+	"github.com/digitalSloth/go-executor/internal/codec"
 )
 
 // Path is the 32-byte, already-derived SMT position — the same type the shared path-native
@@ -36,26 +39,29 @@ type StateDiffEntry struct {
 	Value []byte
 }
 
-// Event is a domain-defined log entry emitted during Apply.
-type Event struct {
-	Topic []byte
-	Data  []byte
-}
-
-// OutboxMessage is a domain-defined message destined for L1 once its batch finalizes (e.g.
-// a withdrawal release or a call into another embedded contract).
-type OutboxMessage struct {
-	Kind    uint8
-	Payload []byte
-}
-
 // Effects is the full, pure output of one Apply call: the staged state diff plus everything
 // the runtime folds into the input's receipt, the batch's event/outbox roots, and its
-// AssetFlowSummary.
+// AssetFlowSummary. Every deterministic execution outcome, including every failure status, is
+// returned as Effects with a nil error — see Apply's doc comment for the halt/status split.
 type Effects struct {
+	// Status is the §15 receipt status ordinal.
+	Status codec.Status
+	// GasUsed is committed in the receiptRoot; its value per status is a domain invariant, not
+	// a free choice (§27.7).
+	GasUsed uint64
+	// ContractID is the receipt's contractId; zero when no contract target was involved.
+	ContractID types.Hash
+	// CodeHash is the receipt's codeHash; zero when nothing executed.
+	CodeHash types.Hash
+	// AbortCode is the §7.5 abort code of a REVERT: the code passed to env.abort, or for a run
+	// returning r < 0 the value (-r) truncated to i32. It is 0 for every other status. It is
+	// in-process only — no wire format carries it today.
+	AbortCode int32
+	// ClaimedDeposit is zero on any failure status (§14.3).
+	ClaimedDeposit codec.U256
 	StateDiff      []StateDiffEntry
-	Events         []Event
-	OutboxMessages []OutboxMessage
+	Events         []codec.Event
+	OutboxMessages []codec.OutboxMessage
 	ReturnData     []byte
 }
 
@@ -70,18 +76,57 @@ type StateInit struct {
 // interprets the raw L1 payload; Apply only ever sees the typed result.
 type Input interface{}
 
+// InputContext is the per-input context the runtime observes on L1 that the canonical wire
+// encoding a domain decodes does not itself carry. It crosses the seam as a plain Go struct,
+// in-process only: none of these facts are ever committed or sent over the wire by this
+// package.
+type InputContext struct {
+	GlobalInputIndex uint64
+	MomentumHeight   uint64
+	MomentumTime     uint64
+	// L1Sender is the raw L1 sender address of the source account-block.
+	L1Sender types.Address
+	// SourceData is domain-defined bytes from the source account-block that the domain's
+	// canonical input encoding does not carry (e.g. chunk bytes for a chunked deployment).
+	SourceData []byte
+}
+
 // Domain is the state-transition-function contract every execution domain implements. It is
 // the only code a domain author writes: a pure function plus decoding and genesis.
 type Domain interface {
 	// Genesis returns the domain's initial state, seeded once before the first input.
 	Genesis() StateInit
 
-	// DecodeInput turns an opaque L1 payload into a typed, structurally-valid Input. It
-	// MUST reject anything that is not well-formed for this domain.
-	DecodeInput(payload []byte) (Input, error)
+	// DecodeInput turns an opaque L1 payload into a typed, structurally-valid Input. It MUST
+	// reject anything that is not well-formed for this domain. Its error return means halt the
+	// binary — an internal or local-availability fault, never a consensus outcome; a
+	// deterministic decode-time rejection the domain wants recorded as a receipt (e.g. an
+	// unsupported input kind) is instead carried forward as an Input for Apply to turn into a
+	// status.
+	DecodeInput(ctx InputContext, payload []byte) (Input, error)
 
 	// Apply is the pure state-transition function: deterministic, side-effect-free, and a
-	// function only of state and in. No clock, no RNG, no network, no environment.
+	// function only of state and in. No clock, no RNG, no network, no wall clock, no other
+	// process environment.
+	//
+	// Apply's error return means halt the binary, never a consensus outcome: every
+	// deterministic execution outcome, including every failure status, MUST be returned as
+	// Effects with a nil error, since the runtime discards Effects entirely on a non-nil error
+	// and a domain's own failure-path effects (e.g. a refund owed independently of the failure)
+	// would be lost with it.
+	//
+	// Read-and-write local-store carve-out: Apply MAY read a local content-addressed store,
+	// provided every entry it reads is verified against a hash obtained from state or from the
+	// input, and provided a miss or a verification failure is reported through the error
+	// channel (halt) and never as a receipt status or a state difference. Apply MAY write
+	// entries to that same store, provided every entry written is a pure deterministic function
+	// of state and the input — a content-addressed blob plus its integrity checksum, and
+	// nothing else. Such a write is memoization only: it is never observable in the returned
+	// Effects, it never changes the receipt or state outcome of any later call, and its only
+	// effect is that work already derived need not be re-derived — a missing entry can only
+	// halt this node, never alter what any node computes. An entry read back is still
+	// hash-verified before use, exactly as the read rule requires. Apply MUST NOT read from, or
+	// write to, anything else in the environment.
 	Apply(state StateAccess, in Input) (Effects, error)
 }
 
