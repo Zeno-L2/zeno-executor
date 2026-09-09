@@ -4,11 +4,12 @@ The off-chain executor binary for Zenon's Phase 1 off-chain execution layer: a g
 domain-agnostic runtime that runs a domain's deterministic state-transition function
 off-consensus and settles commitments on L1 via the Settlement embedded contract.
 
-Normative specs live in `go-zenon`:
-[`SPEC.md`](../go-zenon/docs/notes/offchain-execution/phase-1/SPEC.md) (on-chain protocol),
-[`EXECUTOR.md`](../go-zenon/docs/notes/offchain-execution/phase-1/EXECUTOR.md) (this binary),
-[`ARCHITECTURE.md`](../go-zenon/docs/notes/offchain-execution/phase-1/ARCHITECTURE.md) (design
-companion). This repo implements the executor side of that split; `go-zenon` governs on any
+Normative specs live in the **`zeno`** documentation repository, under `phase-1/`:
+`SPEC.md` (on-chain protocol), `EXECUTOR.md` (this binary), `ARCHITECTURE.md` (design
+companion), `AMENDMENTS.md` (the wire-format and normative-text decisions this repo's
+implementation work has forced), and `CHANGELOG.md`. Those copies are canonical: an
+amendment is applied there first and this repo builds against the result. This repo
+implements the executor side of the split and `zeno`'s `phase-1/` set governs on any
 conflict.
 
 ## Layout
@@ -17,7 +18,7 @@ conflict.
 |---|---|
 | `domain` | The plugin seam every execution domain implements (`Domain`, `Source`, `StateAccess`, `Effects`) — public, importable by out-of-tree domain plugins. |
 | `runtime` | The generic runtime: plugin registration, the single-instance lease, and the run loop. |
-| `plugins/wasm` | The WASM execution domain. Currently a stub; the deterministic interpreter is a separate, larger effort. |
+| `plugins/wasm` | The WASM execution domain: the deterministic Core 1.0 interpreter — binary reader and validator, gas metering and instrumentation, the three-import host ABI, and `Apply` for all six input kinds. |
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
 | `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
 | `internal/codec` | The canonical binary encoding for every consensus-visible structure. |

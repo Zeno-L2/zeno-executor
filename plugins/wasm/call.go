@@ -2,7 +2,6 @@ package wasm
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -67,10 +66,13 @@ func (p *Plugin) applyCall(state domain.StateAccess, ctx domain.InputContext, ar
 		return domain.Effects{}, fmt.Errorf("wasm: apply call: pre code hash leaf has width %d, want %d", len(preCodeHashLeaf), len(types.Hash{}))
 	}
 
-	gasBudget := args.PlasmaLimit
-	if gasBudget > math.MaxInt64 {
-		gasBudget = math.MaxInt64 // D24
+	// Settlement rejects a plasma_limit above MaxInputGas at send validation, so an admitted
+	// input never carries one. A larger budget here means this node's view differs from the
+	// network's, which is a halt rather than a committed status.
+	if args.PlasmaLimit > MaxInputGas {
+		return domain.Effects{}, fmt.Errorf("wasm: apply call: plasma_limit %d exceeds MaxInputGas %d", args.PlasmaLimit, uint64(MaxInputGas))
 	}
+	gasBudget := args.PlasmaLimit
 	s := settlement{
 		ContractID:       args.TargetContract,
 		GlobalInputIndex: ctx.GlobalInputIndex,

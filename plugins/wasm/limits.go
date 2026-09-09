@@ -10,6 +10,14 @@ const (
 	MaxReturnData = 4 << 10
 	// MaxExecutionResult bounds the final assembled ExecutionResult.
 	MaxExecutionResult = 32 << 10
+	// MaxResultBlob bounds the ContractEffects blob a contract returns, checked before the
+	// blob is decoded. It keeps the decode, and the per-entry SMT key derivation that follows
+	// it, proportional to a consensus constant rather than to the contract's declared memory.
+	MaxResultBlob = 64 << 10
+	// MaxInputGas is the ceiling on a CallL2 or Deposit plasma_limit, and so on the gas budget
+	// one input can authorize. Settlement rejects a larger plasma_limit at send validation, so
+	// a budget above this is one no admitted input carries.
+	MaxInputGas = 1_000_000_000
 	// MaxCodeSize bounds a pre-instrumentation assembled module.
 	MaxCodeSize = 256 << 10
 	// MaxChunkCount bounds a chunked deployment's declared chunk_count.

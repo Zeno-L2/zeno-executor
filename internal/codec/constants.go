@@ -9,7 +9,7 @@ const (
 	SerializationVersion   uint16 = 1
 	StateDiffVersion       uint16 = 1
 	ExecutionResultVersion uint16 = 1
-	ReceiptVersion         uint16 = 1
+	ReceiptVersion         uint16 = 2
 	OutboxVersion          uint16 = 1
 	DAModeVersion          uint16 = 1
 )
@@ -23,9 +23,13 @@ const (
 	MaxEventDataSize      = 1 << 10
 	MaxTopicsPerEvent     = 4
 	MaxOutboxPerExecution = 32
-	MaxOutboxPayloadSize  = 8 << 10
-	MaxAssetsPerBatch     = 16
-	MaxCallPayload        = 8 << 10
+	// MaxOutboxPerResult is the ExecutionResult outbox bound (§27.4): the contract's own
+	// MaxOutboxPerExecution messages plus one slot for the runtime-emitted deposit refund
+	// (§18.5), which sits outside the contract's own cap.
+	MaxOutboxPerResult   = MaxOutboxPerExecution + 1
+	MaxOutboxPayloadSize = 8 << 10
+	MaxAssetsPerBatch    = 16
+	MaxCallPayload       = 8 << 10
 )
 
 // OutboxMessage kind ordinals (§27.4).

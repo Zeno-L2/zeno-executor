@@ -56,6 +56,11 @@ func New(cfg Config) (*Plugin, error) {
 	}, nil
 }
 
+// Close releases the resources the plugin's engine owns. The Plugin is unusable afterward.
+func (p *Plugin) Close() error {
+	return p.engine.Close()
+}
+
 // Genesis returns the empty initial state; the WASM domain seeds no leaves before its first
 // input.
 func (p *Plugin) Genesis() domain.StateInit {

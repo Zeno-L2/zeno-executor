@@ -18,6 +18,7 @@ func newTestPlugin(t *testing.T) *Plugin {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { _ = p.Close() })
 	return p
 }
 
@@ -164,6 +165,7 @@ func TestChainIDMatchesFormulaAndIsPerNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { _ = p1.Close() })
 	want := hashOf(crypto.Hash([]byte("ZENON_WASM_L2:"), []byte("mainnet")))
 	if p1.chainID != want {
 		t.Fatalf("chainID = %x, want %x", p1.chainID, want)
@@ -173,6 +175,7 @@ func TestChainIDMatchesFormulaAndIsPerNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { _ = p2.Close() })
 	if p1.chainID != p2.chainID {
 		t.Fatalf("chainID is not deterministic across constructions for the same network: %x != %x", p1.chainID, p2.chainID)
 	}
@@ -181,6 +184,7 @@ func TestChainIDMatchesFormulaAndIsPerNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { _ = p3.Close() })
 	if p1.chainID == p3.chainID {
 		t.Fatal("chainID is the same for two different network names, want distinct")
 	}
@@ -205,6 +209,7 @@ func TestDecodeInputHaltsOnCodeStoreWriteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { _ = p.Close() })
 
 	// Make the deploy-chunk subdirectory unwritable so the store's temp-file-then-rename write
 	// fails with a genuine I/O fault, distinct from the decode-time rejections above.
@@ -301,5 +306,15 @@ func TestApplyRejectsForeignInputType(t *testing.T) {
 	p := newTestPlugin(t)
 	if _, err := p.Apply(nil, "not a wasm.Input"); err == nil {
 		t.Fatal("Apply: got nil error for a foreign Input type, want an error")
+	}
+}
+
+func TestPluginClose(t *testing.T) {
+	p, err := New(Config{NetworkName: "testnet", CodeStorePath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: got error %v, want nil", err)
 	}
 }

@@ -97,6 +97,7 @@ func sampleReceipt() Receipt {
 		CodeHash:      fillHash(0x03),
 		Status:        StatusSuccess,
 		GasUsed:       12345,
+		AbortCode:     -7,
 		StateDiffHash: fillHash(0x04),
 		ReturnHash:    fillHash(0x05),
 		EventRoot:     fillHash(0x06),
@@ -142,6 +143,47 @@ func TestReceiptUnknownStatus(t *testing.T) {
 	b[114] = 8
 	if _, err := DecodeReceipt(b); !errors.Is(err, ErrInvalidStatus) {
 		t.Fatalf("got %v, want ErrInvalidStatus", err)
+	}
+}
+
+func TestReceiptAbortCodeRoundTrip(t *testing.T) {
+	for _, abortCode := range []int32{42, -42, 0} {
+		rec := sampleReceipt()
+		rec.AbortCode = abortCode
+		b, err := rec.Encode()
+		if err != nil {
+			t.Fatalf("Encode(%d): %v", abortCode, err)
+		}
+		got, err := DecodeReceipt(b)
+		if err != nil {
+			t.Fatalf("Decode(%d): %v", abortCode, err)
+		}
+		if got != rec {
+			t.Errorf("abort_code %d: got %+v, want %+v", abortCode, got, rec)
+		}
+	}
+}
+
+func TestReceiptVersion1Rejected(t *testing.T) {
+	rec := sampleReceipt()
+	b, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	b[1] = 1 // receipt_version = 1, big-endian u16 low byte
+	if _, err := DecodeReceipt(b); !errors.Is(err, ErrUnknownVersion) {
+		t.Fatalf("got %v, want ErrUnknownVersion", err)
+	}
+}
+
+func TestReceiptTruncated(t *testing.T) {
+	rec := sampleReceipt()
+	b, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if _, err := DecodeReceipt(b[:len(b)-1]); !errors.Is(err, ErrTruncated) {
+		t.Fatalf("got %v, want ErrTruncated", err)
 	}
 }
 
