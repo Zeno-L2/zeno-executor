@@ -208,3 +208,84 @@ func TestSMTConformanceVectors(t *testing.T) {
 		})
 	}
 }
+
+// testPath returns a distinct 32-byte SMT path seeded from b.
+func testPath(b byte) trie.Path {
+	var p trie.Path
+	p[0] = b
+	return p
+}
+
+// TestApplyMixedPresentEmptyAndDelete applies a present-empty write and a delete in one diff.
+//
+// The two are different operations with different results: a present-empty write leaves the
+// path in the tree holding a zero-length value, a delete takes the path out of the tree
+// entirely, and the applier keeps them apart within a single diff. The expected post-root is
+// computed independently through the shared path-native core over the leaf set the diff
+// implies, so the applier is checked against the primitive the L1 side commits with rather
+// than against a constant.
+func TestApplyMixedPresentEmptyAndDelete(t *testing.T) {
+	emptied := testPath(0xA1)
+	deleted := testPath(0xB2)
+	untouched := testPath(0xC3)
+
+	s := openTestStore(t)
+	if _, err := s.Apply([]domain.StateDiffEntry{
+		{Path: emptied, Value: []byte("a")},
+		{Path: deleted, Value: []byte("b")},
+		{Path: untouched, Value: []byte("c")},
+	}); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+
+	got, err := s.Apply([]domain.StateDiffEntry{
+		{Path: emptied, Value: []byte{}},
+		{Path: deleted, Value: nil},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	want, err := trie.RootOfLeaves(
+		[]trie.Path{emptied, untouched},
+		[][]byte{{}, []byte("c")},
+	)
+	if err != nil {
+		t.Fatalf("RootOfLeaves: %v", err)
+	}
+	if got != want {
+		t.Errorf("post-root = %x, want %x", got, want)
+	}
+
+	present, value, _, err := s.Prove(emptied)
+	if err != nil {
+		t.Fatalf("Prove(emptied): %v", err)
+	}
+	if !present {
+		t.Errorf("emptied: present = false, want true")
+	}
+	if len(value) != 0 {
+		t.Errorf("emptied: value = %x, want zero-length", value)
+	}
+
+	present, _, _, err = s.Prove(deleted)
+	if err != nil {
+		t.Fatalf("Prove(deleted): %v", err)
+	}
+	if present {
+		t.Errorf("deleted: present = true, want false")
+	}
+
+	// A present-empty leaf and an absent one give different roots: the same leaf set with
+	// emptied removed rather than emptied to zero length hashes differently.
+	absentRoot, err := trie.RootOfLeaves(
+		[]trie.Path{untouched},
+		[][]byte{[]byte("c")},
+	)
+	if err != nil {
+		t.Fatalf("RootOfLeaves(absent): %v", err)
+	}
+	if got == absentRoot {
+		t.Errorf("present-empty root == absent root, expected distinct")
+	}
+}

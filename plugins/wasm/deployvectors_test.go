@@ -1,0 +1,287 @@
+package wasm
+
+import (
+	"testing"
+
+	"github.com/zenon-network/go-zenon/common/types"
+
+	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+)
+
+// This file holds the deploy/upgrade and §7.2 rejection vectorSpecs, the fixture bodies they
+// need and the fixture-to-validator-rule map. All fixtures go through buildWasmModule/
+// runModuleSpec (fixtures_test.go); no ad-hoc WASM bytes, no new builder.
+
+// deployModule is the module CV-DEPLOY-1, CV-DEPLOY-2 and EXEC-DEPLOY-1 share: three
+// independent code stores, not one sequenced deployment.
+var deployModule = buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, nil))
+
+// upgradeModule is the new code all three upgrade vectors name.
+var upgradeModule = buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0x42, 0x01, 0x0B}, nil))
+
+// The three upgrade targets and their seeded old code hashes.
+var (
+	upCid       = repeatedHash(0x66) // EXEC-UPGRADE-1's target
+	oldCodeHash = repeatedHash(0x9A) // the keyCodeHash leaf EXEC-UPGRADE-1 seeds for upCid
+
+	undeployedCid = repeatedHash(0x67) // CV-UPGRADE-UNDEPLOYED-1's target: no leaves at all
+	unauthCid     = repeatedHash(0x68) // CV-UPGRADE-UNAUTH-1's target
+	unauthOldHash = repeatedHash(0x9B) // the keyCodeHash leaf CV-UPGRADE-UNAUTH-1 seeds
+
+	upOwnerHash = callerHash(repeatedAddr(0x01)) // EXEC-UPGRADE-1's seeded keyOwner leaf
+)
+
+// rejectionReasons binds each §7.2 rejection vector to the validator rule its module
+// exercises. A validation_rejection vector missing from this map fails the suite.
+var rejectionReasons = map[string]error{
+	"CV-REJECT-WASI-1":    module.ErrDisallowedImport,
+	"CV-REJECT-FLOAT-1":   module.ErrFloatInstruction,
+	"CV-REJECT-ATOMIC-1":  module.ErrAtomics,
+	"CV-REJECT-SIMD-1":    module.ErrSIMD,
+	"CV-REJECT-SIGNEXT-1": module.ErrSignExtension,
+	"CV-REJECT-SATCONV-1": module.ErrSaturatingConversion,
+}
+
+// deployVectors returns every deploy-shape and validation_rejection-shape vectorSpec, in the
+// file's table order.
+func deployVectors(t *testing.T) []vectorSpec {
+	t.Helper()
+
+	n := 0
+	newIdentity := func() (idx uint64, src types.Hash) {
+		idx = uint64(300 + n)
+		src = repeatedHash(byte(0xE1 + n))
+		n++
+		return
+	}
+
+	var specs []vectorSpec
+
+	// --- CV-DEPLOY-1/CV-DEPLOY-2/EXEC-DEPLOY-1: single-chunk sizing and finalize.
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-DEPLOY-1",
+			Purpose:                "single-chunk deployment start: chunk_count 1 for a module within MaxDeployChunkData",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args: codec.DeployStartArgs{
+				CodeHash:     CodeHash(deployModule),
+				MetadataHash: types.Hash{0x09},
+				TotalSize:    uint64(len(deployModule)),
+				ChunkCount:   1,
+			},
+			Module:     deployModule,
+			WantStatus: codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		ctx := stdCtx(idx)
+		ctx.SourceData = deployModule
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-DEPLOY-2",
+			Purpose:                "the single deploy chunk carrying the whole module at chunk_index 0",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    ctx,
+			SourceAccountBlockHash: src,
+			Args: codec.DeployChunkArgs{
+				CodeHash:   CodeHash(deployModule),
+				ChunkIndex: 0,
+				ChunkHash:  CodeHash(deployModule),
+			},
+			Module:     deployModule,
+			WantStatus: codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "EXEC-DEPLOY-1",
+			Purpose:                "deploy finalize: the three reserved leaves are written and ReturnData is code_hash then CodeHash",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(deployModule)},
+			Module:                 deployModule,
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// --- Upgrade: SUCCESS, undeployed target, unauthorized.
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "EXEC-UPGRADE-1",
+			Purpose:                "an authorized upgrade rewrites both code-hash leaves and returns the old then the new CodeHash",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             upCid,
+			Args:                   codec.UpgradeArgs{ContractID: upCid, NewCodeHash: CodeHash(upgradeModule)},
+			Module:                 upgradeModule,
+			ExtraPreState: map[domain.Path][]byte{
+				derive(upCid, keyCodeHash):      oldCodeHash[:],
+				derive(upCid, keyUpgradePolicy): {policyOwnerUpgradeable},
+				derive(upCid, keyOwner):         upOwnerHash[:],
+			},
+			WantStatus: codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-UPGRADE-UNDEPLOYED-1",
+			Purpose:                "an upgrade naming a contract_id with no code-hash leaf is VALIDATION_FAILED, not UNAUTHORIZED",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             undeployedCid,
+			Args:                   codec.UpgradeArgs{ContractID: undeployedCid, NewCodeHash: CodeHash(upgradeModule)},
+			Module:                 upgradeModule,
+			ExtraPreState:          nil,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-UPGRADE-UNAUTH-1",
+			Purpose:                "an upgrade of a deployed contract with no upgrade-policy leaf is UNAUTHORIZED and its receipt carries the unchanged CodeHash",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             unauthCid,
+			Args:                   codec.UpgradeArgs{ContractID: unauthCid, NewCodeHash: CodeHash(upgradeModule)},
+			Module:                 upgradeModule,
+			ExtraPreState: map[domain.Path][]byte{
+				derive(unauthCid, keyCodeHash): unauthOldHash[:],
+			},
+			WantStatus: codec.StatusUnauthorized,
+		})
+	}
+
+	// --- §7.2 rejections.
+
+	{
+		idx, src := newIdentity()
+		fixture := buildWasmModule(wasmModuleSpec{
+			Types:       []wasmFuncType{{Params: []byte{0x7F, 0x7F}, Results: []byte{0x7E}}},
+			Imports:     []wasmImport{{Module: "wasi_snapshot_preview1", Name: "fd_write", TypeIdx: 0}},
+			Funcs:       []wasmFunc{{TypeIdx: 0, Locals: []byte{0x00}, Body: []byte{0x42, 0x00, 0x0B}}},
+			MemoryPages: 1,
+			Exports: []wasmExport{
+				{Name: "memory", Kind: 0x02, Index: 0},
+				{Name: "run", Kind: 0x00, Index: 1}, // run follows the one import
+			},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-REJECT-WASI-1",
+			Purpose:                "a deploy of a module importing from wasi_snapshot_preview1",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
+			Module:                 fixture,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		fixture := buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0xA0, 0x42, 0x00, 0x0B}, nil))
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-REJECT-FLOAT-1",
+			Purpose:                "a deploy of a module using a float instruction",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
+			Module:                 fixture,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		fixture := buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0xFE, 0x10, 0x42, 0x00, 0x0B}, nil))
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-REJECT-ATOMIC-1",
+			Purpose:                "a deploy of a module using an atomic instruction",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
+			Module:                 fixture,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		fixture := buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0xFD, 0x0C, 0x42, 0x00, 0x0B}, nil))
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-REJECT-SIMD-1",
+			Purpose:                "a deploy of a module using a v128 instruction",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
+			Module:                 fixture,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		fixture := buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0xC0, 0x42, 0x00, 0x0B}, nil))
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-REJECT-SIGNEXT-1",
+			Purpose:                "a deploy of a module using a sign-extension instruction",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
+			Module:                 fixture,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		fixture := buildWasmModule(runModuleSpec(nil, 1, []byte{0x00}, []byte{0xFC, 0x00, 0x42, 0x00, 0x0B}, nil))
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-REJECT-SATCONV-1",
+			Purpose:                "a deploy of a module using a saturating float-to-int conversion",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
+			Module:                 fixture,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	return specs
+}

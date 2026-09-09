@@ -434,6 +434,40 @@ func (f successFixture) input(kind string) Input {
 	return Input{Ctx: ctx, Args: codec.CallL2Args{TargetContract: f.contractID, PlasmaLimit: 10_000_000, DepositAsset: codec.AssetID{}, DepositAmount: depositAmount, Payload: []byte("payload")}}
 }
 
+// Settlement rejects a plasma_limit above MaxInputGas at send validation, so an admitted input
+// never carries one. Seeing one means this node's view differs from the network's, which is a
+// halt: Apply returns an error rather than a committed status.
+func TestApplyPlasmaLimitAboveMaxInputGasHalts(t *testing.T) {
+	for _, kind := range []string{"CallL2", "Deposit"} {
+		t.Run(kind, func(t *testing.T) {
+			f := buildSuccessFixture(t)
+			p := newTestPlugin(t)
+			if err := p.store.put(entryAssembledModule, f.preCodeHash[:], f.raw); err != nil {
+				t.Fatalf("store.put assembled: %v", err)
+			}
+			if err := p.store.put(entryInstrumentedModule, f.codeHash[:], f.instrumented); err != nil {
+				t.Fatalf("store.put instrumented: %v", err)
+			}
+
+			in := f.input(kind)
+			switch args := in.Args.(type) {
+			case codec.CallL2Args:
+				args.PlasmaLimit = MaxInputGas + 1
+				in.Args = args
+			case codec.DepositArgs:
+				args.PlasmaLimit = MaxInputGas + 1
+				in.Args = args
+			default:
+				t.Fatalf("unexpected args type %T", in.Args)
+			}
+
+			if _, err := p.Apply(f.state(), in); err == nil {
+				t.Fatal("Apply returned no error, want a halt")
+			}
+		})
+	}
+}
+
 func TestApplySuccessEndToEnd(t *testing.T) {
 	for _, kind := range []string{"CallL2", "Deposit"} {
 		t.Run(kind, func(t *testing.T) {

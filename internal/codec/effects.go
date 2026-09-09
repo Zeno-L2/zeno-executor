@@ -240,7 +240,7 @@ func encodeContractEffectsBody(w *writer, c ContractEffects) error {
 	if err := writeEventList(w, c.Events, c.GlobalInputIndex); err != nil {
 		return err
 	}
-	if err := writeOutboxList(w, c.Outbox, c.GlobalInputIndex); err != nil {
+	if err := writeOutboxList(w, c.Outbox, c.GlobalInputIndex, MaxOutboxPerExecution); err != nil {
 		return err
 	}
 	w.bytes(c.ReturnData)
@@ -270,7 +270,7 @@ func decodeContractEffectsBody(r *reader) (ContractEffects, error) {
 	if c.Events, err = readEventList(r, c.GlobalInputIndex); err != nil {
 		return c, err
 	}
-	if c.Outbox, err = readOutboxList(r, c.GlobalInputIndex); err != nil {
+	if c.Outbox, err = readOutboxList(r, c.GlobalInputIndex, MaxOutboxPerExecution); err != nil {
 		return c, err
 	}
 	if c.ReturnData, err = r.bytes(^uint32(0)); err != nil {
@@ -291,9 +291,13 @@ type ExecutionResult struct {
 	PostStateRoot    types.Hash
 	StateDiff        []StateDiffEntry
 	Events           []Event
-	Outbox           []OutboxMessage
-	ReturnData       []byte
-	ClaimedDeposit   U256
+	// Outbox is bounded at MaxOutboxPerResult on decode. The codec places no constraint on
+	// which slot (if any) is the runtime-emitted deposit refund, or on that message's
+	// SourceContract; attributing the 33rd slot to the refund is the runtime's invariant, not
+	// this type's.
+	Outbox         []OutboxMessage
+	ReturnData     []byte
+	ClaimedDeposit U256
 }
 
 // Encode returns the canonical encoding of e.
@@ -332,7 +336,7 @@ func encodeExecutionResultBody(w *writer, e ExecutionResult) error {
 	if err := writeEventList(w, e.Events, e.GlobalInputIndex); err != nil {
 		return err
 	}
-	if err := writeOutboxList(w, e.Outbox, e.GlobalInputIndex); err != nil {
+	if err := writeOutboxList(w, e.Outbox, e.GlobalInputIndex, MaxOutboxPerResult); err != nil {
 		return err
 	}
 	w.bytes(e.ReturnData)
@@ -368,7 +372,7 @@ func decodeExecutionResultBody(r *reader) (ExecutionResult, error) {
 	if e.Events, err = readEventList(r, e.GlobalInputIndex); err != nil {
 		return e, err
 	}
-	if e.Outbox, err = readOutboxList(r, e.GlobalInputIndex); err != nil {
+	if e.Outbox, err = readOutboxList(r, e.GlobalInputIndex, MaxOutboxPerResult); err != nil {
 		return e, err
 	}
 	if e.ReturnData, err = r.bytes(^uint32(0)); err != nil {

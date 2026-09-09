@@ -39,6 +39,10 @@ func (w *writer) u16(v uint16) { w.buf = binary.BigEndian.AppendUint16(w.buf, v)
 func (w *writer) u32(v uint32) { w.buf = binary.BigEndian.AppendUint32(w.buf, v) }
 func (w *writer) u64(v uint64) { w.buf = binary.BigEndian.AppendUint64(w.buf, v) }
 
+// i32 writes v as its two's-complement big-endian four-byte encoding (§27.7), the same width
+// as u32. Every int32 is a valid abort_code, so there is no range check.
+func (w *writer) i32(v int32) { w.u32(uint32(v)) }
+
 func (w *writer) u256(v U256)             { w.buf = append(w.buf, v[:]...) }
 func (w *writer) hash(v types.Hash)       { w.buf = append(w.buf, v[:]...) }
 func (w *writer) path(v trie.Path)        { w.buf = append(w.buf, v[:]...) }
@@ -104,6 +108,12 @@ func (r *reader) u64() (uint64, error) {
 		return 0, err
 	}
 	return binary.BigEndian.Uint64(b), nil
+}
+
+// i32 reads a two's-complement big-endian four-byte abort_code (§27.7).
+func (r *reader) i32() (int32, error) {
+	v, err := r.u32()
+	return int32(v), err
 }
 
 func (r *reader) u256() (U256, error) {

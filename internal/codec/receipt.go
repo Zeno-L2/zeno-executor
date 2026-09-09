@@ -54,6 +54,7 @@ type Receipt struct {
 	CodeHash      types.Hash
 	Status        Status
 	GasUsed       uint64
+	AbortCode     int32
 	StateDiffHash types.Hash
 	ReturnHash    types.Hash
 	EventRoot     types.Hash
@@ -80,6 +81,7 @@ func (rec Receipt) Encode() ([]byte, error) {
 	w.hash(rec.CodeHash)
 	w.u8(uint8(rec.Status))
 	w.u64(rec.GasUsed)
+	w.i32(rec.AbortCode)
 	w.hash(rec.StateDiffHash)
 	w.hash(rec.ReturnHash)
 	w.hash(rec.EventRoot)
@@ -130,6 +132,9 @@ func DecodeReceipt(b []byte) (Receipt, error) {
 	rec.Status = Status(statusByte)
 
 	if rec.GasUsed, err = r.u64(); err != nil {
+		return rec, fmt.Errorf("codec: decode receipt: %w", err)
+	}
+	if rec.AbortCode, err = r.i32(); err != nil {
 		return rec, fmt.Errorf("codec: decode receipt: %w", err)
 	}
 	if rec.StateDiffHash, err = r.hash(); err != nil {

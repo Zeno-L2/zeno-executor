@@ -237,7 +237,7 @@ func TestOutboxIDDeterministic(t *testing.T) {
 // TestOutboxIDPreimageFormat independently re-derives the §17.3 preimage bytes
 // (domainId:u32 || batchId:u64 || inputIndex:u64 || outboxIndex:u32) with plain
 // encoding/binary calls, never via the codec's writer, to pin the field widths and
-// order that OPEN QUESTION 3 decided (domainId as u32).
+// order (domainId as u32).
 func TestOutboxIDPreimageFormat(t *testing.T) {
 	domainID := uint32(7)
 	batchID := uint64(1234)
@@ -562,7 +562,7 @@ func TestEventListOverCapRejected(t *testing.T) {
 
 func TestOutboxListOverCapRejected(t *testing.T) {
 	e := sampleExecutionResult(0)
-	e.Outbox = make([]OutboxMessage, MaxOutboxPerExecution+1)
+	e.Outbox = make([]OutboxMessage, MaxOutboxPerResult+1)
 	for i := range e.Outbox {
 		e.Outbox[i] = sampleL2Delivery(0, uint32(i))
 	}
@@ -576,6 +576,72 @@ func TestOutboxListOverCapRejected(t *testing.T) {
 	t.Run("decode", func(t *testing.T) {
 		b := rawExecutionResult(0, nil, e.Outbox)
 		if _, err := DecodeExecutionResult(b); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("got %v, want ErrLimitExceeded", err)
+		}
+	})
+}
+
+// TestExecutionResultOutboxAtMaxPerResultAccepted freezes the §27.4 exemption: an
+// ExecutionResult carrying exactly MaxOutboxPerResult messages — the contract's own
+// MaxOutboxPerExecution plus the runtime's refund slot — round-trips.
+func TestExecutionResultOutboxAtMaxPerResultAccepted(t *testing.T) {
+	e := sampleExecutionResult(0)
+	e.Outbox = make([]OutboxMessage, MaxOutboxPerResult)
+	for i := range e.Outbox {
+		e.Outbox[i] = sampleL2Delivery(0, uint32(i))
+	}
+	b, err := e.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := DecodeExecutionResult(b)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Outbox) != MaxOutboxPerResult {
+		t.Errorf("got %d outbox messages, want %d", len(got.Outbox), MaxOutboxPerResult)
+	}
+}
+
+// rawContractEffects hand-builds a canonical ContractEffects encoding with the given outbox
+// messages written verbatim via encodeOutboxMessageBody, bypassing writeOutboxList's count
+// check — Encode refuses to emit such bytes, so this is the only way to construct them for a
+// decode-side rejection test.
+func rawContractEffects(globalInputIndex uint64, outbox []OutboxMessage) []byte {
+	w := &writer{}
+	w.u16(ExecutionResultVersion)
+	w.u64(globalInputIndex)
+	w.u32(0) // empty local state diff list
+	w.u32(0) // empty event list
+
+	w.u32(uint32(len(outbox)))
+	for _, m := range outbox {
+		if err := encodeOutboxMessageBody(w, m); err != nil {
+			panic(err)
+		}
+	}
+
+	w.bytes([]byte("ret"))
+	w.u256(U256{31: 3})
+	return w.buf
+}
+
+func TestContractEffectsOutboxOverCapRejected(t *testing.T) {
+	c := sampleContractEffects(0)
+	c.Outbox = make([]OutboxMessage, MaxOutboxPerExecution+1)
+	for i := range c.Outbox {
+		c.Outbox[i] = sampleL2Delivery(0, uint32(i))
+	}
+
+	t.Run("encode", func(t *testing.T) {
+		if _, err := c.Encode(); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("got %v, want ErrLimitExceeded", err)
+		}
+	})
+
+	t.Run("decode", func(t *testing.T) {
+		b := rawContractEffects(0, c.Outbox)
+		if _, err := DecodeContractEffects(b); !errors.Is(err, ErrLimitExceeded) {
 			t.Fatalf("got %v, want ErrLimitExceeded", err)
 		}
 	})

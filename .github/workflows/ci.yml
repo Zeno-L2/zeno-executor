@@ -6,8 +6,12 @@ on:
   pull_request:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,3 +21,15 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: ./scripts/check-trie-imports.sh
+
+  # This job exists only to keep a check literally named "build" in existence for branch
+  # protection: a matrix job's checks are named "test (ubuntu-latest)" / "test (macos-latest)",
+  # not "test", so a rule requiring "build" would otherwise never be satisfied. It is green only
+  # when every matrix leg of "test" succeeded. Do not rename or remove it without repointing
+  # branch protection first.
+  build:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: '[ "${{ needs.test.result }}" = "success" ]'

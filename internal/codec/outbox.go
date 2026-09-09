@@ -165,10 +165,11 @@ func decodeOutboxMessageBody(r *reader) (OutboxMessage, error) {
 const minOutboxEncodedSize = 32 + 8 + 4 + 1 + 32 + 4
 
 // writeOutboxList encodes a List<OutboxMessage> and enforces the §27.4 index rules shared by
-// ContractEffects and ExecutionResult: count ≤ MaxOutboxPerExecution, ascending OutboxIndex
+// ContractEffects and ExecutionResult: count ≤ max (the caller's bound: MaxOutboxPerExecution
+// for a ContractEffects, MaxOutboxPerResult for an ExecutionResult), ascending OutboxIndex
 // from 0 with no gaps, and InputIndex == globalInputIndex.
-func writeOutboxList(w *writer, messages []OutboxMessage, globalInputIndex uint64) error {
-	if len(messages) > MaxOutboxPerExecution {
+func writeOutboxList(w *writer, messages []OutboxMessage, globalInputIndex uint64, max int) error {
+	if len(messages) > max {
 		return ErrLimitExceeded
 	}
 	w.u32(uint32(len(messages)))
@@ -186,12 +187,12 @@ func writeOutboxList(w *writer, messages []OutboxMessage, globalInputIndex uint6
 	return nil
 }
 
-func readOutboxList(r *reader, globalInputIndex uint64) ([]OutboxMessage, error) {
+func readOutboxList(r *reader, globalInputIndex uint64, max int) ([]OutboxMessage, error) {
 	count, err := r.count(minOutboxEncodedSize)
 	if err != nil {
 		return nil, err
 	}
-	if count > MaxOutboxPerExecution {
+	if count > uint32(max) {
 		return nil, ErrLimitExceeded
 	}
 	messages := make([]OutboxMessage, 0, count)

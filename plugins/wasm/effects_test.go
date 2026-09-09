@@ -3,6 +3,7 @@ package wasm
 import (
 	"encoding/binary"
 	"math"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/digitalSloth/go-executor/internal/state"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/engine"
 )
 
@@ -262,6 +264,42 @@ func TestSettleTruncatedBlobRejected(t *testing.T) {
 	}
 }
 
+// An over-long blob is rejected on its length, ahead of every check on its contents: the blob
+// below is also malformed, and still carries RESULT_TOO_LARGE rather than RUNTIME_FAULT.
+func TestSettleOverLongBlobRejectedBeforeDecode(t *testing.T) {
+	s := baseSettlement()
+	blob := make([]byte, MaxResultBlob+1)
+
+	eff, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: blob})
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if eff.Status != codec.StatusResultTooLarge {
+		t.Fatalf("Status = %v, want StatusResultTooLarge", eff.Status)
+	}
+	if eff.GasUsed != 1000 {
+		t.Fatalf("GasUsed = %d, want the metered gas 1000", eff.GasUsed)
+	}
+}
+
+// A well-formed blob at the bound still decodes, so the check is a ceiling and not an
+// off-by-one that rejects the largest admissible blob.
+func TestSettleBlobAtBoundAccepted(t *testing.T) {
+	s := baseSettlement()
+	b := encodeEffects(t, validEffects(s, 500))
+	if len(b) > MaxResultBlob {
+		t.Fatalf("fixture blob is %d bytes, above MaxResultBlob %d", len(b), MaxResultBlob)
+	}
+
+	eff, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: b})
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if eff.Status == codec.StatusResultTooLarge {
+		t.Fatal("a blob within the bound was rejected on length")
+	}
+}
+
 func TestSettleGlobalInputIndexMismatch(t *testing.T) {
 	s := baseSettlement()
 	// No events/outbox, so the blob's own internal InputIndex-consistency check (unrelated to
@@ -459,7 +497,10 @@ func TestSettleStep3PositionalPrecedence(t *testing.T) {
 	})
 }
 
-func TestSettleOutboxCapacity(t *testing.T) {
+// TestSettleOutboxAtCapacityAppendsRefund freezes the §27.4 exemption: a contract at
+// MaxOutboxPerExecution messages with a non-zero remainder still gets its refund, in the
+// ExecutionResult's 33rd slot.
+func TestSettleOutboxAtCapacityAppendsRefund(t *testing.T) {
 	s := baseSettlement()
 	eff := validEffects(s, 500)
 	outbox := make([]codec.OutboxMessage, codec.MaxOutboxPerExecution)
@@ -472,13 +513,84 @@ func TestSettleOutboxCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}
-	if got.Status != codec.StatusRuntimeFault {
-		t.Fatalf("Status = %v, want StatusRuntimeFault", got.Status)
+	if got.Status != codec.StatusSuccess {
+		t.Fatalf("Status = %v, want StatusSuccess", got.Status)
 	}
-	want := s.refund(codec.U256{}, 0)
-	if !reflect.DeepEqual(got.OutboxMessages, want) {
-		t.Fatalf("OutboxMessages = %+v, want %+v", got.OutboxMessages, want)
+	if len(got.OutboxMessages) != codec.MaxOutboxPerResult {
+		t.Fatalf("len(OutboxMessages) = %d, want %d", len(got.OutboxMessages), codec.MaxOutboxPerResult)
 	}
+	refund := got.OutboxMessages[len(got.OutboxMessages)-1]
+	if refund.SourceContract != (types.Hash{}) {
+		t.Fatalf("refund SourceContract = %x, want zero", refund.SourceContract)
+	}
+	if refund.OutboxIndex != codec.MaxOutboxPerExecution {
+		t.Fatalf("refund OutboxIndex = %d, want %d", refund.OutboxIndex, codec.MaxOutboxPerExecution)
+	}
+}
+
+// TestSettleOutboxNoPadOnZeroRemainder freezes the no-pad case: a contract at exactly
+// MaxOutboxPerExecution messages with a zero remainder emits no refund, so the
+// ExecutionResult carries MaxOutboxPerExecution messages, not MaxOutboxPerResult.
+func TestSettleOutboxNoPadOnZeroRemainder(t *testing.T) {
+	s := baseSettlement()
+	eff := validEffects(s, 1000) // claims the whole deposit: zero remainder
+	outbox := make([]codec.OutboxMessage, codec.MaxOutboxPerExecution)
+	for i := range outbox {
+		outbox[i] = codec.OutboxMessage{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: uint32(i), Target: codec.L2Delivery{TargetContract: testOtherHash}}
+	}
+	eff.Outbox = outbox
+
+	got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: encodeEffects(t, eff)})
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if got.Status != codec.StatusSuccess {
+		t.Fatalf("Status = %v, want StatusSuccess", got.Status)
+	}
+	if len(got.OutboxMessages) != codec.MaxOutboxPerExecution {
+		t.Fatalf("len(OutboxMessages) = %d, want %d (no pad)", len(got.OutboxMessages), codec.MaxOutboxPerExecution)
+	}
+}
+
+// TestSettleReceiptAbortCode freezes that the abort code reaches the receipt through refDerive,
+// the only codec.Receipt assembler in the tree: AbortCode = 7 for abort(7) and 0 for a
+// RUNTIME_FAULT.
+func TestSettleReceiptAbortCode(t *testing.T) {
+	s := baseSettlement()
+
+	newAccessor := func(t *testing.T) *state.Accessor {
+		t.Helper()
+		store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
+		if err != nil {
+			t.Fatalf("state.Open: %v", err)
+		}
+		t.Cleanup(func() { store.Close() })
+		return store.Accessor()
+	}
+
+	t.Run("Abort", func(t *testing.T) {
+		eff, err := s.settle(engine.Outcome{Kind: engine.Aborted, GasUsed: 1000, AbortCode: 7})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		acc := newAccessor(t)
+		ref := refDerive(t, eff, acc, s.GlobalInputIndex, 1, types.Hash{}, types.Hash{}, types.Hash{})
+		if ref.Receipt.AbortCode != 7 {
+			t.Fatalf("Receipt.AbortCode = %d, want 7", ref.Receipt.AbortCode)
+		}
+	})
+
+	t.Run("RuntimeFault", func(t *testing.T) {
+		eff, err := s.settle(engine.Outcome{Kind: engine.Trapped, GasUsed: 1000})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		acc := newAccessor(t)
+		ref := refDerive(t, eff, acc, s.GlobalInputIndex, 1, types.Hash{}, types.Hash{}, types.Hash{})
+		if ref.Receipt.AbortCode != 0 {
+			t.Fatalf("Receipt.AbortCode = %d, want 0", ref.Receipt.AbortCode)
+		}
+	})
 }
 
 func TestSettleRefundIndex(t *testing.T) {

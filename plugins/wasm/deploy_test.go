@@ -436,6 +436,7 @@ func TestApplyDeployFinalizeAbsurdChunkCountNeverTouchesChunkStore(t *testing.T)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { _ = p.Close() })
 	codeHash := types.Hash{0x99}
 	decodeStart(t, p, codec.DeployStartArgs{CodeHash: codeHash, MetadataHash: types.Hash{1}, TotalSize: 100, ChunkCount: 4_000_000_000}, domain.InputContext{})
 
@@ -592,6 +593,7 @@ func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		t.Cleanup(func() { _ = p.Close() })
 		sender := types.Address{1}
 		raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
 		codeHash := seedDeployment(t, p, raw, sender)
@@ -613,6 +615,7 @@ func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		t.Cleanup(func() { _ = p.Close() })
 		sender := types.Address{1}
 		raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
 		codeHash := seedDeployment(t, p, raw, sender)

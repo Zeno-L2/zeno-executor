@@ -22,7 +22,7 @@ type settlement struct {
 	L1Sender         types.Address
 	DepositAsset     codec.AssetID
 	DepositAmount    codec.U256
-	GasBudget        uint64 // plasma_limit, clamped to MaxInt64 (D6, D24)
+	GasBudget        uint64 // the input's plasma_limit, one budget unit per unit
 }
 
 // settle maps a completed Outcome onto the §15 status, the gas_used that status defines, the
@@ -54,6 +54,14 @@ func (s settlement) settle(out engine.Outcome) (domain.Effects, error) {
 func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	metered := out.GasUsed
 	remaining := s.GasBudget - metered
+
+	// Step 0: bound the blob before anything reads it. Decoding and the per-entry key
+	// derivation in step 3 are both proportional to the blob's length, so the length is
+	// checked ahead of every check on its contents: an over-long blob is RESULT_TOO_LARGE
+	// whether or not it is also malformed.
+	if len(out.ResultBlob) > MaxResultBlob {
+		return s.fail(codec.StatusResultTooLarge, metered), nil
+	}
 
 	// Step 1: decode the returned blob.
 	eff, err := codec.DecodeContractEffects(out.ResultBlob)
@@ -99,9 +107,15 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
-	// Step 5: outbox capacity for the refund.
+	// Step 5: outbox capacity for the refund (§27.4). The refund occupies the 33rd slot, so the
+	// bound is the ExecutionResult's MaxOutboxPerResult, not the contract's MaxOutboxPerExecution.
+	// Step 1's decode already bounds the contract's own messages at MaxOutboxPerExecution, so this
+	// cannot fail today; it is kept because it mirrors the MaxOutboxPerResult >=
+	// MaxOutboxPerExecution + 1 invariant that result.Encode()'s own bound depends on below. If
+	// that invariant ever breaks, a contract-triggered Encode failure at the end of settle becomes
+	// this step's RUNTIME_FAULT instead of an uncontrolled halt.
 	remainder := subU256(s.DepositAmount, eff.ClaimedDeposit)
-	if remainder != (codec.U256{}) && len(eff.Outbox) >= codec.MaxOutboxPerExecution {
+	if remainder != (codec.U256{}) && len(eff.Outbox)+1 > codec.MaxOutboxPerResult {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
@@ -117,7 +131,7 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusResultTooLarge, gasUsed), nil
 	}
 
-	// Step 8: final-message-set size.
+	// Assemble the canonical state diff and the final message set.
 	derived = sortStateDiff(derived)
 
 	outbox := append([]codec.OutboxMessage(nil), eff.Outbox...)
@@ -138,11 +152,12 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	if err != nil {
 		return domain.Effects{}, err
 	}
+	// Step 8: final-message-set size.
 	if len(encoded) > MaxExecutionResult {
 		return s.fail(codec.StatusResultTooLarge, gasUsed), nil
 	}
 
-	// Step 9: success.
+	// Every step passed.
 	return domain.Effects{
 		Status:         codec.StatusSuccess,
 		GasUsed:        gasUsed,
