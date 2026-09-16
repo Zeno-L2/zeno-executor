@@ -22,7 +22,7 @@ conflict.
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
 | `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
 | `internal/codec` | The canonical binary encoding for every consensus-visible structure. |
-| `internal/ledger` | (Empty) The input pipeline: ledger following, canonical ordering, per-domain cursor. |
+| `internal/ledger` | The input pipeline: a `Follower` that reads confirmed momenta from a `MomentumSource`, reconstructs the canonical per-block order, assigns the global input index, and filters to a configured domain via a `SettlementFilter`. |
 | `internal/batch` | (Empty) The STF driver, batch slicing, commitment, and DA bundle builder. |
 | `internal/recovery` | (Empty) On-disk layout and the crash-recovery state machine. |
 | `cmd/executor` | The binary entry point: wires a build's plugins into the runtime. |
