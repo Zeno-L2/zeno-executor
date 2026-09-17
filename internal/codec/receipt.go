@@ -3,6 +3,7 @@ package codec
 import (
 	"fmt"
 
+	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
@@ -160,4 +161,26 @@ func DecodeReceipt(b []byte) (Receipt, error) {
 		return rec, fmt.Errorf("codec: decode receipt: %w", err)
 	}
 	return rec, nil
+}
+
+// StateDiffHash is the §15 receipt preimage rule: SHA3-256 over the canonical
+// List<StateDiffEntry> encoding (§27.1a, §27.2), and bytes32(0) when the list is empty.
+func StateDiffHash(entries []StateDiffEntry) (types.Hash, error) {
+	if len(entries) == 0 {
+		return types.Hash{}, nil
+	}
+	w := &writer{}
+	if err := writeDerivedStateDiffList(w, entries); err != nil {
+		return types.Hash{}, fmt.Errorf("codec: state diff hash: %w", err)
+	}
+	return hashOf(crypto.Hash(w.buf)), nil
+}
+
+// ReturnHash is the §15 receipt preimage rule: SHA3-256(ReturnData) over the raw bytes with
+// no length prefix and no framing, and bytes32(0) when ReturnData is empty.
+func ReturnHash(data []byte) types.Hash {
+	if len(data) == 0 {
+		return types.Hash{}
+	}
+	return hashOf(crypto.Hash(data))
 }

@@ -22,6 +22,10 @@ type BundleInputRecord struct {
 	InputData        []byte
 	Witnesses        []WitnessEntry
 	ExecutionResult  []byte
+	// DeployChunkData is the kind-3 chunk's raw bytes (OD-7). It is encoded, as a trailing
+	// Bytes field, only for a record whose InputData names input_kind 3; it MUST be nil for
+	// every other kind.
+	DeployChunkData []byte
 }
 
 // Encode returns the canonical encoding of r. Witnesses MUST be strictly ascending by
@@ -52,6 +56,14 @@ func encodeBundleInputRecordBody(w *writer, rec BundleInputRecord) error {
 		w.bytes(we.Proof)
 	}
 	w.bytes(rec.ExecutionResult)
+
+	isKind3 := len(rec.InputData) > 0 && rec.InputData[0] == 3
+	if rec.DeployChunkData != nil && !isKind3 {
+		return ErrInvalidKind
+	}
+	if isKind3 {
+		w.bytes(rec.DeployChunkData)
+	}
 	return nil
 }
 
@@ -98,6 +110,12 @@ func decodeBundleInputRecordBody(r *reader) (BundleInputRecord, error) {
 
 	if rec.ExecutionResult, err = r.bytes(^uint32(0)); err != nil {
 		return rec, err
+	}
+
+	if len(rec.InputData) > 0 && rec.InputData[0] == 3 {
+		if rec.DeployChunkData, err = r.bytes(^uint32(0)); err != nil {
+			return rec, err
+		}
 	}
 	return rec, nil
 }

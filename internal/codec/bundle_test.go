@@ -145,6 +145,94 @@ func TestBundleEmptyRecordSetRoundTrips(t *testing.T) {
 	}
 }
 
+// TestBundleKind3DeployChunkData covers OD-7's kind-3-scoped DeployChunkData field: it
+// round-trips for a kind-3 record, is rejected on a non-kind-3 record, does not panic on an
+// empty InputData, and leaves a kind-4 record's encoding unchanged.
+func TestBundleKind3DeployChunkData(t *testing.T) {
+	t.Run("Kind3RoundTrips", func(t *testing.T) {
+		rec := BundleInputRecord{
+			GlobalInputIndex: 0,
+			InputData:        []byte{3, 0xAA, 0xBB},
+			ExecutionResult:  []byte("result-0"),
+			DeployChunkData:  []byte("chunk-bytes"),
+		}
+		b, err := EncodeBundle([]BundleInputRecord{rec})
+		if err != nil {
+			t.Fatalf("EncodeBundle: %v", err)
+		}
+		got, err := DecodeBundle(b)
+		if err != nil {
+			t.Fatalf("DecodeBundle: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("got %d records, want 1", len(got))
+		}
+		if !bytes.Equal(got[0].DeployChunkData, rec.DeployChunkData) {
+			t.Errorf("DeployChunkData = %q, want %q", got[0].DeployChunkData, rec.DeployChunkData)
+		}
+		rebuilt, err := EncodeBundle(got)
+		if err != nil {
+			t.Fatalf("re-EncodeBundle: %v", err)
+		}
+		if !bytes.Equal(rebuilt, b) {
+			t.Errorf("round trip mismatch: got %x, want %x", rebuilt, b)
+		}
+	})
+
+	t.Run("NonKind3WithDeployChunkDataRejected", func(t *testing.T) {
+		rec := BundleInputRecord{
+			GlobalInputIndex: 0,
+			InputData:        []byte{0, 0xAA, 0xBB},
+			ExecutionResult:  []byte("result-0"),
+			DeployChunkData:  []byte("chunk-bytes"),
+		}
+		if _, err := rec.Encode(); !errors.Is(err, ErrInvalidKind) {
+			t.Fatalf("got %v, want ErrInvalidKind", err)
+		}
+	})
+
+	t.Run("EmptyInputDataDoesNotPanic", func(t *testing.T) {
+		rec := BundleInputRecord{
+			GlobalInputIndex: 0,
+			InputData:        []byte{},
+			ExecutionResult:  []byte("result-0"),
+		}
+		b, err := rec.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		if _, err := DecodeBundle(b); err != nil {
+			t.Fatalf("DecodeBundle: %v", err)
+		}
+	})
+
+	t.Run("Kind4EncodingUnchanged", func(t *testing.T) {
+		rec := BundleInputRecord{
+			GlobalInputIndex: 0,
+			InputData:        []byte{4, 0xAA, 0xBB},
+			ExecutionResult:  []byte("result-0"),
+		}
+		b, err := rec.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		got, err := DecodeBundle(b)
+		if err != nil {
+			t.Fatalf("DecodeBundle: %v", err)
+		}
+		if len(got) != 1 || got[0].DeployChunkData != nil {
+			t.Fatalf("got %+v, want a single record with nil DeployChunkData", got)
+		}
+		rebuilt, err := EncodeBundle(got)
+		if err != nil {
+			t.Fatalf("re-EncodeBundle: %v", err)
+		}
+		if !bytes.Equal(rebuilt, b) {
+			t.Errorf("round trip mismatch: got %x, want %x", rebuilt, b)
+		}
+	})
+}
+
 func TestBundleHashStability(t *testing.T) {
 	records := sampleBundleRecords(t)
 	got, err := BundleHash(records)

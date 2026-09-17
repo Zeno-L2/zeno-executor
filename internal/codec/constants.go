@@ -41,3 +41,13 @@ const (
 // EmptyValueLength is the §27.2 EMPTY deletion sentinel: a StateDiff value length prefix of
 // 0xFFFFFFFF marks deletion rather than a present value of that length.
 const EmptyValueLength uint32 = 0xFFFFFFFF
+
+// MaxBatchWithdrawal is the per-asset, per-batch withdrawal cap (§27.9). plugins/wasm enforces
+// it against a single input (ordered validation step 5a) so that every input the STF settles as
+// SUCCESS fits within one batch alone; internal/batch enforces it against the batch total.
+// Both read this one symbol, so the two cannot disagree.
+//
+// 2^255 is a Phase-1 placeholder, above any L1 asset supply and one bit below the U256 ceiling,
+// so a per-input total is always representable. The real value is the Periphery record's per
+// (domain, asset) scalar (§19/§27.9), which no Phase-1 ticket wires. Treat as read-only.
+var MaxBatchWithdrawal = U256{0x80}
