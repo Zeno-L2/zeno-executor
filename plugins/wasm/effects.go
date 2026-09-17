@@ -3,6 +3,7 @@ package wasm
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 	"sort"
 
 	"github.com/zenon-network/go-zenon/common/types"
@@ -117,6 +118,41 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	remainder := subU256(s.DepositAmount, eff.ClaimedDeposit)
 	if remainder != (codec.U256{}) && len(eff.Outbox)+1 > codec.MaxOutboxPerResult {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
+	}
+
+	// Step 5a (D35): the per-asset, per-batch withdrawal cap (§27.9), enforced here against this
+	// input alone so that every input the STF settles as SUCCESS fits within one batch alone. The
+	// asset footprint includes the input's own deposit — not merely the asset — since that is the
+	// exact upper bound on the refund the runtime appends after this method returns.
+	totals := map[codec.AssetID]*big.Int{}
+	for _, m := range eff.Outbox {
+		w, ok := m.Target.(codec.L1Withdrawal)
+		if !ok {
+			continue
+		}
+		total, ok := totals[w.Asset]
+		if !ok {
+			total = new(big.Int)
+			totals[w.Asset] = total
+		}
+		total.Add(total, new(big.Int).SetBytes(w.Amount[:]))
+	}
+	if s.DepositAmount != (codec.U256{}) {
+		total, ok := totals[s.DepositAsset]
+		if !ok {
+			total = new(big.Int)
+			totals[s.DepositAsset] = total
+		}
+		total.Add(total, new(big.Int).SetBytes(s.DepositAmount[:]))
+	}
+	if len(totals) > codec.MaxAssetsPerBatch {
+		return s.fail(codec.StatusRuntimeFault, metered), nil
+	}
+	cap := new(big.Int).SetBytes(codec.MaxBatchWithdrawal[:])
+	for _, total := range totals {
+		if total.Cmp(cap) > 0 {
+			return s.fail(codec.StatusRuntimeFault, metered), nil
+		}
 	}
 
 	// Step 6: the §10.4 post-execution effect charge.

@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -260,6 +261,24 @@ func DecodeInput(b []byte) (Input, error) {
 		return in, fmt.Errorf("codec: decode input: %w", err)
 	}
 	return in, nil
+}
+
+// CanonicalInput returns the §27.5 canonical input encoding for a raw payload: the payload
+// itself when it decodes as one of the six defined kinds, and the input_kind ||
+// source_account_block_hash prefix alone for any other kind, which defines no tail. This is
+// the inputHash preimage, the inputRoot leaf, and the bundle record's inputData.
+//
+// CanonicalInput reaches the prefix branch only through errors.Is(err, ErrInvalidKind), which
+// DecodeInput can report only after it has already consumed the 1-byte kind and the 32-byte
+// source hash; every other decode error is returned unchanged.
+func CanonicalInput(payload []byte) ([]byte, error) {
+	if _, err := DecodeInput(payload); err != nil {
+		if errors.Is(err, ErrInvalidKind) {
+			return payload[:33:33], nil
+		}
+		return nil, err
+	}
+	return payload, nil
 }
 
 // Hash returns inputHash = SHA3-256(canonical encoding) (§27.5).

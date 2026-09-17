@@ -23,7 +23,7 @@ conflict.
 | `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
 | `internal/codec` | The canonical binary encoding for every consensus-visible structure. |
 | `internal/ledger` | The input pipeline: a `Follower` that reads confirmed momenta from a `MomentumSource`, reconstructs the canonical per-block order, assigns the global input index, and filters to a configured domain via a `SettlementFilter`. |
-| `internal/batch` | (Empty) The STF driver, batch slicing, commitment, and DA bundle builder. |
+| `internal/batch` | The `Driver`: the per-input execution pipeline against a `domain.Domain` and `internal/state.Store`, batch slicing under the §25.1/§27.9 caps, and the self-verified batch commitment and DA bundle. |
 | `internal/recovery` | (Empty) On-disk layout and the crash-recovery state machine. |
 | `cmd/executor` | The binary entry point: wires a build's plugins into the runtime. |
 

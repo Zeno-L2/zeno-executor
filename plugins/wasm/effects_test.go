@@ -3,6 +3,7 @@ package wasm
 import (
 	"encoding/binary"
 	"math"
+	"math/big"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -737,3 +738,125 @@ func TestSettleSuccessStateDiffSortedAndDeletionsPreserved(t *testing.T) {
 
 // domainEffects is a local alias so this file's helper signatures stay short.
 type domainEffects = domain.Effects
+
+// twoPow255 is codec.MaxBatchWithdrawal's value as a big.Int.
+func twoPow255() *big.Int { return new(big.Int).Lsh(big.NewInt(1), 255) }
+
+// u256FromBig converts v into a codec.U256, failing the test on overflow.
+func u256FromBig(t *testing.T, v *big.Int) codec.U256 {
+	t.Helper()
+	out, err := codec.U256FromBig(v)
+	if err != nil {
+		t.Fatalf("codec.U256FromBig: %v", err)
+	}
+	return out
+}
+
+// withdrawalAsset returns a distinct AssetID for byte b, distinct from the zero AssetID
+// baseSettlement's deposit uses.
+func withdrawalAsset(b byte) codec.AssetID {
+	var a codec.AssetID
+	a[31] = b
+	return a
+}
+
+// TestSettleStep5aRejects covers the four ways the per-asset, per-batch withdrawal cap (D35)
+// rejects an input with RUNTIME_FAULT at the metered gas, before the §10.4 effect charge runs.
+func TestSettleStep5aRejects(t *testing.T) {
+	cap := twoPow255()
+	metered := uint64(1000)
+
+	assertRejected := func(t *testing.T, s settlement, eff codec.ContractEffects) {
+		t.Helper()
+		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: metered, ResultBlob: encodeEffects(t, eff)})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		if got.Status != codec.StatusRuntimeFault || got.GasUsed != metered {
+			t.Fatalf("Status/GasUsed = %v/%d, want RuntimeFault/%d", got.Status, got.GasUsed, metered)
+		}
+	}
+
+	t.Run("SingleAssetOverCap", func(t *testing.T) {
+		s := baseSettlement()
+		over := new(big.Int).Add(cap, big.NewInt(1))
+		eff := codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: s.GlobalInputIndex,
+			Outbox: []codec.OutboxMessage{
+				{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(1), Amount: u256FromBig(t, over)}},
+			},
+			ClaimedDeposit: codec.U256{},
+		}
+		assertRejected(t, s, eff)
+	})
+
+	t.Run("TooManyAssets", func(t *testing.T) {
+		s := baseSettlement()
+		s.DepositAmount = codec.U256{} // isolate the footprint check to the withdrawal messages alone
+		outbox := make([]codec.OutboxMessage, codec.MaxAssetsPerBatch+1)
+		for i := range outbox {
+			outbox[i] = codec.OutboxMessage{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: uint32(i), Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(byte(i + 1)), Amount: u256(1)}}
+		}
+		eff := codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: s.GlobalInputIndex, Outbox: outbox, ClaimedDeposit: codec.U256{}}
+		assertRejected(t, s, eff)
+	})
+
+	t.Run("SixteenAssetsPlusDepositSeventeenth", func(t *testing.T) {
+		s := baseSettlement()
+		s.DepositAsset = withdrawalAsset(200) // distinct from every withdrawal asset below
+		outbox := make([]codec.OutboxMessage, codec.MaxAssetsPerBatch)
+		for i := range outbox {
+			outbox[i] = codec.OutboxMessage{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: uint32(i), Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(byte(i + 1)), Amount: u256(1)}}
+		}
+		eff := codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: s.GlobalInputIndex, Outbox: outbox, ClaimedDeposit: codec.U256{}}
+		assertRejected(t, s, eff)
+	})
+
+	t.Run("DepositAloneOverCap", func(t *testing.T) {
+		s := baseSettlement()
+		over := new(big.Int).Add(cap, big.NewInt(1))
+		s.DepositAmount = u256FromBig(t, over)
+		eff := codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: s.GlobalInputIndex, ClaimedDeposit: codec.U256{}}
+		assertRejected(t, s, eff)
+	})
+}
+
+// TestSettleStep5aAdmits covers the two ways the cap does not reject: a withdrawal at exactly
+// the cap in an asset distinct from the deposit's, and a failed input's refund, which never
+// reaches step 5a at all.
+func TestSettleStep5aAdmits(t *testing.T) {
+	t.Run("WithdrawalAtCapDifferentAsset", func(t *testing.T) {
+		s := baseSettlement() // DepositAsset is the zero AssetID, DepositAmount 1000
+		eff := validEffects(s, 0)
+		eff.Outbox = []codec.OutboxMessage{
+			{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(1), Amount: codec.MaxBatchWithdrawal}},
+		}
+		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: encodeEffects(t, eff)})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		if got.Status != codec.StatusSuccess {
+			t.Fatalf("Status = %v, want StatusSuccess", got.Status)
+		}
+	})
+
+	t.Run("RefundAboveCapOnFailedInputUntouched", func(t *testing.T) {
+		s := baseSettlement()
+		over := new(big.Int).Add(twoPow255(), big.NewInt(1))
+		s.DepositAmount = u256FromBig(t, over)
+		eff := validEffects(s, 0)
+		eff.StateDiff = []codec.LocalStateDiffEntry{{LocalKey: keyCodeHash, Value: []byte{1}}} // forces UNAUTHORIZED, well before step 5a
+		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: encodeEffects(t, eff)})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		if got.Status != codec.StatusUnauthorized {
+			t.Fatalf("Status = %v, want StatusUnauthorized", got.Status)
+		}
+		want := s.refund(codec.U256{}, 0)
+		if !reflect.DeepEqual(got.OutboxMessages, want) {
+			t.Fatalf("OutboxMessages = %+v, want %+v (refund untouched by step 5a)", got.OutboxMessages, want)
+		}
+	})
+}
