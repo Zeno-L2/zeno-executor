@@ -17,14 +17,14 @@ conflict.
 | Package | Responsibility |
 |---|---|
 | `domain` | The plugin seam every execution domain implements (`Domain`, `Source`, `StateAccess`, `Effects`) — public, importable by out-of-tree domain plugins. |
-| `runtime` | The generic runtime: plugin registration, the single-instance lease, and the run loop. |
+| `runtime` | The generic runtime: plugin registration, the single-instance lease, the boot-time recovery, and the execution loop that commits batches, handles reorgs and halts on a consistency fault. |
 | `plugins/wasm` | The WASM execution domain: the deterministic Core 1.0 interpreter — binary reader and validator, gas metering and instrumentation, the three-import host ABI, and `Apply` for all six input kinds. |
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
 | `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
 | `internal/codec` | The canonical binary encoding for every consensus-visible structure. |
 | `internal/ledger` | The input pipeline: a `Follower` that reads confirmed momenta from a `MomentumSource`, reconstructs the canonical per-block order, assigns the global input index, and filters to a configured domain via a `SettlementFilter`. |
 | `internal/batch` | The `Driver`: the per-input execution pipeline against a `domain.Domain` and `internal/state.Store`, batch slicing under the §25.1/§27.9 caps, and the self-verified batch commitment and DA bundle. |
-| `internal/recovery` | (Empty) On-disk layout and the crash-recovery state machine. |
+| `internal/recovery` | The on-disk storage layout, atomic cursor persistence, snapshot retention, and the boot-to-ready recovery state machine with reorg rollback and fail-closed halts. |
 | `cmd/executor` | The binary entry point: wires a build's plugins into the runtime. |
 
 ## Building

@@ -57,8 +57,15 @@ type Config struct {
 	// cursor belongs to the caller's checkpoint/resume logic, which this package does not
 	// implement.
 	StartGlobalIndex uint64
-	Source           MomentumSource
-	Filter           SettlementFilter
+	// MaxBufferedInputs bounds how many inputs one refill buffers. Once the buffer holds at
+	// least this many, refill stops processing the current ranged read at that momentum
+	// boundary and discards the rest of the read; the next refill reads those momenta again.
+	// The buffer therefore holds fewer than MaxBufferedInputs inputs plus one momentum's
+	// remainder, which bounds how long Checkpoint stays not ok under a saturated stream. Zero
+	// means unbounded: a refill buffers a whole ranged read.
+	MaxBufferedInputs int
+	Source            MomentumSource
+	Filter            SettlementFilter
 }
 
 // Input is one canonical input for the configured domain: the opaque payload plus the L1
@@ -77,6 +84,9 @@ type Follower struct {
 	lastHeight uint64
 	lastHash   types.Hash
 	haveLast   bool
+
+	// recent is the trailing window of consumed momenta, at most ConfirmationDepth+1 entries.
+	recent []ConsumedMomentum
 
 	buf []Input
 
@@ -123,8 +133,8 @@ func New(cfg Config) (*Follower, error) {
 // fresh read on the following call. An error from a momentum-processing failure — validation,
 // the link check, Accept, or index overflow — is permanent: the Follower latches it and every
 // later Next returns that same error without reading further. An error from a MomentumSource
-// read call itself is wrapped and returned as-is: it is not latched and nothing is advanced, so
-// the caller may retry by calling Next again.
+// read call itself is wrapped and returned as-is, matching ErrSourceRead: it is not latched and
+// nothing is advanced, so the caller may retry by calling Next again.
 func (f *Follower) Next() (Input, bool, error) {
 	if in, ok := f.pop(); ok {
 		return in, true, nil
@@ -183,6 +193,46 @@ func (f *Follower) LastEmittedIndex() (index uint64, ok bool) {
 	return f.cursor, f.cursorSet
 }
 
+// ConsumedMomentum is one momentum a Follower has fully walked, in the shape EXECUTOR §16's
+// momentum_hashes/ records it.
+type ConsumedMomentum struct {
+	Height uint64
+	Hash   types.Hash
+}
+
+// RecentMomenta returns the momenta this Follower has most recently consumed, ascending by
+// height and contiguous — a Follower consumes every confirmed momentum in order, including one
+// holding nothing for its domain — at most ConfirmationDepth+1 entries. The caller persists it:
+// a Follower's link check lives in memory and cannot see a reorg that landed while the process
+// was down, and a window this long is exactly the depth within which §14 permits a rollback.
+func (f *Follower) RecentMomenta() []ConsumedMomentum {
+	return append([]ConsumedMomentum(nil), f.recent...)
+}
+
+// Checkpoint is a resume point: a Follower built with StartHeight = Height+1 and
+// StartGlobalIndex = NextGlobalIndex continues this Follower's stream exactly, re-emitting
+// nothing and skipping nothing.
+type Checkpoint struct {
+	Height          uint64
+	Hash            types.Hash
+	NextGlobalIndex uint64
+}
+
+// Checkpoint reports the last momentum boundary this Follower has fully delivered. ok is false
+// before the first momentum is consumed, and while inputs read but not yet returned by Next
+// remain buffered: resuming past such a boundary would skip an input the caller never saw.
+func (f *Follower) Checkpoint() (Checkpoint, bool) {
+	if !f.haveLast || len(f.buf) != 0 {
+		return Checkpoint{}, false
+	}
+	return Checkpoint{Height: f.lastHeight, Hash: f.lastHash, NextGlobalIndex: f.counter.next}, true
+}
+
+// ErrSourceRead reports that a MomentumSource read call failed. It is the machine-readable form
+// of the unlatched error class Next documents: nothing advanced and nothing latched, so the
+// caller may retry, which EXECUTOR §15 requires for an unavailable znnd.
+var ErrSourceRead = errors.New("ledger: momentum source read")
+
 // ReorgError reports that the ledger no longer extends the last momentum this follower
 // consumed: the momentum now at Height links back to Got where the follower consumed Want.
 // Got is the zero Hash when the node no longer has any momentum at Height at all. It is a
@@ -231,7 +281,7 @@ func (c *indexCounter) assign() (uint64, error) {
 func (f *Follower) refill() error {
 	frontier, err := f.cfg.Source.FrontierHeight()
 	if err != nil {
-		return fmt.Errorf("ledger: read frontier height: %w", err)
+		return fmt.Errorf("%w: read frontier height: %w", ErrSourceRead, err)
 	}
 
 	if f.haveLast && frontier < f.lastHeight {
@@ -255,7 +305,7 @@ func (f *Follower) refill() error {
 
 		moms, err := f.cfg.Source.DetailedMomentumsByHeight(f.nextHeight, count)
 		if err != nil {
-			return fmt.Errorf("ledger: read momenta from height %d: %w", f.nextHeight, err)
+			return fmt.Errorf("%w: read momenta from height %d: %w", ErrSourceRead, f.nextHeight, err)
 		}
 		if len(moms) == 0 {
 			return nil
@@ -269,7 +319,7 @@ func (f *Follower) refill() error {
 				// ceiling before this momentum was ever read — see Edge cases.
 				return nil
 			}
-			if stop {
+			if stop || (f.cfg.MaxBufferedInputs > 0 && len(f.buf) >= f.cfg.MaxBufferedInputs) {
 				break
 			}
 		}
@@ -403,5 +453,9 @@ func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64) (st
 	f.lastHash = m.Hash
 	f.haveLast = true
 	f.nextHeight = m.Height + 1
+	f.recent = append(f.recent, ConsumedMomentum{Height: m.Height, Hash: m.Hash})
+	if max := f.cfg.ConfirmationDepth + 1; uint64(len(f.recent)) > max {
+		f.recent = append([]ConsumedMomentum(nil), f.recent[uint64(len(f.recent))-max:]...)
+	}
 	return false, false
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -873,5 +874,335 @@ func TestUnwiredFilterAccept(t *testing.T) {
 	}
 	if _, ok, err := f.Next(); ok || !errors.Is(err, ErrSettlementUnwired) {
 		t.Fatalf("Next: got (ok=%v, err=%v), want (false, wrapped ErrSettlementUnwired)", ok, err)
+	}
+}
+
+// --- checkpoint, recent momenta and source-read errors ---
+
+// domainByData accepts every block, assigning it to the domain named by its first Data byte.
+func domainByData() *fakeFilter {
+	return &fakeFilter{fn: func(m *nom.Momentum, block *nom.AccountBlock) (*Envelope, error) {
+		return &Envelope{DomainID: uint32(block.Data[0]), Payload: []byte{block.Address[0]}}, nil
+	}}
+}
+
+func TestCheckpointBoundaryAndResume(t *testing.T) {
+	// Momentum 1 holds two blocks for domain 0 and one for domain 1, in header order, so the
+	// other domain's block follows this domain's last one. Momentum 2 holds one more for domain 0.
+	moms := chain(1, 3, func(h uint64) []*nom.AccountBlock {
+		switch h {
+		case 1:
+			return []*nom.AccountBlock{
+				newBlock(1, 1, 1, []byte{0}),
+				newBlock(2, 1, 2, []byte{0}),
+				newBlock(3, 1, 3, []byte{1}),
+			}
+		case 2:
+			return []*nom.AccountBlock{newBlock(4, 2, 4, []byte{0})}
+		}
+		return nil
+	})
+	// The frontier confirms momentum 1 only, so the follower's buffer holds exactly its inputs.
+	source := &fakeSource{frontier: 2, moms: moms}
+
+	f, err := New(Config{DomainID: 0, ConfirmationDepth: 1, StartHeight: 1, Source: source, Filter: domainByData()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := f.Checkpoint(); ok {
+		t.Fatalf("Checkpoint ok before the first momentum")
+	}
+
+	first, ok, err := f.Next()
+	if err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+	if first.Ctx.GlobalInputIndex != 0 {
+		t.Fatalf("first index = %d, want 0", first.Ctx.GlobalInputIndex)
+	}
+	if _, ok := f.Checkpoint(); ok {
+		t.Fatalf("Checkpoint ok while an input is still buffered")
+	}
+
+	if _, ok, err := f.Next(); err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+	cp, ok := f.Checkpoint()
+	if !ok {
+		t.Fatalf("Checkpoint not ok at a drained boundary")
+	}
+	// Indices 0 and 1 are domain 0's, index 2 is domain 1's: the next block takes index 3.
+	if cp.Height != 1 || cp.Hash != momHash(1) || cp.NextGlobalIndex != 3 {
+		t.Fatalf("Checkpoint = %+v, want height 1, hash of 1, next index 3", cp)
+	}
+
+	source.frontier = 10
+	rest := drain(t, f)
+
+	resumed, err := New(Config{
+		DomainID: 0, ConfirmationDepth: 1, StartHeight: cp.Height + 1, StartGlobalIndex: cp.NextGlobalIndex,
+		Source: &fakeSource{frontier: 10, moms: moms}, Filter: domainByData(),
+	})
+	if err != nil {
+		t.Fatalf("New resumed: %v", err)
+	}
+	got := drain(t, resumed)
+	if len(got) != len(rest) || len(got) == 0 {
+		t.Fatalf("resumed emitted %d inputs, original continued with %d", len(got), len(rest))
+	}
+	for i := range got {
+		if got[i].Ctx.GlobalInputIndex != rest[i].Ctx.GlobalInputIndex || !bytes.Equal(got[i].Payload, rest[i].Payload) {
+			t.Fatalf("input %d differs: resumed %+v, original %+v", i, got[i], rest[i])
+		}
+	}
+	if got[0].Ctx.GlobalInputIndex != 3 {
+		t.Fatalf("resumed first index = %d, want 3", got[0].Ctx.GlobalInputIndex)
+	}
+}
+
+func TestRecentMomentaWindow(t *testing.T) {
+	// Only heights divisible by 3 hold a block, so most consumed momenta are empty.
+	moms := chain(1, 12, func(h uint64) []*nom.AccountBlock {
+		if h%3 == 0 {
+			return []*nom.AccountBlock{newBlock(byte(h), h, byte(h), []byte{0})}
+		}
+		return nil
+	})
+	source := &fakeSource{frontier: 13, moms: moms}
+	f, err := New(Config{DomainID: 0, ConfirmationDepth: 3, StartHeight: 1, Source: source, Filter: domainByData()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := f.RecentMomenta(); len(got) != 0 {
+		t.Fatalf("RecentMomenta before any read = %v", got)
+	}
+
+	check := func() {
+		t.Helper()
+		got := f.RecentMomenta()
+		if uint64(len(got)) > 4 {
+			t.Fatalf("RecentMomenta has %d entries, want at most ConfirmationDepth+1 = 4", len(got))
+		}
+		for i, e := range got {
+			if e.Hash != momHash(e.Height) {
+				t.Fatalf("entry %d hash does not match its height", i)
+			}
+			if i > 0 && e.Height != got[i-1].Height+1 {
+				t.Fatalf("entries not contiguous ascending: %v", got)
+			}
+		}
+		if cp, ok := f.Checkpoint(); ok && got[len(got)-1].Height != cp.Height {
+			t.Fatalf("last entry %d is not the last consumed height %d", got[len(got)-1].Height, cp.Height)
+		}
+	}
+	for {
+		_, ok, err := f.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if len(f.RecentMomenta()) > 0 {
+			check()
+		}
+		if !ok {
+			break
+		}
+	}
+	got := f.RecentMomenta()
+	if len(got) != 4 || got[3].Height != 10 {
+		t.Fatalf("final RecentMomenta = %v, want the four momenta ending at the ceiling 10", got)
+	}
+
+	// The returned slice is a copy.
+	got[0].Height = 999
+	if f.RecentMomenta()[0].Height == 999 {
+		t.Fatalf("RecentMomenta aliases internal state")
+	}
+}
+
+func TestErrSourceRead(t *testing.T) {
+	moms := chain(1, 3, func(h uint64) []*nom.AccountBlock {
+		return []*nom.AccountBlock{newBlock(byte(h), h, byte(h), []byte{0})}
+	})
+
+	t.Run("frontier read failure", func(t *testing.T) {
+		source := &fakeSource{frontier: 10, moms: moms, frontierErr: errors.New("boom")}
+		f, _ := New(Config{DomainID: 0, ConfirmationDepth: 1, StartHeight: 1, Source: source, Filter: domainByData()})
+		if _, _, err := f.Next(); !errors.Is(err, ErrSourceRead) {
+			t.Fatalf("frontier failure: err = %v, want ErrSourceRead", err)
+		}
+	})
+	t.Run("momenta read failure", func(t *testing.T) {
+		source := &fakeSource{frontier: 10, moms: moms, readErr: errors.New("boom")}
+		f, _ := New(Config{DomainID: 0, ConfirmationDepth: 1, StartHeight: 1, Source: source, Filter: domainByData()})
+		if _, _, err := f.Next(); !errors.Is(err, ErrSourceRead) {
+			t.Fatalf("momenta failure: err = %v, want ErrSourceRead", err)
+		}
+		if _, ok, err := f.Next(); err != nil || !ok {
+			t.Fatalf("retry after a source failure: ok=%v err=%v", ok, err)
+		}
+	})
+	t.Run("latched failure is not a source read error", func(t *testing.T) {
+		source := &fakeSource{frontier: 10, moms: moms}
+		f, _ := New(Config{DomainID: 0, ConfirmationDepth: 1, StartHeight: 1, Source: source,
+			Filter: &fakeFilter{fn: func(*nom.Momentum, *nom.AccountBlock) (*Envelope, error) { return nil, errors.New("reject") }}})
+		_, _, err := f.Next()
+		if err == nil || errors.Is(err, ErrSourceRead) {
+			t.Fatalf("latched failure: err = %v, want a non-ErrSourceRead error", err)
+		}
+	})
+	t.Run("reorg is not a source read error", func(t *testing.T) {
+		source := &fakeSource{frontier: 2, moms: moms}
+		f, _ := New(Config{DomainID: 0, ConfirmationDepth: 1, StartHeight: 1, Source: source, Filter: domainByData()})
+		drain(t, f)
+		source.frontier = 3
+		source.moms = chain(1, 3, func(h uint64) []*nom.AccountBlock { return nil })
+		source.moms[1].Momentum.PreviousHash = testHash(0xEE)
+		_, _, err := f.Next()
+		var re *ReorgError
+		if !errors.As(err, &re) || errors.Is(err, ErrSourceRead) {
+			t.Fatalf("reorg: err = %v, want a *ReorgError that is not ErrSourceRead", err)
+		}
+	})
+}
+
+// --- MaxBufferedInputs ---
+
+// twoBlocksPerMomentum gives every momentum two blocks whose payloads identify height and
+// address, so a lost or duplicated input is visible in the drained sequence.
+func twoBlocksPerMomentum(h uint64) []*nom.AccountBlock {
+	return []*nom.AccountBlock{
+		newBlock(1, h, 1, []byte{byte(h), 1}),
+		newBlock(2, h, 2, []byte{byte(h), 2}),
+	}
+}
+
+func payloadFilter(domainID uint32) *fakeFilter {
+	return &fakeFilter{fn: func(m *nom.Momentum, block *nom.AccountBlock) (*Envelope, error) {
+		return &Envelope{DomainID: domainID, Payload: block.Data}, nil
+	}}
+}
+
+func newBoundedFollower(t *testing.T, source *fakeSource, bound int, depth uint64) *Follower {
+	t.Helper()
+	f, err := New(Config{
+		DomainID:          1,
+		ConfirmationDepth: depth,
+		StartHeight:       1,
+		MaxBufferedInputs: bound,
+		Source:            source,
+		Filter:            payloadFilter(1),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return f
+}
+
+func TestMaxBufferedInputsStopsAtMomentumBoundary(t *testing.T) {
+	source := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+	f := newBoundedFollower(t, source, 3, 1)
+
+	if _, ok, err := f.Next(); err != nil || !ok {
+		t.Fatalf("Next: got (ok=%v, err=%v), want (true, nil)", ok, err)
+	}
+	// Two momenta (four inputs) are the first whole-momentum total at or above the bound;
+	// one input has been handed out.
+	if got := len(f.buf); got != 3 {
+		t.Fatalf("buffered inputs after first Next: got %d, want 3", got)
+	}
+	if got := f.nextHeight; got != 3 {
+		t.Fatalf("nextHeight after first refill: got %d, want 3", got)
+	}
+}
+
+func TestMaxBufferedInputsRereadsDiscardedMomentaWithoutLossOrDuplication(t *testing.T) {
+	bounded := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+	unbounded := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+
+	got := drain(t, newBoundedFollower(t, bounded, 3, 1))
+	want := drain(t, newBoundedFollower(t, unbounded, 0, 1))
+
+	if len(got) != len(want) || len(got) != 12 {
+		t.Fatalf("drained inputs: got %d, unbounded %d, want 12", len(got), len(want))
+	}
+	for i := range want {
+		if !reflect.DeepEqual(got[i], want[i]) {
+			t.Fatalf("input %d: got %+v, want %+v", i, got[i], want[i])
+		}
+		if got[i].Ctx.GlobalInputIndex != uint64(i) {
+			t.Fatalf("input %d: globalInputIndex %d, want %d", i, got[i].Ctx.GlobalInputIndex, i)
+		}
+	}
+	if bounded.reads <= unbounded.reads {
+		t.Fatalf("source reads: bounded %d, unbounded %d, want bounded to read more often", bounded.reads, unbounded.reads)
+	}
+}
+
+func TestMaxBufferedInputsZeroBuffersWholeRangedRead(t *testing.T) {
+	source := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+	f := newBoundedFollower(t, source, 0, 1)
+
+	if _, ok, err := f.Next(); err != nil || !ok {
+		t.Fatalf("Next: got (ok=%v, err=%v), want (true, nil)", ok, err)
+	}
+	if got := len(f.buf); got != 11 {
+		t.Fatalf("buffered inputs after first Next: got %d, want 11", got)
+	}
+	if source.reads != 1 {
+		t.Fatalf("source reads: got %d, want 1", source.reads)
+	}
+}
+
+func TestMaxBufferedInputsReorgBeforeBoundSurfaces(t *testing.T) {
+	moms := chain(1, 4, func(h uint64) []*nom.AccountBlock {
+		return []*nom.AccountBlock{newBlock(1, h, 1, []byte{byte(h)})}
+	})
+	moms[1] = newMomentum(2, testHash(0xAA), []*nom.AccountBlock{newBlock(1, 2, 1, []byte{2})})
+	source := &fakeSource{frontier: 5, moms: moms}
+	f := newBoundedFollower(t, source, 3, 1)
+
+	if _, ok, err := f.Next(); err != nil || !ok {
+		t.Fatalf("Next 1: got (ok=%v, err=%v), want (true, nil)", ok, err)
+	}
+	_, ok, err := f.Next()
+	var reorg *ReorgError
+	if ok || !errors.As(err, &reorg) {
+		t.Fatalf("Next 2: got (ok=%v, err=%v), want a *ReorgError", ok, err)
+	}
+	if reorg.Height != 2 || reorg.Want != momHash(1) || reorg.Got != testHash(0xAA) {
+		t.Fatalf("Next 2: got %+v, want {Height:2 Want:%v Got:%v}", reorg, momHash(1), testHash(0xAA))
+	}
+}
+
+func TestMaxBufferedInputsReorgInDiscardedMomentumSurfacesOnLaterRefill(t *testing.T) {
+	moms := chain(1, 4, twoBlocksPerMomentum)
+	moms[2] = newMomentum(3, testHash(0xAA), twoBlocksPerMomentum(3))
+	source := &fakeSource{frontier: 5, moms: moms}
+	f := newBoundedFollower(t, source, 3, 1)
+
+	for i := 0; i < 4; i++ {
+		if _, ok, err := f.Next(); err != nil || !ok {
+			t.Fatalf("Next %d: got (ok=%v, err=%v), want (true, nil)", i, ok, err)
+		}
+	}
+	_, ok, err := f.Next()
+	var reorg *ReorgError
+	if ok || !errors.As(err, &reorg) || reorg.Height != 3 {
+		t.Fatalf("Next 5: got (ok=%v, err=%v), want a *ReorgError at height 3", ok, err)
+	}
+}
+
+func TestMaxBufferedInputsCeilingBeforeBoundEndsCleanly(t *testing.T) {
+	// Frontier 4 with depth 1 confirms heights 1..3, but the source folds height 4 into
+	// the window.
+	source := &fakeSource{frontier: 4, moms: chain(1, 5, twoBlocksPerMomentum), perCallCap: 5}
+	f := newBoundedFollower(t, source, 100, 1)
+
+	got := drain(t, f)
+	if len(got) != 6 {
+		t.Fatalf("drained inputs: got %d, want 6", len(got))
+	}
+	if got[len(got)-1].Ctx.MomentumHeight != 3 {
+		t.Fatalf("last input height: got %d, want 3", got[len(got)-1].Ctx.MomentumHeight)
 	}
 }

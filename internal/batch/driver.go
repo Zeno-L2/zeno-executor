@@ -157,16 +157,17 @@ type applied struct {
 //     the ledger no longer extends the last momentum the follower consumed, so inputs already
 //     popped and applied may come from a retracted momentum; returning them with a nil error
 //     would let the caller submit them before its next call tells it about the reorg. Nothing is
-//     lost by discarding: the store already carries their writes, and ticket 07's rollback must
-//     restore every durable side effect a discarded record produced, not only the cursor and the
-//     state trie: Store.Apply appends each diff to the durable WAL before this method returns
-//     (internal/state/store.go:117), so a rollback that only rewrites in-memory leaves lands back
+//     lost by discarding: the store already carries their writes, and the recovery layer's rollback
+//     must restore the durable side effects a discarded record produced that it owns — the cursor,
+//     the state trie and the WAL: Store.Apply appends each diff to the durable WAL before this
+//     method returns (internal/state/store.go:117), so a rollback that only rewrites in-memory leaves lands back
 //     on the discarded root after a restart replays that log; and Domain.DecodeInput (step 4,
 //     called before any admission or cap decision) can mutate a domain plugin's own local,
 //     non-consensus store outside the state trie — plugins/wasm's code store records a kind-3
 //     input's chunk bytes and a kind-2 input's pending record (plugins/wasm/wasm.go:104,123-134) —
-//     which a state-root rollback cannot reach and which ticket 07 must rebuild or re-derive
-//     itself.
+//     which a state-root rollback cannot reach and which the recovery layer does not rebuild; the
+//     divergence that leaves, and its operator remedy, are recorded in
+//     EXECUTOR §15.
 //
 //   - After a *ledger.ReorgError, the caller MUST NOT reuse this Driver instance: it caches the
 //     store's current root (currentRoot) and only ever refreshes it from its own Store.Apply
