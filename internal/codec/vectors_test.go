@@ -434,7 +434,7 @@ func testMeta1(t *testing.T, vec vectorRaw) {
 		t.Fatalf("UpgradePolicy = %d, want fields.upgrade_policy %d", m.UpgradePolicy, vec.Fields.UpgradePolicy)
 	}
 	if hex.EncodeToString(m.Owner[:]) != vec.Fields.OwnerHex {
-		t.Fatalf("Owner = %x, want fields.owner_hex %s", m.Owner, vec.Fields.OwnerHex)
+		t.Fatalf("Owner = %s, want fields.owner_hex %s", hex.EncodeToString(m.Owner[:]), vec.Fields.OwnerHex)
 	}
 
 	got := m.Encode()
