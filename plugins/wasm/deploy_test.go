@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -224,27 +225,90 @@ func TestContractIDFixedVector(t *testing.T) {
 	}
 }
 
-// --- applyDeployFinalize: the deployer identity source.
+// --- applyDeployFinalize: a stale pending record's deployer.
+//
+// Reproduces attempt A's record expiring (§11.5), a retracted branch's second start B reusing
+// A's code_hash, and a canonical finalize for A reading B's surviving record. The halt runs
+// before the validation-failure branch, so it also covers a stale record that would otherwise
+// fail record-bounds validation.
 
-func TestApplyDeployFinalizeContractIDFromSender(t *testing.T) {
-	p := newTestPlugin(t)
+func TestApplyDeployFinalizeStalePendingRecord(t *testing.T) {
 	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
 	a := types.Address{1}
 	b := types.Address{2}
-	codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
+	bMeta := codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyOwnerUpgradeable, Owner: b}.Encode()
 
-	ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: b}
-	eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	want := contractID(b, ctx.GlobalInputIndex, p.chainID)
-	if eff.ContractID != want {
-		t.Fatalf("ContractID = %x, want %x (derived from finalize's own L1Sender)", eff.ContractID, want)
-	}
-	if eff.ContractID == contractID(a, ctx.GlobalInputIndex, p.chainID) {
-		t.Fatal("ContractID equals the derivation from the pending record's stored deployer, want the finalize input's sender")
-	}
+	t.Run("DeployerMismatchHalts", func(t *testing.T) {
+		p := newTestPlugin(t)
+		seedDeployment(t, p, raw, a, immutableMetadata)
+		codeHash := seedDeployment(t, p, raw, b, bMeta)
+
+		ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: a}
+		eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
+		if err == nil || !strings.Contains(err.Error(), "stale pending record") {
+			t.Fatalf("Apply: err = %v, want a \"stale pending record\" error", err)
+		}
+		if !reflect.DeepEqual(eff, domain.Effects{}) {
+			t.Fatalf("Effects = %+v, want zero value", eff)
+		}
+	})
+
+	t.Run("DeployerMismatchHaltsEvenWhenRecordFailsValidation", func(t *testing.T) {
+		p := newTestPlugin(t)
+		codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
+
+		// B's start reuses A's code_hash with a record that would fail the record-bounds check
+		// (ChunkCount does not match TotalSize's ceiling) were it ever reached; the deployer
+		// comparison runs before that check, so the halt must fire regardless.
+		decodeStart(t, p, codec.DeployStartArgs{
+			CodeHash:     codeHash,
+			MetadataHash: types.Hash{0x09},
+			TotalSize:    uint64(len(raw)),
+			ChunkCount:   2,
+			Metadata:     bMeta,
+		}, domain.InputContext{L1Sender: b})
+
+		ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: a}
+		eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
+		if err == nil || !strings.Contains(err.Error(), "stale pending record") {
+			t.Fatalf("Apply: err = %v, want a \"stale pending record\" error", err)
+		}
+		if !reflect.DeepEqual(eff, domain.Effects{}) {
+			t.Fatalf("Effects = %+v, want zero value", eff)
+		}
+	})
+
+	t.Run("DeployerMatchSucceeds", func(t *testing.T) {
+		p := newTestPlugin(t)
+		seedDeployment(t, p, raw, a, immutableMetadata)
+		codeHash := seedDeployment(t, p, raw, b, bMeta)
+
+		ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: b}
+		eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusSuccess {
+			t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
+		}
+		wantID := contractID(b, ctx.GlobalInputIndex, p.chainID)
+		if eff.ContractID != wantID {
+			t.Fatalf("ContractID = %x, want %x", eff.ContractID, wantID)
+		}
+		wantOwnerHash := callerHash(b)
+		found := false
+		for _, e := range eff.StateDiff {
+			if e.Path == derive(wantID, keyOwner) {
+				found = true
+				if !bytes.Equal(e.Value, wantOwnerHash[:]) {
+					t.Fatalf("keyOwner leaf = %x, want %x", e.Value, wantOwnerHash)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("StateDiff has no keyOwner leaf")
+		}
+	})
 }
 
 // --- kinds 2/3 through Apply.

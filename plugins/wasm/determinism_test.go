@@ -108,8 +108,8 @@ func seedCodeStore(t *testing.T, p *Plugin, vec vectorJSON, warmInstrumented boo
 
 	switch {
 	case vec.InputKind == 4 || vec.InputKind == 5:
-		// The pending record and the chunks prepareModule assembles from. The seeded sender is
-		// not consensus-visible, so the row's own value is used.
+		// The pending record and the chunks prepareModule assembles from. A kind-4 finalize halts
+		// when the record's deployer differs from its sender, so the row's own l1_sender is seeded.
 		seedDeployment(t, p, raw, mustAddress(t, vec.L1Sender), mustHex(t, *vec.PendingMetadataHex))
 	case vec.Shape == "call":
 		// The key loadInstrumented looks the assembled tier up by: the row's pre_state carries
