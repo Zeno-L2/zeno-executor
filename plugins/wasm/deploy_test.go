@@ -50,9 +50,13 @@ func splitChunks(raw []byte) [][]byte {
 	return chunks
 }
 
+// immutableMetadata is the 23-byte version-1 IMMUTABLE, zero-owner ContractMetadata encoding.
+var immutableMetadata = codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyImmutable}.Encode()
+
 // seedDeployment drives a complete DeployStart + DeployChunk* sequence for raw through
-// DecodeInput, returning the pre-instrumentation code_hash.
-func seedDeployment(t *testing.T, p *Plugin, raw []byte, sender types.Address) types.Hash {
+// DecodeInput, returning the pre-instrumentation code_hash. metadata is passed in the
+// DeployStartArgs it decodes.
+func seedDeployment(t *testing.T, p *Plugin, raw []byte, sender types.Address, metadata []byte) types.Hash {
 	t.Helper()
 	codeHash := CodeHash(raw)
 	chunks := splitChunks(raw)
@@ -61,6 +65,7 @@ func seedDeployment(t *testing.T, p *Plugin, raw []byte, sender types.Address) t
 		MetadataHash: types.Hash{0x09},
 		TotalSize:    uint64(len(raw)),
 		ChunkCount:   uint32(len(chunks)),
+		Metadata:     metadata,
 	}, domain.InputContext{L1Sender: sender})
 	for i, c := range chunks {
 		decodeChunk(t, p, codeHash, uint32(i), c)
@@ -83,7 +88,7 @@ func upgradeState(id, oldCodeHash types.Hash, policyPresent bool, policy []byte,
 	return &mapState{values: values}
 }
 
-// assertUpgradeReads checks D20's fixed, branch-independent four-key read order.
+// assertUpgradeReads checks §20's fixed, branch-independent four-key read order.
 func assertUpgradeReads(t *testing.T, state *mapState, id types.Hash) {
 	t.Helper()
 	want := []domain.Path{
@@ -149,19 +154,26 @@ func buildElementModule(tableMin, elemOffset uint32) []byte {
 func TestDecodePendingRecordRoundTrip(t *testing.T) {
 	h := types.Hash{1, 2, 3}
 	addr := types.Address{4, 5, 6}
-	b := encodePendingRecord(h, 12345, 3, addr)
+	b := encodePendingRecord(h, 12345, 3, addr, immutableMetadata)
 
 	rec, ok := decodePendingRecord(b)
 	if !ok {
 		t.Fatal("decodePendingRecord: ok = false for a well-formed record")
 	}
-	if rec.MetadataHash != h || rec.TotalSize != 12345 || rec.ChunkCount != 3 || rec.Deployer != addr {
-		t.Fatalf("decodePendingRecord = %+v, want MetadataHash=%x TotalSize=12345 ChunkCount=3 Deployer=%x", rec, h, addr)
+	if rec.MetadataHash != h || rec.TotalSize != 12345 || rec.ChunkCount != 3 || rec.Deployer != addr || !bytes.Equal(rec.Metadata, immutableMetadata) {
+		t.Fatalf("decodePendingRecord = %+v, want MetadataHash=%x TotalSize=12345 ChunkCount=3 Deployer=%x Metadata=%x", rec, h, addr, immutableMetadata)
 	}
 
-	for _, n := range []int{63, 65, 0} {
+	// A length below pendingRecordPrefixSize is rejected; exactly the prefix width (empty
+	// metadata) and a length above it are accepted.
+	for _, n := range []int{63} {
 		if _, ok := decodePendingRecord(make([]byte, n)); ok {
 			t.Fatalf("decodePendingRecord: ok = true for length %d, want false", n)
+		}
+	}
+	for _, n := range []int{64, 65} {
+		if _, ok := decodePendingRecord(make([]byte, n)); !ok {
+			t.Fatalf("decodePendingRecord: ok = false for length %d, want true", n)
 		}
 	}
 }
@@ -219,7 +231,7 @@ func TestApplyDeployFinalizeContractIDFromSender(t *testing.T) {
 	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
 	a := types.Address{1}
 	b := types.Address{2}
-	codeHash := seedDeployment(t, p, raw, a)
+	codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
 
 	ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: b}
 	eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
@@ -318,7 +330,7 @@ func TestApplyDeployFinalizeSuccess(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newTestPlugin(t)
 			sender := types.Address{1, 2, 3}
-			codeHash := seedDeployment(t, p, tc.raw, sender)
+			codeHash := seedDeployment(t, p, tc.raw, sender, immutableMetadata)
 
 			ctx := domain.InputContext{GlobalInputIndex: 42, L1Sender: sender}
 			eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
@@ -375,6 +387,79 @@ func TestApplyDeployFinalizeSuccess(t *testing.T) {
 			}
 			if CodeHash(gotInstrumented) != wantCodeHash {
 				t.Fatal("stored instrumented bytes do not hash to wantCodeHash")
+			}
+		})
+	}
+}
+
+// --- finalize metadata: OWNER_UPGRADEABLE writes the owner leaf; malformed metadata is
+// VALIDATION_FAILED.
+
+func TestApplyDeployFinalizeOwnerUpgradeableWritesOwnerLeaf(t *testing.T) {
+	p := newTestPlugin(t)
+	sender := types.Address{1, 2, 3}
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	owner := types.Address{9, 9, 9}
+	metadata := codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyOwnerUpgradeable, Owner: owner}.Encode()
+	codeHash := seedDeployment(t, p, raw, sender, metadata)
+
+	ctx := domain.InputContext{GlobalInputIndex: 42, L1Sender: sender}
+	eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if eff.Status != codec.StatusSuccess {
+		t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
+	}
+
+	instrumented, err := module.Instrument(raw, moduleLimits())
+	if err != nil {
+		t.Fatalf("Instrument: %v", err)
+	}
+	wantCodeHash := CodeHash(instrumented)
+	wantOwnerHash := callerHash(owner)
+	wantDiff := sortStateDiff([]domain.StateDiffEntry{
+		{Path: derive(eff.ContractID, keyCodeHash), Value: wantCodeHash[:]},
+		{Path: derive(eff.ContractID, keyPreCodeHash), Value: codeHash[:]},
+		{Path: derive(eff.ContractID, keyUpgradePolicy), Value: []byte{policyOwnerUpgradeable}},
+		{Path: derive(eff.ContractID, keyOwner), Value: wantOwnerHash[:]},
+	})
+	if !reflect.DeepEqual(eff.StateDiff, wantDiff) {
+		t.Fatalf("StateDiff = %+v, want %+v", eff.StateDiff, wantDiff)
+	}
+}
+
+func TestApplyDeployFinalizeMalformedMetadataValidationFailed(t *testing.T) {
+	cases := []struct {
+		name     string
+		metadata []byte
+	}{
+		{"UnknownVersion", codec.ContractMetadata{Version: 2, UpgradePolicy: codec.PolicyImmutable}.Encode()},
+		{"Truncated", []byte{0x00, 0x01}},
+		{"TrailingBytes", append(append([]byte{}, immutableMetadata...), 0x00)},
+		{"InvalidPolicy", codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: 2}.Encode()},
+		{"ImmutableWithOwner", codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyImmutable, Owner: types.Address{1}}.Encode()},
+		{"OwnerUpgradeableZeroOwner", codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyOwnerUpgradeable}.Encode()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPlugin(t)
+			sender := types.Address{1, 2, 3}
+			raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+			codeHash := seedDeployment(t, p, raw, sender, tc.metadata)
+
+			eff, err := p.Apply(nil, Input{Ctx: domain.InputContext{L1Sender: sender}, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if eff.Status != codec.StatusValidationFailed {
+				t.Fatalf("Status = %v, want StatusValidationFailed", eff.Status)
+			}
+			if eff.ContractID != (types.Hash{}) || eff.CodeHash != (types.Hash{}) {
+				t.Fatalf("ContractID/CodeHash = %x/%x, want zero/zero", eff.ContractID, eff.CodeHash)
+			}
+			if len(eff.StateDiff) != 0 {
+				t.Fatalf("StateDiff = %+v, want empty", eff.StateDiff)
 			}
 		})
 	}
@@ -526,7 +611,7 @@ func TestApplyDeployFinalizeModuleRejection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newTestPlugin(t)
 			sender := types.Address{1}
-			codeHash := seedDeployment(t, p, tc.raw, sender)
+			codeHash := seedDeployment(t, p, tc.raw, sender, immutableMetadata)
 
 			eff, err := p.Apply(nil, Input{Ctx: domain.InputContext{L1Sender: sender}, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
 			if err != nil {
@@ -596,7 +681,7 @@ func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 		t.Cleanup(func() { _ = p.Close() })
 		sender := types.Address{1}
 		raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
-		codeHash := seedDeployment(t, p, raw, sender)
+		codeHash := seedDeployment(t, p, raw, sender, immutableMetadata)
 
 		dir := filepath.Join(root, entryPendingRecord.dirName())
 		if err := os.Chmod(dir, 0o000); err != nil {
@@ -618,7 +703,7 @@ func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 		t.Cleanup(func() { _ = p.Close() })
 		sender := types.Address{1}
 		raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
-		codeHash := seedDeployment(t, p, raw, sender)
+		codeHash := seedDeployment(t, p, raw, sender, immutableMetadata)
 
 		dir := filepath.Join(root, entryAssembledModule.dirName())
 		if err := os.Chmod(dir, 0o500); err != nil {
@@ -654,7 +739,7 @@ func TestDeployThenCall(t *testing.T) {
 	body = append(body, 0x0B)
 	raw := buildModule(&dataSeg{offset: offset, bytes: blob}, []byte{0x00}, body, 1)
 
-	codeHash := seedDeployment(t, p, raw, sender)
+	codeHash := seedDeployment(t, p, raw, sender, immutableMetadata)
 
 	finalizeCtx := domain.InputContext{GlobalInputIndex: 5, L1Sender: sender}
 	eff, err := p.Apply(nil, Input{Ctx: finalizeCtx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
@@ -763,7 +848,7 @@ func TestApplyUpgradeSuccess(t *testing.T) {
 	owner := callerHash(sender)
 
 	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
-	newPreCodeHash := seedDeployment(t, p, raw, sender)
+	newPreCodeHash := seedDeployment(t, p, raw, sender, immutableMetadata)
 
 	state := upgradeState(id, oldCodeHash, true, []byte{policyOwnerUpgradeable}, true, owner[:])
 	contractPath := derive(id, []byte{0x01, 0x00})
@@ -890,7 +975,7 @@ func TestApplyUpgradeSucceedsWithMalformedPreCodeHashWidth(t *testing.T) {
 	owner := callerHash(sender)
 
 	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
-	newPreCodeHash := seedDeployment(t, p, raw, sender)
+	newPreCodeHash := seedDeployment(t, p, raw, sender, immutableMetadata)
 
 	state := upgradeState(id, oldCodeHash, true, []byte{policyOwnerUpgradeable}, true, owner[:])
 	state.values[derive(id, keyPreCodeHash)] = make([]byte, 31)
@@ -905,6 +990,133 @@ func TestApplyUpgradeSucceedsWithMalformedPreCodeHashWidth(t *testing.T) {
 	}
 }
 
+// --- transfer ownership: read order and every status row.
+
+// assertTransferReads checks §20's fixed, branch-independent three-key read order (no
+// keyPreCodeHash read).
+func assertTransferReads(t *testing.T, state *mapState, id types.Hash) {
+	t.Helper()
+	want := []domain.Path{
+		derive(id, keyCodeHash),
+		derive(id, keyUpgradePolicy),
+		derive(id, keyOwner),
+	}
+	if !reflect.DeepEqual(state.reads, want) {
+		t.Fatalf("read sequence = %v, want %v", state.reads, want)
+	}
+}
+
+func TestApplyTransferOwnershipRows(t *testing.T) {
+	id := types.Hash{0x90}
+	codeHash := types.Hash{0xAB}
+	owner := callerHash(types.Address{1, 2, 3})
+	newOwnerAddr := types.Address{4, 5, 6}
+
+	t.Run("NoCodeHashLeafValidationFailed", func(t *testing.T) {
+		p := newTestPlugin(t)
+		state := &mapState{values: map[domain.Path][]byte{}}
+		eff, err := p.Apply(state, Input{Args: codec.TransferOwnershipArgs{ContractID: id, NewOwner: newOwnerAddr}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusValidationFailed {
+			t.Fatalf("Status = %v, want StatusValidationFailed", eff.Status)
+		}
+		if eff.ContractID != id {
+			t.Fatalf("ContractID = %x, want %x", eff.ContractID, id)
+		}
+		if eff.CodeHash != (types.Hash{}) {
+			t.Fatalf("CodeHash = %x, want zero", eff.CodeHash)
+		}
+		assertTransferReads(t, state, id)
+	})
+
+	t.Run("UnauthorizedNoOwnerLeaf", func(t *testing.T) {
+		p := newTestPlugin(t)
+		state := &mapState{values: map[domain.Path][]byte{
+			derive(id, keyCodeHash): codeHash[:],
+		}}
+		eff, err := p.Apply(state, Input{Args: codec.TransferOwnershipArgs{ContractID: id, NewOwner: newOwnerAddr}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusUnauthorized {
+			t.Fatalf("Status = %v, want StatusUnauthorized", eff.Status)
+		}
+		if eff.CodeHash != codeHash {
+			t.Fatalf("CodeHash = %x, want %x (current)", eff.CodeHash, codeHash)
+		}
+		assertTransferReads(t, state, id)
+	})
+
+	t.Run("SuccessNonZeroNewOwnerRewritesOwnerLeaf", func(t *testing.T) {
+		p := newTestPlugin(t)
+		state := &mapState{values: map[domain.Path][]byte{
+			derive(id, keyCodeHash):      codeHash[:],
+			derive(id, keyUpgradePolicy): {policyOwnerUpgradeable},
+			derive(id, keyOwner):         owner[:],
+		}}
+		ctx := domain.InputContext{L1Sender: types.Address{1, 2, 3}}
+		eff, err := p.Apply(state, Input{Ctx: ctx, Args: codec.TransferOwnershipArgs{ContractID: id, NewOwner: newOwnerAddr}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusSuccess {
+			t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
+		}
+		if eff.GasUsed != 0 {
+			t.Fatalf("GasUsed = %d, want 0", eff.GasUsed)
+		}
+		if eff.ContractID != id || eff.CodeHash != codeHash {
+			t.Fatalf("ContractID/CodeHash = %x/%x, want %x/%x", eff.ContractID, eff.CodeHash, id, codeHash)
+		}
+		newOwnerHash := callerHash(newOwnerAddr)
+		want := []domain.StateDiffEntry{{Path: derive(id, keyOwner), Value: newOwnerHash[:]}}
+		if !reflect.DeepEqual(eff.StateDiff, want) {
+			t.Fatalf("StateDiff = %+v, want %+v", eff.StateDiff, want)
+		}
+		if eff.Events != nil || eff.OutboxMessages != nil || eff.ReturnData != nil {
+			t.Fatalf("Events/OutboxMessages/ReturnData = %+v/%+v/%+v, want nil/nil/nil", eff.Events, eff.OutboxMessages, eff.ReturnData)
+		}
+		assertTransferReads(t, state, id)
+	})
+
+	t.Run("SuccessZeroNewOwnerRenounces", func(t *testing.T) {
+		p := newTestPlugin(t)
+		state := &mapState{values: map[domain.Path][]byte{
+			derive(id, keyCodeHash):      codeHash[:],
+			derive(id, keyUpgradePolicy): {policyOwnerUpgradeable},
+			derive(id, keyOwner):         owner[:],
+		}}
+		ctx := domain.InputContext{L1Sender: types.Address{1, 2, 3}}
+		eff, err := p.Apply(state, Input{Ctx: ctx, Args: codec.TransferOwnershipArgs{ContractID: id, NewOwner: types.Address{}}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusSuccess {
+			t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
+		}
+		want := sortStateDiff([]domain.StateDiffEntry{
+			{Path: derive(id, keyUpgradePolicy), Value: []byte{policyImmutable}},
+			{Path: derive(id, keyOwner), Value: nil},
+		})
+		if !reflect.DeepEqual(eff.StateDiff, want) {
+			t.Fatalf("StateDiff = %+v, want %+v", eff.StateDiff, want)
+		}
+		assertTransferReads(t, state, id)
+	})
+
+	t.Run("HaltsOnMalformedCodeHashWidth", func(t *testing.T) {
+		p := newTestPlugin(t)
+		state := &mapState{values: map[domain.Path][]byte{
+			derive(id, keyCodeHash): make([]byte, 31),
+		}}
+		if _, err := p.Apply(state, Input{Args: codec.TransferOwnershipArgs{ContractID: id, NewOwner: newOwnerAddr}}); err == nil {
+			t.Fatal("Apply: got nil error for a 31-byte keyCodeHash leaf, want a halt")
+		}
+	})
+}
+
 // --- upgrade behaviour must not depend on code-store cache warmth.
 
 func TestApplyUpgradeWarmVsColdCodeStore(t *testing.T) {
@@ -917,7 +1129,7 @@ func TestApplyUpgradeWarmVsColdCodeStore(t *testing.T) {
 	run := func(t *testing.T, warm bool) (domain.Effects, []domain.Path) {
 		t.Helper()
 		p := newTestPlugin(t)
-		newPreCodeHash := seedDeployment(t, p, raw, sender)
+		newPreCodeHash := seedDeployment(t, p, raw, sender, immutableMetadata)
 		if warm {
 			instrumented, err := module.Instrument(raw, moduleLimits())
 			if err != nil {

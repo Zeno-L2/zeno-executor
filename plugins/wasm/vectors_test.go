@@ -21,8 +21,8 @@ import (
 )
 
 // --- the JSON schema, frozen here for later volume tickets to add rows to. It changes only
-// alongside a version-constant bump, since the artifact's version fields are what a schema
-// change re-dates.
+// alongside a change to the committed bytes it describes: the regenerated artifact and its
+// vectorFileDigest.
 
 type vectorFile struct {
 	Artifact               string       `json:"artifact"` // "execution-conformance-v1"
@@ -56,8 +56,9 @@ type vectorJSON struct {
 	InstrumentedCodeHash   string            `json:"instrumented_code_hash,omitempty"` // SPEC's CodeHash (§11.4)
 	InputFrameHex          string            `json:"input_frame_hex,omitempty"`        // call shape only
 	PreState               map[string]string `json:"pre_state"`                        // derived path hex -> value hex ("" is present-empty)
+	PendingMetadataHex     *string           `json:"pending_metadata_hex,omitempty"`   // kinds 4,5 only
 	PreStateRoot           string            `json:"pre_state_root"`
-	WitnessKeys            []string          `json:"witness_keys"` // read ∪ written (D14), ascending
+	WitnessKeys            []string          `json:"witness_keys"` // read ∪ written (§20), ascending
 	Status                 string            `json:"status"`
 	GasUsed                uint64            `json:"gas_used"`
 	ContractEffectsBlobHex string            `json:"contract_effects_blob_hex,omitempty"`
@@ -80,12 +81,14 @@ type vectorInput struct {
 	PayloadHex     *string `json:"payload_hex,omitempty"`     // kind 0; "" for an empty payload
 	CodeHash       string  `json:"code_hash,omitempty"`       // kinds 2,3,4
 	MetadataHash   string  `json:"metadata_hash,omitempty"`   // kind 2
+	MetadataHex    *string `json:"metadata_hex,omitempty"`    // kind 2
 	TotalSize      *uint64 `json:"total_size,omitempty"`      // kind 2
 	ChunkCount     *uint32 `json:"chunk_count,omitempty"`     // kind 2
 	ChunkIndex     *uint32 `json:"chunk_index,omitempty"`     // kind 3; 0 is the single-chunk case
 	ChunkHash      string  `json:"chunk_hash,omitempty"`      // kind 3
-	ContractID     string  `json:"contract_id,omitempty"`     // kind 5
+	ContractID     string  `json:"contract_id,omitempty"`     // kinds 5,6
 	NewCodeHash    string  `json:"new_code_hash,omitempty"`   // kind 5
+	NewOwner       string  `json:"new_owner,omitempty"`       // kind 6; 20-byte hex
 }
 
 // vectorReceipt is the decoded §27.7 receipt view. Its code_hash is §11.4's CodeHash, i.e.
@@ -128,6 +131,7 @@ type vectorSpec struct {
 	Module                 []byte                 // raw, pre-instrumentation
 	ExtraPreState          map[domain.Path][]byte // seeded beyond the two reserved leaves
 	WantStatus             codec.Status           // the §15 status this vector exists to freeze
+	PendingMetadata        []byte                 // seeded into a kind-4/5 vector's pending record
 }
 
 // repeatedHash builds a 32-byte hash whose every byte is b.
@@ -302,9 +306,11 @@ func inputView(args codec.InputArgs) *vectorInput {
 			DepositAmount:  hex.EncodeToString(a.DepositAmount[:]),
 		}
 	case codec.DeployStartArgs:
+		metadataHex := hex.EncodeToString(a.Metadata)
 		return &vectorInput{
 			CodeHash:     hex.EncodeToString(a.CodeHash[:]),
 			MetadataHash: hex.EncodeToString(a.MetadataHash[:]),
+			MetadataHex:  strp(metadataHex),
 			TotalSize:    u64p(a.TotalSize),
 			ChunkCount:   u32p(a.ChunkCount),
 		}
@@ -320,6 +326,11 @@ func inputView(args codec.InputArgs) *vectorInput {
 		return &vectorInput{
 			ContractID:  hex.EncodeToString(a.ContractID[:]),
 			NewCodeHash: hex.EncodeToString(a.NewCodeHash[:]),
+		}
+	case codec.TransferOwnershipArgs:
+		return &vectorInput{
+			ContractID: hex.EncodeToString(a.ContractID[:]),
+			NewOwner:   hex.EncodeToString(a.NewOwner[:]),
 		}
 	default:
 		return nil
@@ -377,7 +388,7 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 
 	// Witness backend (hard requirement): the committed accessor MUST be a state.Store-backed
 	// state.Accessor. mapState records nothing on an absent-key Len observation, so a
-	// mapState-backed generator would silently drop exactly the entries D1 checks for.
+	// mapState-backed generator would silently drop exactly the entries N1 checks for.
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
 	if err != nil {
 		t.Fatalf("%s: state.Open: %v", spec.ID, err)
@@ -521,8 +532,8 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 }
 
 // generateUnsupportedVector drives one unrecognized-kind input through the real
-// DecodeInput/Apply seam (D18). Its canonical input is assembled here rather than by
-// codec.Input.Encode, which refuses a kind outside {0..5} by design: D34 fixes the encoding as
+// DecodeInput/Apply seam (§15). Its canonical input is assembled here rather than by
+// codec.Input.Encode, which refuses a kind outside {0..6} by design: §27.5 fixes the encoding as
 // input_kind:u8 ‖ source_account_block_hash:bytes32, with no tail.
 func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainID types.Hash) vectorJSON {
 	t.Helper()
@@ -634,7 +645,7 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 
 	kind := spec.Args.Kind()
 	if kind == codec.DeployFinalize || kind == codec.Upgrade {
-		gotCodeHash := seedDeployment(t, p, spec.Module, spec.Ctx.L1Sender)
+		gotCodeHash := seedDeployment(t, p, spec.Module, spec.Ctx.L1Sender, spec.PendingMetadata)
 		var wantCodeHash types.Hash
 		switch a := spec.Args.(type) {
 		case codec.DeployFinalizeArgs:
@@ -647,7 +658,12 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		}
 	}
 
-	codeHash := CodeHash(spec.Module)
+	var codeHash types.Hash
+	var haveModule bool
+	if spec.Module != nil {
+		codeHash = CodeHash(spec.Module)
+		haveModule = true
+	}
 
 	var instrumentedCodeHash types.Hash
 	var haveInstrumented bool
@@ -663,8 +679,19 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		instrumentedCodeHash = CodeHash(instrumented)
 		haveInstrumented = true
 	case spec.Shape == "validation_rejection":
-		if err := module.Validate(spec.Module, moduleLimits()); err == nil {
-			t.Fatalf("%s: Validate: want a non-nil error", spec.ID)
+		// Exactly one of module.Validate and codec.DecodeContractMetadata must fail; a rejected
+		// vector must have exactly one cause.
+		validateErr := module.Validate(spec.Module, moduleLimits())
+		_, metadataErr := codec.DecodeContractMetadata(spec.PendingMetadata)
+		failures := 0
+		if validateErr != nil {
+			failures++
+		}
+		if metadataErr != nil {
+			failures++
+		}
+		if failures != 1 {
+			t.Fatalf("%s: validation_rejection: got %d failure causes (Validate=%v, DecodeContractMetadata=%v), want exactly 1", spec.ID, failures, validateErr, metadataErr)
 		}
 	case kind == codec.Upgrade && spec.WantStatus != codec.StatusSuccess:
 		if err := module.Validate(spec.Module, moduleLimits()); err != nil {
@@ -746,8 +773,6 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		Input:                  inputView(spec.Args),
 		CanonicalInputHex:      hex.EncodeToString(canonical),
 		SourceDataHex:          hex.EncodeToString(spec.Ctx.SourceData),
-		ModuleWasmHex:          hex.EncodeToString(spec.Module),
-		CodeHash:               hex.EncodeToString(codeHash[:]),
 		PreState:               preState,
 		PreStateRoot:           hex.EncodeToString(preStateRoot[:]),
 		WitnessKeys:            witnessKeys,
@@ -758,8 +783,16 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		Receipt:                toVectorReceipt(ref.Receipt),
 		ReceiptHex:             hex.EncodeToString(ref.ReceiptBlob),
 	}
+	if haveModule {
+		vj.ModuleWasmHex = hex.EncodeToString(spec.Module)
+		vj.CodeHash = hex.EncodeToString(codeHash[:])
+	}
 	if haveInstrumented {
 		vj.InstrumentedCodeHash = hex.EncodeToString(instrumentedCodeHash[:])
+	}
+	if kind == codec.DeployFinalize || kind == codec.Upgrade {
+		metadataHex := hex.EncodeToString(spec.PendingMetadata)
+		vj.PendingMetadataHex = strp(metadataHex)
 	}
 
 	return vj
@@ -818,7 +851,15 @@ func TestGenerateVectors(t *testing.T) {
 	for _, spec := range deploySpecs {
 		vectors = append(vectors, generateDeployVector(t, spec))
 	}
-	vectors = append(vectors, generateUnsupportedVector(t, unsupported, 6, chainID))
+	vectors = append(vectors, generateUnsupportedVector(t, unsupported, 7, chainID))
+
+	assertChainedRoots(t, vectors, [][2]string{
+		{"EXEC-UPGRADE-2", "EXEC-DEPLOY-2"},
+		{"EXEC-TRANSFER-1", "EXEC-UPGRADE-2"},
+		{"EXEC-TRANSFER-2", "EXEC-TRANSFER-1"},
+		{"CV-UPGRADE-RENOUNCED-1", "EXEC-TRANSFER-2"},
+		{"CV-TRANSFER-UNAUTH-1", "EXEC-UPGRADE-2"},
+	})
 
 	file := vectorFile{
 		Artifact:               "execution-conformance-v1",
@@ -856,6 +897,31 @@ func TestGenerateVectors(t *testing.T) {
 	}
 }
 
+// assertChainedRoots asserts, for each (y, x) pair, that vector y's pre_state_root equals
+// vector x's post_state_root: y's ExtraPreState was hand-copied from x's post-state, and this
+// is the exact check that the copy is right, exact because every vector named here starts
+// generateDeployVector's store from empty.
+func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
+	t.Helper()
+	byID := make(map[string]vectorJSON, len(vectors))
+	for _, v := range vectors {
+		byID[v.ID] = v
+	}
+	for _, pair := range pairs {
+		y, ok := byID[pair[0]]
+		if !ok {
+			t.Fatalf("assertChainedRoots: vector %q not found", pair[0])
+		}
+		x, ok := byID[pair[1]]
+		if !ok {
+			t.Fatalf("assertChainedRoots: vector %q not found", pair[1])
+		}
+		if y.PreStateRoot != x.PostStateRoot {
+			t.Fatalf("%s.pre_state_root = %s, want %s.post_state_root = %s", y.ID, y.PreStateRoot, x.ID, x.PostStateRoot)
+		}
+	}
+}
+
 // --- the tripwire.
 
 // vectorFileDigest is the hand-recorded SHA-256 of the whole checked-in artifact. -update can
@@ -863,7 +929,7 @@ func TestGenerateVectors(t *testing.T) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "fcefe5dfba0c3fa1c0f0b9c7a39525b37bb85e9bce945b2a272e2848bb48caeb"
+const vectorFileDigest = "9e850651b8febc92f4ee2fa26d4f1cd6dca1626cc890b4d9ae01f792d0041b56"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {

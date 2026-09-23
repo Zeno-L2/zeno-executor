@@ -50,7 +50,7 @@ func toCallArgs(args codec.InputArgs) (callArgs, bool) {
 // reserved reads, deployed-target detection, module loading, frame assembly and encoding,
 // engine execution, and settlement.
 func (p *Plugin) applyCall(state domain.StateAccess, ctx domain.InputContext, args callArgs) (domain.Effects, error) {
-	// D20: unconditional, in this order, before any code-store lookup.
+	// §20: unconditional, in this order, before any code-store lookup.
 	codeHashLeaf, codeHashPresent, err := state.Read(derive(args.TargetContract, keyCodeHash))
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply call: read code hash: %w", err)
@@ -131,7 +131,7 @@ func buildFrame(chainID types.Hash, ctx domain.InputContext, args callArgs, code
 	}
 }
 
-// callerHash is the §9.2/D5 L1 caller identity: SHA3-256("L1_CALLER:" || raw 20 address bytes).
+// callerHash is the §9.2/§27.0/§14.1 L1 caller identity: SHA3-256("L1_CALLER:" || raw 20 address bytes).
 func callerHash(addr types.Address) types.Hash {
 	return hashOf(crypto.Hash([]byte("L1_CALLER:"), addr[:]))
 }

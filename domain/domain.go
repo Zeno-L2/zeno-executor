@@ -136,9 +136,9 @@ type RelayPayload struct {
 	Data []byte
 }
 
-// Source is implemented only by domains whose inputSource is L1_RELAYED or
-// EXTERNAL_OBSERVED — the relay role watches an external chain and posts what the domain's
-// STF will need onto L1. An L1_NATIVE domain implements only Domain.
+// Source is implemented only by domains whose inputSource is L1_RELAYED (§6.1) — the relay
+// role watches an external chain and posts what the domain's STF will need onto L1. An
+// L1_NATIVE domain implements only Domain.
 type Source interface {
 	Watch(ctx context.Context) (<-chan RelayPayload, error)
 }

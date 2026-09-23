@@ -60,7 +60,22 @@ func sampleInputs() []Input {
 				NewCodeHash: fillHash(0x0F),
 			},
 		},
+		{
+			SourceAccountBlockHash: fillHash(0x10),
+			Args: TransferOwnershipArgs{
+				ContractID: fillHash(0x11),
+				NewOwner:   fillAddress(0x12),
+			},
+		},
 	}
+}
+
+func fillAddress(b byte) types.Address {
+	var out types.Address
+	for i := range out {
+		out[i] = b
+	}
+	return out
 }
 
 func TestInputRoundTripAllKinds(t *testing.T) {
@@ -100,6 +115,8 @@ func argsTypeName(a InputArgs) string {
 		return "DeployFinalize"
 	case UpgradeArgs:
 		return "Upgrade"
+	case TransferOwnershipArgs:
+		return "TransferOwnership"
 	default:
 		return "unknown"
 	}
@@ -122,7 +139,7 @@ func TestInputHashMatchesIndependentSHA3(t *testing.T) {
 }
 
 func TestInputUnknownKind(t *testing.T) {
-	b := []byte{0x06} // kind 6 is out of the 0..5 range
+	b := []byte{0x07} // kind 7 is out of the 0..6 range
 	b = append(b, make([]byte, 32)...)
 	if _, err := DecodeInput(b); !errors.Is(err, ErrInvalidKind) {
 		t.Fatalf("got %v, want ErrInvalidKind", err)

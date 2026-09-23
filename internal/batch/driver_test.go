@@ -180,7 +180,7 @@ func callPayload(t *testing.T, src, target types.Hash, asset codec.AssetID, amou
 }
 
 // unsupportedPayload is a raw input_kind || source_account_block_hash prefix for a kind
-// outside 0..5, with no defined tail.
+// outside 0..6, with no defined tail.
 func unsupportedPayload(kind byte, src types.Hash) []byte {
 	b := make([]byte, 33)
 	b[0] = kind
@@ -577,6 +577,54 @@ func TestDriverCapCloseAndCarry(t *testing.T) {
 				got := new(big.Int).SetBytes(e.WithdrawalDebit[:])
 				if got.Cmp(want) != 0 {
 					t.Fatalf("WithdrawalDebit = %s, want %s", got, want)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no AssetFlowSummary entry for asset %x", asset)
+		}
+	})
+
+	t.Run("LoneInputDepositNearCapU256Invariant", func(t *testing.T) {
+		// A lone input's withdrawalDebit is at most MaxBatchWithdrawal + deposit <= 2^255 +
+		// (2^255 - 1) = 2^256 - 1 (codec/constants.go's u256 invariant): breach() must never
+		// reject this input for overflow.
+		contractID := hashN(2)
+		src := hashN(1)
+		asset := assetN(1)
+		depositAmt := u256Big(new(big.Int).Sub(cap, big.NewInt(1))) // 2^255 - 1
+
+		inputs := []ledger.Input{ledgerInput(0, callPayload(t, src, contractID, asset, depositAmt))}
+		dom := &fakeDomain{steps: []fakeStep{{effects: domain.Effects{
+			Status:     codec.StatusSuccess,
+			ContractID: contractID,
+			OutboxMessages: []codec.OutboxMessage{
+				{SourceContract: contractID, InputIndex: 0, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: asset, Amount: u256Big(cap)}},
+				{SourceContract: types.Hash{}, InputIndex: 0, OutboxIndex: 1, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: asset, Amount: depositAmt}},
+			},
+		}}}}
+		cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		got, ok, err := d.NextBatch()
+		if err != nil || !ok {
+			t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+		}
+		if len(got.Receipts) != 1 {
+			t.Fatalf("len(Receipts) = %d, want 1", len(got.Receipts))
+		}
+
+		want := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)) // 2^256 - 1
+		var found bool
+		for _, e := range got.Commitment.AssetFlowSummary {
+			if e.Asset == asset {
+				found = true
+				gotDebit := new(big.Int).SetBytes(e.WithdrawalDebit[:])
+				if gotDebit.Cmp(want) != 0 {
+					t.Fatalf("WithdrawalDebit = %s, want %s (2^256 - 1)", gotDebit, want)
 				}
 			}
 		}

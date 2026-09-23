@@ -73,8 +73,8 @@ func (p *Plugin) Genesis() domain.StateInit {
 // from an account block whose structure Settlement's method ABI already constrained, so a
 // malformed encoding, a kind-3 chunk-hash or chunk-size mismatch, or a SourceData/kind
 // mismatch is an internal fault, not a consensus outcome. An input_kind outside the Phase-1
-// set {0..5} is instead returned as Input{Unsupported: true} with a nil error, so Apply can
-// emit the deterministic UNSUPPORTED_OPERATION status (D18).
+// set {0..6} is instead returned as Input{Unsupported: true} with a nil error, so Apply can
+// emit the deterministic UNSUPPORTED_OPERATION status (§15).
 func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.Input, error) {
 	in, err := codec.DecodeInput(payload)
 	if err != nil {
@@ -128,7 +128,7 @@ func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.In
 		if err := p.store.delete(entryPendingRecord, args.CodeHash[:]); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
-		record := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, ctx.L1Sender)
+		record := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, ctx.L1Sender, args.Metadata)
 		if err := p.store.put(entryPendingRecord, args.CodeHash[:], record); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
@@ -137,15 +137,15 @@ func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.In
 	return Input{Ctx: ctx, Args: in.Args}, nil
 }
 
-// Apply serves all six input kinds: CallL2 and Deposit (0/1), the chunked-deployment receipts
-// and finalize (2-4), and the upgrade (5).
+// Apply serves all seven input kinds: CallL2 and Deposit (0/1), the chunked-deployment
+// receipts and finalize (2-4), the upgrade (5), and the ownership transfer (6).
 func (p *Plugin) Apply(state domain.StateAccess, in domain.Input) (domain.Effects, error) {
 	input, ok := in.(Input)
 	if !ok {
 		return domain.Effects{}, fmt.Errorf("wasm: apply: unexpected input type %T", in)
 	}
 	if input.Unsupported {
-		// D18 receipt side: gasUsed 0, zero contractId/codeHash, no outbox message —
+		// §15 receipt side: gasUsed 0, zero contractId/codeHash, no outbox message —
 		// deposit_asset/deposit_amount live in the tail that could not be decoded.
 		return domain.Effects{Status: codec.StatusUnsupportedOperation}, nil
 	}
@@ -159,6 +159,8 @@ func (p *Plugin) Apply(state domain.StateAccess, in domain.Input) (domain.Effect
 		return p.applyDeployFinalize(input.Ctx, args)
 	case codec.UpgradeArgs:
 		return p.applyUpgrade(state, input.Ctx, args)
+	case codec.TransferOwnershipArgs:
+		return p.applyTransferOwnership(state, input.Ctx, args)
 	}
 
 	callArgs, ok := toCallArgs(input.Args)
@@ -177,15 +179,17 @@ func deployChunkKey(codeHash types.Hash, chunkIndex uint32) []byte {
 	return key
 }
 
-// encodePendingRecord is the local, non-consensus fixed-width encoding of a chunked
-// deployment's pending record: metadata_hash(32) ‖ total_size(8, BE) ‖ chunk_count(4, BE) ‖
-// deployer_l1_address(20). Any encoding is legitimate here — the record never crosses the
-// consensus boundary — but it must be a pure function of the kind-2 input alone (§4).
-func encodePendingRecord(metadataHash types.Hash, totalSize uint64, chunkCount uint32, deployerL1Address types.Address) []byte {
-	buf := make([]byte, 0, len(metadataHash)+8+4+len(deployerL1Address))
+// encodePendingRecord is the local, non-consensus encoding of a chunked deployment's pending
+// record: the fixed-width prefix metadata_hash(32) ‖ total_size(8, BE) ‖ chunk_count(4, BE) ‖
+// deployer_l1_address(20), followed by the raw metadata bytes with no length prefix. Any
+// encoding is legitimate here — the record never crosses the consensus boundary — but it must
+// be a pure function of the kind-2 input alone (§4).
+func encodePendingRecord(metadataHash types.Hash, totalSize uint64, chunkCount uint32, deployerL1Address types.Address, metadata []byte) []byte {
+	buf := make([]byte, 0, len(metadataHash)+8+4+len(deployerL1Address)+len(metadata))
 	buf = append(buf, metadataHash[:]...)
 	buf = binary.BigEndian.AppendUint64(buf, totalSize)
 	buf = binary.BigEndian.AppendUint32(buf, chunkCount)
 	buf = append(buf, deployerL1Address[:]...)
+	buf = append(buf, metadata...)
 	return buf
 }

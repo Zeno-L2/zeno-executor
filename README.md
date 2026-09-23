@@ -6,9 +6,9 @@ off-consensus and settles commitments on L1 via the Settlement embedded contract
 
 Normative specs live in the **`zeno`** documentation repository, under `phase-1/`:
 `SPEC.md` (on-chain protocol), `EXECUTOR.md` (this binary), `ARCHITECTURE.md` (design
-companion), `AMENDMENTS.md` (the wire-format and normative-text decisions this repo's
-implementation work has forced), and `CHANGELOG.md`. Those copies are canonical: an
-amendment is applied there first and this repo builds against the result. This repo
+companion), `BRIDGES.md` (building bridges on the two), and `CHANGELOG.md` (revision
+history, with the reasoning behind each change). Those copies are canonical: a change is
+applied there first and this repo builds against the result. This repo
 implements the executor side of the split and `zeno`'s `phase-1/` set governs on any
 conflict.
 

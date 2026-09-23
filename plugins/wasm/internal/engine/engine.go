@@ -157,7 +157,7 @@ func (e *Engine) Run(hc HostContext, codeHash types.Hash, instrumented, frame []
 
 	budget := gasBudget
 	if budget > math.MaxInt64 {
-		budget = math.MaxInt64 // D24
+		budget = math.MaxInt64 // §10.1
 	}
 
 	if e.compiles >= e.compilesPerRebuild {
@@ -210,7 +210,7 @@ func (e *Engine) Run(hc HostContext, codeHash types.Hash, instrumented, frame []
 	}
 
 	if !mem.Write(0, frame) {
-		// The frame does not fit declared memory (D10 => RUNTIME_FAULT). Nothing ran, so the
+		// The frame does not fit declared memory (§27.1 => RUNTIME_FAULT). Nothing ran, so the
 		// only charge paid is the initial-memory one -- exactly §15's "metered".
 		return Outcome{Kind: Trapped, GasUsed: memCost}, nil
 	}

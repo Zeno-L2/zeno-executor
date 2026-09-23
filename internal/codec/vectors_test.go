@@ -42,6 +42,19 @@ type vectorRaw struct {
 	Records             []bundleRecordRaw `json:"records"`
 	BundleHex           string            `json:"bundle_hex"`
 	ExpectedDAHash      string            `json:"expected_da_hash"`
+	Rejected            []metaRejectRaw   `json:"rejected"`
+	Fields              *metaFieldsRaw    `json:"fields"`
+}
+
+type metaRejectRaw struct {
+	EncodedHex   string `json:"encoded_hex"`
+	RejectReason string `json:"reject_reason"`
+}
+
+type metaFieldsRaw struct {
+	MetadataVersion uint16 `json:"metadata_version"`
+	UpgradePolicy   uint8  `json:"upgrade_policy"`
+	OwnerHex        string `json:"owner_hex"`
 }
 
 type inputVectorRaw struct {
@@ -55,6 +68,7 @@ type bundleRecordRaw struct {
 	InputHex           string   `json:"input_hex"`
 	ExecutionResultHex string   `json:"execution_result_hex"`
 	ObservedKeys       []string `json:"observed_keys"`
+	DeployChunkDataHex string   `json:"deploy_chunk_data_hex"`
 }
 
 func loadConformanceVectors(t *testing.T) vectorFile {
@@ -89,6 +103,14 @@ func rejectSentinel(reason string) error {
 		return ErrNonEmptyWithdrawalPayload
 	case "invalid_asset_id":
 		return ErrInvalidAssetID
+	case "unknown_version":
+		return ErrUnknownVersion
+	case "truncated":
+		return ErrTruncated
+	case "invalid_upgrade_policy":
+		return ErrInvalidPolicy
+	case "invalid_owner":
+		return ErrInvalidOwner
 	default:
 		return nil
 	}
@@ -115,6 +137,12 @@ func TestConformanceVectors(t *testing.T) {
 				testGenericReject(t, vec, func(b []byte) error { _, err := DecodeOutboxMessage(b); return err })
 			case "CV-BUNDLE-1":
 				testBundle(t, vec)
+			case "CV-BUNDLE-2":
+				testBundle2(t, vec)
+			case "CV-META-1":
+				testMeta1(t, vec)
+			case "CV-META-2":
+				testMeta2(t, vec)
 			default:
 				t.Fatalf("unhandled vector id %q", vec.ID)
 			}
@@ -333,6 +361,104 @@ func testBundle(t *testing.T, vec vectorRaw) {
 	}
 }
 
+// testBundle2 checks CV-BUNDLE-2: a kind-3 record carrying deployChunkData followed by a
+// non-kind-3 record, both with real canonical inputs and a real encoded empty SUCCESS
+// ExecutionResult, no witnesses.
+func testBundle2(t *testing.T, vec vectorRaw) {
+	t.Helper()
+
+	if len(vec.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(vec.Records))
+	}
+
+	var records []BundleInputRecord
+	for i, r := range vec.Records {
+		rec := BundleInputRecord{
+			GlobalInputIndex: r.GlobalInputIndex,
+			InputData:        mustHexBytes(t, r.InputHex),
+			ExecutionResult:  mustHexBytes(t, r.ExecutionResultHex),
+		}
+		if r.DeployChunkDataHex != "" {
+			rec.DeployChunkData = mustHexBytes(t, r.DeployChunkDataHex)
+		}
+		records = append(records, rec)
+		if i == 0 && rec.DeployChunkData == nil {
+			t.Fatalf("record 0: want a kind-3 record carrying DeployChunkData")
+		}
+	}
+
+	bundleBytes := mustHexBytes(t, vec.BundleHex)
+	got, err := EncodeBundle(records)
+	if err != nil {
+		t.Fatalf("EncodeBundle: %v", err)
+	}
+	if !bytes.Equal(got, bundleBytes) {
+		t.Fatalf("EncodeBundle mismatch:\n got  %x\n want %x", got, bundleBytes)
+	}
+
+	decoded, err := DecodeBundle(bundleBytes)
+	if err != nil {
+		t.Fatalf("DecodeBundle: %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("DecodeBundle: got %d records, want 2", len(decoded))
+	}
+	if decoded[1].DeployChunkData != nil {
+		t.Fatalf("record 1 (kind-4): DeployChunkData = %x, want nil", decoded[1].DeployChunkData)
+	}
+
+	gotDAHash := hashOf(crypto.Hash(bundleBytes))
+	wantDAHash := mustHexBytes(t, vec.ExpectedDAHash)
+	if !bytes.Equal(gotDAHash[:], wantDAHash) {
+		t.Fatalf("expected_da_hash mismatch: got %x, want %x", gotDAHash, wantDAHash)
+	}
+}
+
+// testMeta1 checks CV-META-1: decode, compare the fields, and re-encode to reproduce
+// encoded_hex.
+func testMeta1(t *testing.T, vec vectorRaw) {
+	t.Helper()
+	encoded := mustHexBytes(t, vec.EncodedHex)
+	m, err := DecodeContractMetadata(encoded)
+	if err != nil {
+		t.Fatalf("DecodeContractMetadata: %v", err)
+	}
+
+	if vec.Fields == nil {
+		t.Fatalf("vector %s: fields is absent", vec.ID)
+	}
+	if m.Version != vec.Fields.MetadataVersion {
+		t.Fatalf("Version = %d, want fields.metadata_version %d", m.Version, vec.Fields.MetadataVersion)
+	}
+	if m.UpgradePolicy != vec.Fields.UpgradePolicy {
+		t.Fatalf("UpgradePolicy = %d, want fields.upgrade_policy %d", m.UpgradePolicy, vec.Fields.UpgradePolicy)
+	}
+	if hex.EncodeToString(m.Owner[:]) != vec.Fields.OwnerHex {
+		t.Fatalf("Owner = %x, want fields.owner_hex %s", m.Owner, vec.Fields.OwnerHex)
+	}
+
+	got := m.Encode()
+	if !bytes.Equal(got, encoded) {
+		t.Fatalf("Encode did not reproduce encoded_hex:\n got  %x\n want %x", got, encoded)
+	}
+}
+
+// testMeta2 checks CV-META-2: every rejected shape fails DecodeContractMetadata with its
+// mapped sentinel.
+func testMeta2(t *testing.T, vec vectorRaw) {
+	t.Helper()
+	for _, r := range vec.Rejected {
+		want := rejectSentinel(r.RejectReason)
+		if want == nil {
+			t.Fatalf("unmapped reject_reason %q", r.RejectReason)
+		}
+		encoded := mustHexBytes(t, r.EncodedHex)
+		if _, err := DecodeContractMetadata(encoded); !errors.Is(err, want) {
+			t.Fatalf("%s: got %v, want %v", r.RejectReason, err, want)
+		}
+	}
+}
+
 // leavesFromMap parses a pre_state_leaves object (derived-path hex -> value hex, "" ==
 // present-empty) into parallel path/value slices.
 func leavesFromMap(t *testing.T, m map[string]string) ([]trie.Path, [][]byte) {
@@ -405,7 +531,7 @@ func checkWitnesses(t *testing.T, label string, observedKeys []string, witnesses
 			t.Fatalf("%s: witness %d key mismatch: got %x, want %x", label, i, witnesses[i].DerivedKey, key)
 		}
 
-		present, _, proof, err := trie.ProveByPath(paths, values, key)
+		present, value, proof, err := trie.ProveByPath(paths, values, key)
 		if err != nil {
 			t.Fatalf("%s: ProveByPath(%s): %v", label, keyHex, err)
 		}
@@ -416,6 +542,13 @@ func checkWitnesses(t *testing.T, label string, observedKeys []string, witnesses
 		_, wantPresent := presentLeaves[keyHex]
 		if present != wantPresent {
 			t.Fatalf("%s: witness %d present = %v, want %v", label, i, present, wantPresent)
+		}
+		if present {
+			if !bytes.Equal(witnesses[i].Value, value) {
+				t.Fatalf("%s: witness %d value mismatch: got %x, want %x", label, i, witnesses[i].Value, value)
+			}
+		} else if witnesses[i].Value != nil {
+			t.Fatalf("%s: witness %d value = %x, want nil (absent)", label, i, witnesses[i].Value)
 		}
 
 		if !present {

@@ -6,7 +6,7 @@ import "github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 // only the bounds named inside its own grammar blocks). These are the plugin's own bounds,
 // enforced by the validator, the instrumentation ceiling, and the effects pipeline.
 const (
-	// MaxReturnData bounds ContractEffects.ReturnData (D15).
+	// MaxReturnData bounds ContractEffects.ReturnData (§14.3).
 	MaxReturnData = 4 << 10
 	// MaxExecutionResult bounds the final assembled ExecutionResult.
 	MaxExecutionResult = 32 << 10
@@ -33,10 +33,10 @@ const (
 	MaxStackDepth = 512
 	// MaxInstrumentedCodeSize is the post-instrumentation size ceiling (§21).
 	MaxInstrumentedCodeSize = 1 << 20
-	// MaxLocalsPerFunction bounds params + declared locals per function (D13).
+	// MaxLocalsPerFunction bounds params + declared locals per function (§25.1).
 	MaxLocalsPerFunction = 8192
 	// MaxTotalLocals bounds the sum of params + declared locals across every function in a
-	// module (D13). A function can be declared in as few as ~7 bytes regardless of its local
+	// module (§25.1). A function can be declared in as few as ~7 bytes regardless of its local
 	// count (a one-entry locals vector with a single run-length count), so MaxCodeSize alone
 	// does not bound functions x locals: a 256 KiB module could otherwise pack tens of
 	// thousands of functions each sitting at MaxLocalsPerFunction. Measured compile cost is
@@ -46,7 +46,7 @@ const (
 	// modules (thousands of functions with everyday local counts, or a much smaller number of
 	// functions each at MaxLocalsPerFunction).
 	MaxTotalLocals = 1 << 20
-	// MaxTableEntries bounds a declared table minimum (D13).
+	// MaxTableEntries bounds a declared table minimum (§25.1).
 	MaxTableEntries = 10000
 	// MaxTotalParams bounds the sum of every declared function type's parameter count across a
 	// module's type section. wazero's decode-time cache key for a function type is built with
@@ -58,22 +58,22 @@ const (
 	// how the type section's params are shaped, while still comfortably admitting realistic
 	// modules.
 	MaxTotalParams = 1 << 16
-	// MaxGlobals bounds a module's declared global count (D25). ~36ns of instantiation work
+	// MaxGlobals bounds a module's declared global count (§25.1). ~36ns of instantiation work
 	// each (one heap-allocated GlobalInstance per global), forcing that cost on every
 	// instantiation, i.e. every call, forever.
 	MaxGlobals = 1024
-	// MaxDataSegments bounds the data section's segment count (D25). ~16ns each (one copy per
+	// MaxDataSegments bounds the data section's segment count (§25.1). ~16ns each (one copy per
 	// active data segment applied at every instantiation).
 	MaxDataSegments = 1024
-	// MaxFunctions bounds the function section's count, i.e. locally defined functions (D25).
+	// MaxFunctions bounds the function section's count, i.e. locally defined functions (§25.1).
 	// ~11ns each (one []function entry built at every instantiation).
 	MaxFunctions = 8192
 	// MaxTotalElementEntries bounds the sum of every element segment's function-index count
-	// (D25). MaxTableEntries caps one table's declared minimum, not how many segments write into
+	// (§25.1). MaxTableEntries caps one table's declared minimum, not how many segments write into
 	// it, so it does not bound this dimension. ~2.5ns per entry (one table write at every
 	// instantiation).
 	MaxTotalElementEntries = 16384
-	// MaxTypeCount bounds the type section's declared function-type count (D25). The engine
+	// MaxTypeCount bounds the type section's declared function-type count (§25.1). The engine
 	// interns every declared type into its Store for the runtime's lifetime and never evicts
 	// one, at ~117 bytes per distinct type, so this is what bounds a module's permanent
 	// contribution to node heap: ~240 KiB at this cap (the interning key is ~3 bytes per

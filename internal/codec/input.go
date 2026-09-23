@@ -12,12 +12,13 @@ import (
 type InputKind uint8
 
 const (
-	CallL2         InputKind = 0
-	Deposit        InputKind = 1
-	DeployStart    InputKind = 2
-	DeployChunk    InputKind = 3
-	DeployFinalize InputKind = 4
-	Upgrade        InputKind = 5
+	CallL2            InputKind = 0
+	Deposit           InputKind = 1
+	DeployStart       InputKind = 2
+	DeployChunk       InputKind = 3
+	DeployFinalize    InputKind = 4
+	Upgrade           InputKind = 5
+	TransferOwnership InputKind = 6
 )
 
 // InputArgs is the kind-specific tail of a canonical input encoding (§27.5).
@@ -57,6 +58,7 @@ type DeployStartArgs struct {
 	MetadataHash types.Hash
 	TotalSize    uint64
 	ChunkCount   uint32
+	Metadata     []byte // §27.12 encoding, carried verbatim; validated by the runtime at finalize
 }
 
 // Kind returns DeployStart.
@@ -90,6 +92,15 @@ type UpgradeArgs struct {
 
 // Kind returns Upgrade.
 func (UpgradeArgs) Kind() InputKind { return Upgrade }
+
+// TransferOwnershipArgs is the input_kind = 6 tail (§12, §27.5).
+type TransferOwnershipArgs struct {
+	ContractID types.Hash
+	NewOwner   types.Address
+}
+
+// Kind returns TransferOwnership.
+func (TransferOwnershipArgs) Kind() InputKind { return TransferOwnership }
 
 // Input is the canonical input encoding's source: input_kind:u8 || source_hash:bytes32 ||
 // <kind-specific tail> (§27.5). This is byte-identical to the inputHash preimage and the
@@ -135,6 +146,7 @@ func (in Input) Encode() ([]byte, error) {
 		w.hash(args.MetadataHash)
 		w.u64(args.TotalSize)
 		w.u32(args.ChunkCount)
+		w.bytes(args.Metadata)
 	case DeployChunkArgs:
 		w.hash(args.CodeHash)
 		w.u32(args.ChunkIndex)
@@ -144,6 +156,9 @@ func (in Input) Encode() ([]byte, error) {
 	case UpgradeArgs:
 		w.hash(args.ContractID)
 		w.hash(args.NewCodeHash)
+	case TransferOwnershipArgs:
+		w.hash(args.ContractID)
+		w.address(args.NewOwner)
 	default:
 		return nil, fmt.Errorf("codec: encode input: %w", ErrInvalidKind)
 	}
@@ -222,7 +237,11 @@ func DecodeInput(b []byte) (Input, error) {
 		if err != nil {
 			return in, fmt.Errorf("codec: decode input: %w", err)
 		}
-		in.Args = DeployStartArgs{CodeHash: codeHash, MetadataHash: metadataHash, TotalSize: totalSize, ChunkCount: chunkCount}
+		metadata, err := r.bytes(^uint32(0))
+		if err != nil {
+			return in, fmt.Errorf("codec: decode input: %w", err)
+		}
+		in.Args = DeployStartArgs{CodeHash: codeHash, MetadataHash: metadataHash, TotalSize: totalSize, ChunkCount: chunkCount, Metadata: metadata}
 	case DeployChunk:
 		codeHash, err := r.hash()
 		if err != nil {
@@ -253,6 +272,16 @@ func DecodeInput(b []byte) (Input, error) {
 			return in, fmt.Errorf("codec: decode input: %w", err)
 		}
 		in.Args = UpgradeArgs{ContractID: contractID, NewCodeHash: newCodeHash}
+	case TransferOwnership:
+		contractID, err := r.hash()
+		if err != nil {
+			return in, fmt.Errorf("codec: decode input: %w", err)
+		}
+		newOwner, err := r.address()
+		if err != nil {
+			return in, fmt.Errorf("codec: decode input: %w", err)
+		}
+		in.Args = TransferOwnershipArgs{ContractID: contractID, NewOwner: newOwner}
 	default:
 		return in, fmt.Errorf("codec: decode input: %w", ErrInvalidKind)
 	}
@@ -264,7 +293,7 @@ func DecodeInput(b []byte) (Input, error) {
 }
 
 // CanonicalInput returns the §27.5 canonical input encoding for a raw payload: the payload
-// itself when it decodes as one of the six defined kinds, and the input_kind ||
+// itself when it decodes as one of the seven defined kinds, and the input_kind ||
 // source_account_block_hash prefix alone for any other kind, which defines no tail. This is
 // the inputHash preimage, the inputRoot leaf, and the bundle record's inputData.
 //

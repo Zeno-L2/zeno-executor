@@ -13,7 +13,10 @@ import (
 // or written present key, or a non-inclusion proof for an absent observation.
 type WitnessEntry struct {
 	DerivedKey trie.Path
-	Proof      []byte
+	// Value is the observed leaf value in the §27.2 value form: nil means absent (the EMPTY
+	// sentinel), a non-nil zero-length slice means present-empty.
+	Value []byte
+	Proof []byte
 }
 
 // BundleInputRecord is one input's entry in the canonical DA bundle (§20).
@@ -22,7 +25,7 @@ type BundleInputRecord struct {
 	InputData        []byte
 	Witnesses        []WitnessEntry
 	ExecutionResult  []byte
-	// DeployChunkData is the kind-3 chunk's raw bytes (OD-7). It is encoded, as a trailing
+	// DeployChunkData is the kind-3 chunk's raw bytes (§20). It is encoded, as a trailing
 	// Bytes field, only for a record whose InputData names input_kind 3; it MUST be nil for
 	// every other kind.
 	DeployChunkData []byte
@@ -53,6 +56,9 @@ func encodeBundleInputRecordBody(w *writer, rec BundleInputRecord) error {
 	w.u32(uint32(len(rec.Witnesses)))
 	for _, we := range rec.Witnesses {
 		w.path(we.DerivedKey)
+		if err := writeStateValue(w, we.Value); err != nil {
+			return err
+		}
 		w.bytes(we.Proof)
 	}
 	w.bytes(rec.ExecutionResult)
@@ -68,8 +74,8 @@ func encodeBundleInputRecordBody(w *writer, rec BundleInputRecord) error {
 }
 
 // minWitnessEntryEncodedSize is the smallest possible encoded WitnessEntry: derivedKey(32) +
-// proof length(4).
-const minWitnessEntryEncodedSize = 32 + 4
+// value length(4) + proof length(4).
+const minWitnessEntryEncodedSize = 32 + 4 + 4
 
 func decodeBundleInputRecordBody(r *reader) (BundleInputRecord, error) {
 	var rec BundleInputRecord
@@ -92,6 +98,10 @@ func decodeBundleInputRecordBody(r *reader) (BundleInputRecord, error) {
 		if err != nil {
 			return rec, err
 		}
+		value, err := readStateValue(r)
+		if err != nil {
+			return rec, err
+		}
 		proof, err := r.bytes(^uint32(0))
 		if err != nil {
 			return rec, err
@@ -104,7 +114,7 @@ func decodeBundleInputRecordBody(r *reader) (BundleInputRecord, error) {
 				return rec, ErrNotSorted
 			}
 		}
-		witnesses = append(witnesses, WitnessEntry{DerivedKey: key, Proof: proof})
+		witnesses = append(witnesses, WitnessEntry{DerivedKey: key, Value: value, Proof: proof})
 	}
 	rec.Witnesses = witnesses
 

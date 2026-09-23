@@ -19,7 +19,7 @@ import (
 
 // blobOffset is where a fixture's pre-encoded ContractEffects blob is placed when it is the
 // module's only data segment. It is clear of the input frame, which the runtime writes at
-// offset 0 after segment initialization (D8).
+// offset 0 after segment initialization (§7.3, §27.1).
 const blobOffset = 1024
 
 // returnBlobBody is the tail every returning fixture ends with: i64.const (offset<<32)|len; end.
@@ -1040,11 +1040,66 @@ func callVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
+	// --- step 5a footprint: CV-ASSETS-1/2. First advance n once, so the sequence skips the
+	// 0xD4 source hash EXEC-UNSUP-1 holds.
+	newIdentity()
+
+	{
+		idx, src := newIdentity()
+		outbox := make([]codec.OutboxMessage, 17)
+		for i := range outbox {
+			outbox[i] = codec.OutboxMessage{SourceContract: cid2, InputIndex: idx, OutboxIndex: uint32(i), Target: codec.L1Withdrawal{RecipientL1: repeatedAddr(0xCC), Asset: assetsTestAssetDistinct(byte(i + 1)), Amount: u256(1)}}
+		}
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx, Outbox: outbox})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-ASSETS-1",
+			Purpose:                "17 distinct-asset withdrawals in one input breach the per-input asset footprint: RUNTIME_FAULT at the metered gas",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WantStatus:             codec.StatusRuntimeFault,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		outbox := make([]codec.OutboxMessage, 16)
+		for i := range outbox {
+			outbox[i] = codec.OutboxMessage{SourceContract: cid2, InputIndex: idx, OutboxIndex: uint32(i), Target: codec.L1Withdrawal{RecipientL1: repeatedAddr(0xCC), Asset: assetsTestAssetDistinct(byte(i + 1)), Amount: u256(1)}}
+		}
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx, Outbox: outbox, ClaimedDeposit: codec.U256{}})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-ASSETS-2",
+			Purpose:                "16 distinct-asset withdrawals plus a non-zero deposit in a 17th asset breach the footprint: RUNTIME_FAULT, full refund",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WantStatus:             codec.StatusRuntimeFault,
+		})
+	}
+
 	return specs
 }
 
-// unsupportedVector returns EXEC-UNSUP-1's vectorSpec: input_kind 6 is outside the Phase-1 set,
-// so DecodeInput returns Input{Unsupported: true} and Apply commits UNSUPPORTED_OPERATION (D18).
+// assetsTestAssetDistinct returns a valid AssetID distinct from testAsset() for every b in
+// [1,17]: only the trailing byte varies, and testAsset() sets bytes within
+// [32-ZenonTokenStandardSize:32) to a fixed non-trailing-byte-1..17 pattern.
+func assetsTestAssetDistinct(b byte) codec.AssetID {
+	var a codec.AssetID
+	a[31] = b
+	return a
+}
+
+// unsupportedVector returns EXEC-UNSUP-1's vectorSpec: input_kind 7 is outside the Phase-1 set,
+// so DecodeInput returns Input{Unsupported: true} and Apply commits UNSUPPORTED_OPERATION (§15).
 func unsupportedVector() vectorSpec {
 	return vectorSpec{
 		ID:      "EXEC-UNSUP-1",

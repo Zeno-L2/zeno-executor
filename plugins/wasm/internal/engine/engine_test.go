@@ -458,7 +458,7 @@ func TestRunBudgetClampedToInt64(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.Kind != Returned {
-		t.Fatalf("Kind = %v, want Returned (D24 clamp), got %v", out.Kind, out)
+		t.Fatalf("Kind = %v, want Returned (§10.1 clamp), got %v", out.Kind, out)
 	}
 }
 

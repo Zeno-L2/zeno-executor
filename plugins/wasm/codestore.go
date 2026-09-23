@@ -48,7 +48,7 @@ func (k entryKind) dirName() string {
 
 var allEntryKinds = []entryKind{entryDeployChunk, entryPendingRecord, entryAssembledModule, entryInstrumentedModule}
 
-// codeStore is the local, non-consensus, checksummed disk tier the D21 carve-out permits
+// codeStore is the local, non-consensus, checksummed disk tier the EXECUTOR §2 carve-out permits
 // Apply and DecodeInput to read and memoize into. There is no in-memory byte tier: the OS page
 // cache is sufficient at this scale (§4). Every entry carries a SHA3-256 checksum of its own
 // bytes, and a checksum mismatch — corruption, or a write that never completed — is treated
