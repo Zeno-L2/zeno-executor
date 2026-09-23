@@ -10,7 +10,7 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
 )
 
-// Reserved local keys (§13.3, D2): exactly these four two-byte strings, matched exactly and
+// Reserved local keys (§13.3): exactly these four two-byte strings, matched exactly and
 // never by prefix, so a contract keying its own state by a zero-padded big-endian integer
 // never collides with the reserved space.
 var (

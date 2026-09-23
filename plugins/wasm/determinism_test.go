@@ -102,7 +102,7 @@ func seedCodeStore(t *testing.T, p *Plugin, vec vectorJSON, warmInstrumented boo
 	t.Helper()
 
 	if vec.ModuleWasmHex == "" {
-		return // the unsupported_kind vector: nothing to seed.
+		return // the unsupported_kind and ownership vectors: nothing to seed.
 	}
 	raw := mustHex(t, vec.ModuleWasmHex)
 
@@ -110,7 +110,7 @@ func seedCodeStore(t *testing.T, p *Plugin, vec vectorJSON, warmInstrumented boo
 	case vec.InputKind == 4 || vec.InputKind == 5:
 		// The pending record and the chunks prepareModule assembles from. The seeded sender is
 		// not consensus-visible, so the row's own value is used.
-		seedDeployment(t, p, raw, mustAddress(t, vec.L1Sender))
+		seedDeployment(t, p, raw, mustAddress(t, vec.L1Sender), mustHex(t, *vec.PendingMetadataHex))
 	case vec.Shape == "call":
 		// The key loadInstrumented looks the assembled tier up by: the row's pre_state carries
 		// pre_code_hash as this same value.
@@ -357,7 +357,7 @@ func TestDeterminismCacheMatrix(t *testing.T) {
 // EXEC-002 is the vector that makes this observable: its module passes a "probe" local key to
 // env.storage_len and never writes it, so the derived path is in the frozen witness set only
 // because state.Accessor.Len records an absent-key observation and mapState.Len records
-// nothing. This does not duplicate checkD1WitnessBackendTripwire, which asserts the shape of
+// nothing. This does not duplicate checkN1WitnessBackendTripwire, which asserts the shape of
 // the frozen artifact; this test executes the substitution the acceptance criterion names and
 // shows the resulting witness set is strictly smaller — exactly what makes
 // assertOutcome's length-before-element comparison fail loudly rather than pass.

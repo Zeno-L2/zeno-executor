@@ -75,7 +75,7 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
-	// Step 2a (D27): every event and outbox message must be attributed to the executing
+	// Step 2a (§27.1a): every event and outbox message must be attributed to the executing
 	// contract.
 	for _, e := range eff.Events {
 		if e.ContractID != s.ContractID {
@@ -120,10 +120,10 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
-	// Step 5a (D35): the per-asset, per-batch withdrawal cap (§27.9), enforced here against this
-	// input alone so that every input the STF settles as SUCCESS fits within one batch alone. The
-	// asset footprint includes the input's own deposit — not merely the asset — since that is the
-	// exact upper bound on the refund the runtime appends after this method returns.
+	// Step 5a (§27.9, §10.6): the per-asset withdrawal cap applies to this input's contract
+	// withdrawals, summed per asset. The deposit amount is not counted, so step 5a never limits
+	// a deposit's size; the deposit asset counts toward the asset footprint because every
+	// deposit adds a depositCredit to the batch's AssetFlowSummary.
 	totals := map[codec.AssetID]*big.Int{}
 	for _, m := range eff.Outbox {
 		w, ok := m.Target.(codec.L1Withdrawal)
@@ -137,15 +137,11 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		}
 		total.Add(total, new(big.Int).SetBytes(w.Amount[:]))
 	}
-	if s.DepositAmount != (codec.U256{}) {
-		total, ok := totals[s.DepositAsset]
-		if !ok {
-			total = new(big.Int)
-			totals[s.DepositAsset] = total
-		}
-		total.Add(total, new(big.Int).SetBytes(s.DepositAmount[:]))
+	footprint := len(totals)
+	if _, ok := totals[s.DepositAsset]; s.DepositAmount != (codec.U256{}) && !ok {
+		footprint++
 	}
-	if len(totals) > codec.MaxAssetsPerBatch {
+	if footprint > codec.MaxAssetsPerBatch {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 	cap := new(big.Int).SetBytes(codec.MaxBatchWithdrawal[:])
@@ -246,7 +242,7 @@ func (s settlement) fail(status codec.Status, gasUsed uint64) domain.Effects {
 // effectCharge is the §10.4 post-execution charge over the contract's declared effects: one per
 // StateDiff entry by value bytes (a deletion charges base only), one per event by data bytes,
 // one per contract outbox message by payload bytes, and one for ReturnData, charged
-// unconditionally including when it is empty. The runtime-emitted refund is not charged (D16).
+// unconditionally including when it is empty. The runtime-emitted refund is not charged (§10.6).
 func effectCharge(eff codec.ContractEffects) uint64 {
 	var total uint64
 	for _, e := range eff.StateDiff {

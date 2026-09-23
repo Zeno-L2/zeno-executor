@@ -46,4 +46,10 @@ var (
 	// ErrRootsPresent is returned when bytes claiming to be a ContractEffects blob also parse
 	// as a 9-field ExecutionResult (i.e. carry preStateRoot/postStateRoot).
 	ErrRootsPresent = errors.New("codec: roots present")
+	// ErrInvalidPolicy is returned when a ContractMetadata's upgrade_policy is not one of the
+	// §27.12 ordinals.
+	ErrInvalidPolicy = errors.New("codec: invalid upgrade policy")
+	// ErrInvalidOwner is returned when a ContractMetadata's owner is inconsistent with its
+	// upgrade_policy (§27.12).
+	ErrInvalidOwner = errors.New("codec: owner inconsistent with upgrade policy")
 )

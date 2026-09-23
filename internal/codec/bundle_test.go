@@ -32,8 +32,8 @@ func sampleBundleRecords(t testing.TB) []BundleInputRecord {
 		GlobalInputIndex: 0,
 		InputData:        []byte("input-0"),
 		Witnesses: []WitnessEntry{
-			{DerivedKey: present, Proof: presentProof},
-			{DerivedKey: absent, Proof: absentProof},
+			{DerivedKey: present, Value: []byte("v"), Proof: presentProof},
+			{DerivedKey: absent, Value: nil, Proof: absentProof},
 		},
 		ExecutionResult: []byte("result-0"),
 	}
@@ -68,6 +68,8 @@ func TestBundleRoundTrip(t *testing.T) {
 		}
 		for j := range rec.Witnesses {
 			if got[i].Witnesses[j].DerivedKey != rec.Witnesses[j].DerivedKey ||
+				!bytes.Equal(got[i].Witnesses[j].Value, rec.Witnesses[j].Value) ||
+				(got[i].Witnesses[j].Value == nil) != (rec.Witnesses[j].Value == nil) ||
 				!bytes.Equal(got[i].Witnesses[j].Proof, rec.Witnesses[j].Proof) {
 				t.Errorf("record %d witness %d: got %+v, want %+v", i, j, got[i].Witnesses[j], rec.Witnesses[j])
 			}
@@ -145,7 +147,7 @@ func TestBundleEmptyRecordSetRoundTrips(t *testing.T) {
 	}
 }
 
-// TestBundleKind3DeployChunkData covers OD-7's kind-3-scoped DeployChunkData field: it
+// TestBundleKind3DeployChunkData covers §20's kind-3-scoped DeployChunkData field: it
 // round-trips for a kind-3 record, is rejected on a non-kind-3 record, does not panic on an
 // empty InputData, and leaves a kind-4 record's encoding unchanged.
 func TestBundleKind3DeployChunkData(t *testing.T) {
@@ -231,6 +233,50 @@ func TestBundleKind3DeployChunkData(t *testing.T) {
 			t.Errorf("round trip mismatch: got %x, want %x", rebuilt, b)
 		}
 	})
+}
+
+func TestBundleWitnessValuePresentEmptyAndAbsent(t *testing.T) {
+	records := sampleBundleRecords(t)
+	present := records[0].Witnesses[0]
+	absent := records[0].Witnesses[1]
+
+	present.Value = []byte{}
+	rec := BundleInputRecord{
+		GlobalInputIndex: 0,
+		InputData:        []byte("input-0"),
+		Witnesses:        []WitnessEntry{present},
+		ExecutionResult:  []byte("result-0"),
+	}
+	b, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := DecodeBundle(b)
+	if err != nil {
+		t.Fatalf("DecodeBundle: %v", err)
+	}
+	if got[0].Witnesses[0].Value == nil || len(got[0].Witnesses[0].Value) != 0 {
+		t.Fatalf("present-empty: got %+v, want non-nil zero-length", got[0].Witnesses[0].Value)
+	}
+
+	absent.Value = nil
+	rec = BundleInputRecord{
+		GlobalInputIndex: 0,
+		InputData:        []byte("input-0"),
+		Witnesses:        []WitnessEntry{absent},
+		ExecutionResult:  []byte("result-0"),
+	}
+	b, err = rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err = DecodeBundle(b)
+	if err != nil {
+		t.Fatalf("DecodeBundle: %v", err)
+	}
+	if got[0].Witnesses[0].Value != nil {
+		t.Fatalf("absent: got %+v, want nil", got[0].Witnesses[0].Value)
+	}
 }
 
 func TestBundleHashStability(t *testing.T) {

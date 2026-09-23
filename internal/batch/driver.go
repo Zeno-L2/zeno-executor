@@ -60,10 +60,10 @@ var (
 	// re-hash) failed to reproduce the bundle bytes DAHash commits.
 	ErrDAHashMismatch = errors.New("batch: DA bundle round-trip mismatch")
 	// ErrUnbatchable reports that the first input of a batch alone exceeds a per-batch cap.
-	// plugins/wasm's ordered validation step 5a makes this unreachable: it rejects any input
-	// whose own withdrawal-plus-deposit footprint would breach either cap, so every input the
-	// STF settles as SUCCESS fits within one batch alone. Kept as a structural, fail-closed
-	// guard.
+	// plugins/wasm's step 5a bounds each input's contract withdrawals per asset and its asset
+	// footprint, and the u256 invariant on codec.MaxBatchWithdrawal keeps a lone input's
+	// totals representable, so this is unreachable in practice. Kept as a structural,
+	// fail-closed guard.
 	ErrUnbatchable = errors.New("batch: first input of a batch alone exceeds a per-batch cap")
 	// ErrEffectsInvariant reports that an input's Effects carried content that violates a
 	// committed invariant: on a non-SUCCESS status, §14.3/§15 forbid a non-empty StateDiff,
@@ -163,11 +163,12 @@ type applied struct {
 //     method returns (internal/state/store.go:117), so a rollback that only rewrites in-memory leaves lands back
 //     on the discarded root after a restart replays that log; and Domain.DecodeInput (step 4,
 //     called before any admission or cap decision) can mutate a domain plugin's own local,
-//     non-consensus store outside the state trie — plugins/wasm's code store records a kind-3
-//     input's chunk bytes and a kind-2 input's pending record (plugins/wasm/wasm.go:104,123-134) —
-//     which a state-root rollback cannot reach and which the recovery layer does not rebuild; the
-//     divergence that leaves, and its operator remedy, are recorded in
-//     EXECUTOR §15.
+//     non-consensus store outside the state trie. Replay rewrites every chunk a canonical
+//     finalize assembles, because Settlement accepts a finalize only once every chunk is present
+//     (§11.3). The unrepaired path (EXECUTOR §15): the retracted branch saw a pending record
+//     expire (§11.5) and accepted a second DeployContractStart for the same code_hash; that
+//     second record survives the rollback, and a canonical finalize for the first record
+//     assembles against it. Operator remedy: EXECUTOR §15.
 //
 //   - After a *ledger.ReorgError, the caller MUST NOT reuse this Driver instance: it caches the
 //     store's current root (currentRoot) and only ever refreshes it from its own Store.Apply
@@ -334,11 +335,16 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	keys := witnessKeys(acc.Witnesses(), eff.StateDiff)
 	witnesses := make([]codec.WitnessEntry, 0, len(keys))
 	for _, k := range keys {
-		_, _, proof, err := d.cfg.Store.Prove(k)
+		present, value, proof, err := d.cfg.Store.Prove(k)
 		if err != nil {
 			return applied{}, fmt.Errorf("batch: prove: %w", err)
 		}
-		witnesses = append(witnesses, codec.WitnessEntry{DerivedKey: k, Proof: proof})
+		if !present {
+			value = nil
+		} else if value == nil {
+			value = []byte{}
+		}
+		witnesses = append(witnesses, codec.WitnessEntry{DerivedKey: k, Value: value, Proof: proof})
 	}
 	rec.witnesses = witnesses
 

@@ -3,6 +3,7 @@ package wasm
 import (
 	"testing"
 
+	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/domain"
@@ -42,6 +43,12 @@ var rejectionReasons = map[string]error{
 	"CV-REJECT-SIMD-1":    module.ErrSIMD,
 	"CV-REJECT-SIGNEXT-1": module.ErrSignExtension,
 	"CV-REJECT-SATCONV-1": module.ErrSaturatingConversion,
+	"CV-DEPLOY-META-1":    codec.ErrUnknownVersion,
+	"CV-DEPLOY-META-2":    codec.ErrTruncated,
+	"CV-DEPLOY-META-3":    codec.ErrTrailingBytes,
+	"CV-DEPLOY-META-4":    codec.ErrInvalidPolicy,
+	"CV-DEPLOY-META-5":    codec.ErrInvalidOwner,
+	"CV-DEPLOY-META-6":    codec.ErrInvalidOwner,
 }
 
 // deployVectors returns every deploy-shape and validation_rejection-shape vectorSpec, in the
@@ -72,9 +79,10 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args: codec.DeployStartArgs{
 				CodeHash:     CodeHash(deployModule),
-				MetadataHash: types.Hash{0x09},
+				MetadataHash: hashOf(crypto.Hash(immutableMetadata)),
 				TotalSize:    uint64(len(deployModule)),
 				ChunkCount:   1,
+				Metadata:     immutableMetadata,
 			},
 			Module:     deployModule,
 			WantStatus: codec.StatusSuccess,
@@ -113,6 +121,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(deployModule)},
 			Module:                 deployModule,
+			PendingMetadata:        immutableMetadata,
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -136,7 +145,8 @@ func deployVectors(t *testing.T) []vectorSpec {
 				derive(upCid, keyUpgradePolicy): {policyOwnerUpgradeable},
 				derive(upCid, keyOwner):         upOwnerHash[:],
 			},
-			WantStatus: codec.StatusSuccess,
+			PendingMetadata: []byte{},
+			WantStatus:      codec.StatusSuccess,
 		})
 	}
 
@@ -153,6 +163,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.UpgradeArgs{ContractID: undeployedCid, NewCodeHash: CodeHash(upgradeModule)},
 			Module:                 upgradeModule,
 			ExtraPreState:          nil,
+			PendingMetadata:        []byte{},
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}
@@ -172,7 +183,8 @@ func deployVectors(t *testing.T) []vectorSpec {
 			ExtraPreState: map[domain.Path][]byte{
 				derive(unauthCid, keyCodeHash): unauthOldHash[:],
 			},
-			WantStatus: codec.StatusUnauthorized,
+			PendingMetadata: []byte{},
+			WantStatus:      codec.StatusUnauthorized,
 		})
 	}
 
@@ -199,6 +211,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
 			Module:                 fixture,
+			PendingMetadata:        immutableMetadata,
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}
@@ -215,6 +228,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
 			Module:                 fixture,
+			PendingMetadata:        immutableMetadata,
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}
@@ -231,6 +245,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
 			Module:                 fixture,
+			PendingMetadata:        immutableMetadata,
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}
@@ -247,6 +262,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
 			Module:                 fixture,
+			PendingMetadata:        immutableMetadata,
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}
@@ -263,6 +279,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
 			Module:                 fixture,
+			PendingMetadata:        immutableMetadata,
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}
@@ -279,6 +296,218 @@ func deployVectors(t *testing.T) []vectorSpec {
 			SourceAccountBlockHash: src,
 			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(fixture)},
 			Module:                 fixture,
+			PendingMetadata:        immutableMetadata,
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	// --- Contract metadata, upgrade policy and ownership: a chained sequence of vectors sharing
+	// ownedCid's reserved leaves (§11.3, §12, §15, §27.12). Each vector's spec.ExtraPreState is
+	// the reserved leaves the vector before it in the chain leaves, computed inline (generateDeployVector
+	// gives every vectorSpec its own fresh store; nothing here shares a store across vectors).
+
+	testnetChainID := hashOf(crypto.Hash([]byte("ZENON_WASM_L2:"), []byte("testnet")))
+	deployInstrumented, err := module.Instrument(deployModule, moduleLimits())
+	if err != nil {
+		t.Fatalf("Instrument(deployModule): %v", err)
+	}
+	deployInstrumentedHash := CodeHash(deployInstrumented)
+	upgradeInstrumented, err := module.Instrument(upgradeModule, moduleLimits())
+	if err != nil {
+		t.Fatalf("Instrument(upgradeModule): %v", err)
+	}
+	upgradeInstrumentedHash := CodeHash(upgradeInstrumented)
+
+	ownerMetadata := codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyOwnerUpgradeable, Owner: repeatedAddr(0x01)}.Encode()
+	owner1Hash := callerHash(repeatedAddr(0x01))
+	owner2Hash := callerHash(repeatedAddr(0x02))
+
+	var ownedCid types.Hash
+
+	{
+		idx, src := newIdentity()
+		ownedCid = contractID(repeatedAddr(0x01), idx, testnetChainID)
+		specs = append(specs, vectorSpec{
+			ID:                     "EXEC-DEPLOY-2",
+			Purpose:                "an OWNER_UPGRADEABLE deploy writes the policy and owner leaves alongside the two code-hash leaves",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             ownedCid,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(deployModule)},
+			Module:                 deployModule,
+			PendingMetadata:        ownerMetadata,
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// EXEC-DEPLOY-2's post-state: the four reserved leaves applyDeployFinalize writes for an
+	// OWNER_UPGRADEABLE deploy.
+	deployModuleHash := CodeHash(deployModule)
+	deploy2PostState := map[domain.Path][]byte{
+		derive(ownedCid, keyCodeHash):      deployInstrumentedHash[:],
+		derive(ownedCid, keyPreCodeHash):   deployModuleHash[:],
+		derive(ownedCid, keyUpgradePolicy): {policyOwnerUpgradeable},
+		derive(ownedCid, keyOwner):         owner1Hash[:],
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "EXEC-UPGRADE-2",
+			Purpose:                "an authorized upgrade of an OWNER_UPGRADEABLE contract leaves its policy and owner leaves untouched",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             ownedCid,
+			Args:                   codec.UpgradeArgs{ContractID: ownedCid, NewCodeHash: CodeHash(upgradeModule)},
+			Module:                 upgradeModule,
+			ExtraPreState:          deploy2PostState,
+			PendingMetadata:        []byte{},
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// EXEC-UPGRADE-2's post-state: keyCodeHash/keyPreCodeHash rewritten to the new module;
+	// policy and owner unchanged.
+	upgradeModuleHash := CodeHash(upgradeModule)
+	upgrade2PostState := map[domain.Path][]byte{
+		derive(ownedCid, keyCodeHash):      upgradeInstrumentedHash[:],
+		derive(ownedCid, keyPreCodeHash):   upgradeModuleHash[:],
+		derive(ownedCid, keyUpgradePolicy): {policyOwnerUpgradeable},
+		derive(ownedCid, keyOwner):         owner1Hash[:],
+	}
+
+	{
+		idx, src := newIdentity()
+		ctx := stdCtx(idx)
+		specs = append(specs, vectorSpec{
+			ID:                     "EXEC-TRANSFER-1",
+			Purpose:                "an owner's transfer rewrites only the owner leaf",
+			Shape:                  "ownership",
+			BatchID:                4,
+			Ctx:                    ctx,
+			SourceAccountBlockHash: src,
+			ContractID:             ownedCid,
+			Args:                   codec.TransferOwnershipArgs{ContractID: ownedCid, NewOwner: repeatedAddr(0x02)},
+			ExtraPreState:          upgrade2PostState,
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// EXEC-TRANSFER-1's post-state: keyOwner rewritten to repeatedAddr(0x02)'s caller hash.
+	transfer1PostState := map[domain.Path][]byte{
+		derive(ownedCid, keyCodeHash):      upgradeInstrumentedHash[:],
+		derive(ownedCid, keyPreCodeHash):   upgradeModuleHash[:],
+		derive(ownedCid, keyUpgradePolicy): {policyOwnerUpgradeable},
+		derive(ownedCid, keyOwner):         owner2Hash[:],
+	}
+
+	{
+		idx, src := newIdentity()
+		ctx := stdCtx(idx)
+		ctx.L1Sender = repeatedAddr(0x02)
+		specs = append(specs, vectorSpec{
+			ID:                     "EXEC-TRANSFER-2",
+			Purpose:                "a renounce (zero new_owner) sets the policy to IMMUTABLE and deletes the owner leaf",
+			Shape:                  "ownership",
+			BatchID:                4,
+			Ctx:                    ctx,
+			SourceAccountBlockHash: src,
+			ContractID:             ownedCid,
+			Args:                   codec.TransferOwnershipArgs{ContractID: ownedCid, NewOwner: types.Address{}},
+			ExtraPreState:          transfer1PostState,
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// EXEC-TRANSFER-2's post-state: policy IMMUTABLE, owner leaf absent.
+	transfer2PostState := map[domain.Path][]byte{
+		derive(ownedCid, keyCodeHash):      upgradeInstrumentedHash[:],
+		derive(ownedCid, keyPreCodeHash):   upgradeModuleHash[:],
+		derive(ownedCid, keyUpgradePolicy): {policyImmutable},
+	}
+
+	{
+		idx, src := newIdentity()
+		ctx := stdCtx(idx)
+		ctx.L1Sender = repeatedAddr(0x02)
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-UPGRADE-RENOUNCED-1",
+			Purpose:                "an upgrade against a renounced (IMMUTABLE, no owner leaf) contract is UNAUTHORIZED",
+			Shape:                  "deploy",
+			BatchID:                4,
+			Ctx:                    ctx,
+			SourceAccountBlockHash: src,
+			ContractID:             ownedCid,
+			Args:                   codec.UpgradeArgs{ContractID: ownedCid, NewCodeHash: CodeHash(deployModule)},
+			Module:                 deployModule,
+			ExtraPreState:          transfer2PostState,
+			PendingMetadata:        []byte{},
+			WantStatus:             codec.StatusUnauthorized,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		ctx := stdCtx(idx)
+		ctx.L1Sender = repeatedAddr(0x03)
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-TRANSFER-UNAUTH-1",
+			Purpose:                "a transfer by a non-owner is UNAUTHORIZED and its receipt carries the unchanged CodeHash",
+			Shape:                  "ownership",
+			BatchID:                4,
+			Ctx:                    ctx,
+			SourceAccountBlockHash: src,
+			ContractID:             ownedCid,
+			Args:                   codec.TransferOwnershipArgs{ContractID: ownedCid, NewOwner: repeatedAddr(0x04)},
+			ExtraPreState:          upgrade2PostState,
+			WantStatus:             codec.StatusUnauthorized,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-TRANSFER-UNDEPLOYED-1",
+			Purpose:                "a transfer naming a contract_id with no code-hash leaf is VALIDATION_FAILED",
+			Shape:                  "ownership",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             undeployedCid,
+			Args:                   codec.TransferOwnershipArgs{ContractID: undeployedCid, NewOwner: repeatedAddr(0x02)},
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	// --- CV-DEPLOY-META-1..6: each malformed pending-metadata shape CV-META-2 also rejects, in
+	// the same order.
+	deployMetaCases := []struct {
+		id       string
+		metadata []byte
+	}{
+		{"CV-DEPLOY-META-1", codec.ContractMetadata{Version: 2, UpgradePolicy: codec.PolicyImmutable}.Encode()},
+		{"CV-DEPLOY-META-2", immutableMetadata[:22]},
+		{"CV-DEPLOY-META-3", append(append([]byte{}, immutableMetadata...), 0x00)},
+		{"CV-DEPLOY-META-4", codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: 2}.Encode()},
+		{"CV-DEPLOY-META-5", codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyImmutable, Owner: repeatedAddr(0x01)}.Encode()},
+		{"CV-DEPLOY-META-6", codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyOwnerUpgradeable}.Encode()},
+	}
+	for _, tc := range deployMetaCases {
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     tc.id,
+			Purpose:                "a deploy finalize against malformed pending metadata is VALIDATION_FAILED",
+			Shape:                  "validation_rejection",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.DeployFinalizeArgs{CodeHash: CodeHash(deployModule)},
+			Module:                 deployModule,
+			PendingMetadata:        tc.metadata,
 			WantStatus:             codec.StatusValidationFailed,
 		})
 	}

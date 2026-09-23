@@ -44,7 +44,7 @@ func encodeInput(t *testing.T, args codec.InputArgs) []byte {
 	return b
 }
 
-func TestDecodeInputAcceptsAllSixKinds(t *testing.T) {
+func TestDecodeInputAcceptsAllSevenKinds(t *testing.T) {
 	p := newTestPlugin(t)
 
 	chunkData := []byte("chunk bytes")
@@ -61,6 +61,7 @@ func TestDecodeInputAcceptsAllSixKinds(t *testing.T) {
 		{"DeployChunk", codec.DeployChunkArgs{CodeHash: types.Hash{2}, ChunkIndex: 0, ChunkHash: chunkHash}, domain.InputContext{SourceData: chunkData}},
 		{"DeployFinalize", codec.DeployFinalizeArgs{CodeHash: types.Hash{2}}, domain.InputContext{}},
 		{"Upgrade", codec.UpgradeArgs{ContractID: types.Hash{4}, NewCodeHash: types.Hash{5}}, domain.InputContext{}},
+		{"TransferOwnership", codec.TransferOwnershipArgs{ContractID: types.Hash{6}, NewOwner: types.Address{7}}, domain.InputContext{}},
 	}
 
 	for _, tc := range cases {
@@ -87,9 +88,9 @@ func TestDecodeInputAcceptsAllSixKinds(t *testing.T) {
 func TestDecodeInputUnsupportedKindNoError(t *testing.T) {
 	p := newTestPlugin(t)
 
-	// input_kind = 6 is outside the Phase-1 set {0..5}; the tail is irrelevant since
+	// input_kind = 7 is outside the Phase-1 set {0..6}; the tail is irrelevant since
 	// codec.DecodeInput rejects on the kind byte before reading it.
-	payload := append([]byte{6}, make([]byte, 32)...)
+	payload := append([]byte{7}, make([]byte, 32)...)
 
 	got, err := p.DecodeInput(domain.InputContext{}, payload)
 	if err != nil {
@@ -100,7 +101,7 @@ func TestDecodeInputUnsupportedKindNoError(t *testing.T) {
 		t.Fatalf("DecodeInput: got %T, want wasm.Input", got)
 	}
 	if !in.Unsupported {
-		t.Fatal("DecodeInput: Unsupported = false, want true for input_kind = 6")
+		t.Fatal("DecodeInput: Unsupported = false, want true for input_kind = 7")
 	}
 }
 
@@ -272,7 +273,7 @@ func TestDecodeInputKind2WritesPendingRecord(t *testing.T) {
 	if !ok {
 		t.Fatal("store.get: pending record not found after DecodeInput")
 	}
-	want := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, sender)
+	want := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, sender, args.Metadata)
 	if string(got) != string(want) {
 		t.Fatalf("store.get: record = %x, want %x", got, want)
 	}

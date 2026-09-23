@@ -62,6 +62,68 @@ func TestBuilderAbsentReadWitness(t *testing.T) {
 	}
 }
 
+// --- witness Value: present, present-empty, absent ---
+
+func TestBuilderWitnessValuePresentPresentEmptyAbsent(t *testing.T) {
+	src := hashN(1)
+	contractID := hashN(2)
+	present := pathN(6)
+	presentEmpty := pathN(7)
+	absent := pathN(8)
+
+	inputs := []ledger.Input{
+		ledgerInput(0, callPayload(t, src, contractID, codec.AssetID{}, codec.U256{})),
+		ledgerInput(1, callPayload(t, src, contractID, codec.AssetID{}, codec.U256{})),
+	}
+	dom := &fakeDomain{steps: []fakeStep{
+		{effects: domain.Effects{
+			Status:     codec.StatusSuccess,
+			ContractID: contractID,
+			StateDiff: []domain.StateDiffEntry{
+				{Path: present, Value: []byte("v")},
+				{Path: presentEmpty, Value: []byte{}},
+			},
+		}},
+		{reads: []trie.Path{present, presentEmpty, absent}, effects: domain.Effects{Status: codec.StatusSuccess, ContractID: contractID}},
+	}}
+	cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+	d, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	got, ok, err := d.NextBatch()
+	if err != nil || !ok {
+		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+	}
+	if len(got.Receipts) != 2 {
+		t.Fatalf("len(Receipts) = %d, want 2", len(got.Receipts))
+	}
+
+	decoded, err := codec.DecodeBundle(got.Bundle)
+	if err != nil {
+		t.Fatalf("DecodeBundle: %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("len(decoded) = %d, want 2", len(decoded))
+	}
+
+	values := map[trie.Path][]byte{}
+	for _, w := range decoded[1].Witnesses {
+		values[w.DerivedKey] = w.Value
+	}
+
+	if v, ok := values[present]; !ok || !bytes.Equal(v, []byte("v")) {
+		t.Fatalf("present witness Value = %v, want %q", v, "v")
+	}
+	if v, ok := values[presentEmpty]; !ok || v == nil || len(v) != 0 {
+		t.Fatalf("present-empty witness Value = %v, want non-nil zero-length", v)
+	}
+	if v, ok := values[absent]; !ok || v != nil {
+		t.Fatalf("absent witness Value = %v, want nil", v)
+	}
+}
+
 // --- test 10: two-asset summary ---
 
 func TestBuilderTwoAssetSummary(t *testing.T) {

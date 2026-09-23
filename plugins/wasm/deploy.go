@@ -15,31 +15,33 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
-// Upgrade policy byte values stored under the 0x0003 reserved key (D2).
+// Upgrade policy byte values stored under the 0x0003 reserved key.
 const (
-	policyImmutable        byte = 0
-	policyOwnerUpgradeable byte = 1
+	policyImmutable        = codec.PolicyImmutable
+	policyOwnerUpgradeable = codec.PolicyOwnerUpgradeable
 )
 
-// pendingRecordSize is the fixed width of encodePendingRecord's output:
-// metadata_hash(32) + total_size(8) + chunk_count(4) + deployer_l1_address(20).
-const pendingRecordSize = 64
+// pendingRecordPrefixSize is the fixed width of encodePendingRecord's prefix, before the raw
+// metadata bytes: metadata_hash(32) + total_size(8) + chunk_count(4) + deployer_l1_address(20).
+const pendingRecordPrefixSize = 64
 
-// pendingRecord is the decoded kind-2 record DecodeInput wrote to the local store. Only
-// TotalSize and ChunkCount are used; MetadataHash has no consumer (§12's policy declaration has
-// no transport, D28) and Deployer is decoded for round-trip fidelity with encodePendingRecord
-// and is deliberately read by nothing on the consensus path (see contractID).
+// pendingRecord is the decoded kind-2 record DecodeInput wrote to the local store.
+// MetadataHash and Deployer are decoded for round-trip fidelity with encodePendingRecord and
+// are read by nothing on the consensus path (see contractID); Metadata feeds finalize's §27.12
+// validation.
 type pendingRecord struct {
 	MetadataHash types.Hash
 	TotalSize    uint64
 	ChunkCount   uint32
 	Deployer     types.Address
+	Metadata     []byte
 }
 
-// decodePendingRecord is encodePendingRecord's inverse. ok is false for any length other than
-// pendingRecordSize; the caller turns that into a halt (D30).
+// decodePendingRecord is encodePendingRecord's inverse. ok is false only when b is shorter
+// than pendingRecordPrefixSize; the caller turns that into a halt (EXECUTOR §15 code-store
+// row). Metadata is a copy of b[pendingRecordPrefixSize:].
 func decodePendingRecord(b []byte) (pendingRecord, bool) {
-	if len(b) != pendingRecordSize {
+	if len(b) < pendingRecordPrefixSize {
 		return pendingRecord{}, false
 	}
 	var rec pendingRecord
@@ -47,17 +49,19 @@ func decodePendingRecord(b []byte) (pendingRecord, bool) {
 	rec.TotalSize = binary.BigEndian.Uint64(b[32:40])
 	rec.ChunkCount = binary.BigEndian.Uint32(b[40:44])
 	copy(rec.Deployer[:], b[44:64])
+	rec.Metadata = append([]byte(nil), b[pendingRecordPrefixSize:]...)
 	return rec, true
 }
 
 // prepareModule runs §11.3's finalize steps 1-6 plus step 7's CodeHash derivation against a
 // pre-instrumentation code_hash, and memoizes both derived module tiers on success. It returns
-// only the derived CodeHash: nothing else it computes is consensus-visible, and in particular
-// the pending record's recorded deployer must never leave this function (see contractID).
+// the derived CodeHash and the pending record's metadata for the caller's §27.12 validation:
+// nothing else it computes is consensus-visible, and in particular the pending record's
+// recorded deployer must never leave this function (see contractID).
 //
 // Call-site contract, mandatory and in this order:
 //
-//	codeHash, ok, err := p.prepareModule(h)
+//	codeHash, metadata, ok, err := p.prepareModule(h)
 //	if err != nil {
 //		return domain.Effects{}, err   // halt: this node cannot see what other nodes can
 //	}
@@ -69,30 +73,30 @@ func decodePendingRecord(b []byte) (pendingRecord, bool) {
 // testing ok first would silently commit a halt as a status. The shape is codeStore.get's and
 // domain.StateAccess.Read's (value, ok, err), which every existing call site in call.go already
 // handles error-first.
-func (p *Plugin) prepareModule(preCodeHash types.Hash) (types.Hash, bool, error) {
+func (p *Plugin) prepareModule(preCodeHash types.Hash) (codeHash types.Hash, metadata []byte, ok bool, err error) {
 	// 1. Pending record.
 	recBytes, ok, err := p.store.get(entryPendingRecord, preCodeHash[:])
 	if err != nil {
-		return types.Hash{}, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x: %w", preCodeHash, err)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x: %w", preCodeHash, err)
 	}
 	if !ok {
-		return types.Hash{}, false, fmt.Errorf("wasm: prepare module: no pending record for code hash %x; local recovery required", preCodeHash)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: no pending record for code hash %x; local recovery required", preCodeHash)
 	}
 	record, ok := decodePendingRecord(recBytes)
 	if !ok {
-		return types.Hash{}, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x has unexpected length %d; local recovery required", preCodeHash, len(recBytes))
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x has unexpected length %d; local recovery required", preCodeHash, len(recBytes))
 	}
 
 	// 2. Record bounds, before any chunk lookup.
 	if record.ChunkCount < 1 || record.ChunkCount > MaxChunkCount {
-		return types.Hash{}, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 	if record.TotalSize < 1 || record.TotalSize > MaxCodeSize {
-		return types.Hash{}, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 	wantChunkCount := uint32((record.TotalSize + MaxDeployChunkData - 1) / MaxDeployChunkData)
 	if record.ChunkCount != wantChunkCount {
-		return types.Hash{}, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 
 	// 3. Chunks.
@@ -100,39 +104,39 @@ func (p *Plugin) prepareModule(preCodeHash types.Hash) (types.Hash, bool, error)
 	for i := uint32(0); i < record.ChunkCount; i++ {
 		chunk, ok, err := p.store.get(entryDeployChunk, deployChunkKey(preCodeHash, i))
 		if err != nil {
-			return types.Hash{}, false, fmt.Errorf("wasm: prepare module: chunk %d for code hash %x: %w", i, preCodeHash, err)
+			return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: chunk %d for code hash %x: %w", i, preCodeHash, err)
 		}
 		if !ok {
-			return types.Hash{}, false, fmt.Errorf("wasm: prepare module: missing chunk %d for code hash %x; local recovery required", i, preCodeHash)
+			return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: missing chunk %d for code hash %x; local recovery required", i, preCodeHash)
 		}
 		assembled = append(assembled, chunk...)
 	}
 
 	// 4. Assembly verification.
 	if uint64(len(assembled)) != record.TotalSize || CodeHash(assembled) != preCodeHash {
-		return types.Hash{}, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 
 	// 5. Derive.
-	instrumented, codeHash, ok := p.deriveModule(assembled)
+	instrumented, derivedHash, ok := p.deriveModule(assembled)
 	if !ok {
-		return types.Hash{}, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 
 	// 6. Memoize.
 	if err := p.store.put(entryAssembledModule, preCodeHash[:], assembled); err != nil {
-		return types.Hash{}, false, fmt.Errorf("wasm: prepare module: memoize assembled module for code hash %x: %w", preCodeHash, err)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: memoize assembled module for code hash %x: %w", preCodeHash, err)
 	}
-	if err := p.store.put(entryInstrumentedModule, codeHash[:], instrumented); err != nil {
-		return types.Hash{}, false, fmt.Errorf("wasm: prepare module: memoize instrumented module for code hash %x: %w", codeHash, err)
+	if err := p.store.put(entryInstrumentedModule, derivedHash[:], instrumented); err != nil {
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: memoize instrumented module for code hash %x: %w", derivedHash, err)
 	}
 
-	return codeHash, true, nil
+	return derivedHash, record.Metadata, true, nil
 }
 
 // deriveModule runs finalize steps 5-7 over assembled bytes: validation, the engine compile of
 // the original, instrumentation, the engine compile of the instrumented output, and the CodeHash
-// derivation. It has no error return because none of these steps can ever be a halt (D22, D31):
+// derivation. It has no error return because none of these steps can ever be a halt (§11.3):
 // every one of them is a pure, deterministic function of the assembled bytes under the pinned
 // engine, so a rejection here is a rejection on every node. ok == false is VALIDATION_FAILED.
 func (p *Plugin) deriveModule(assembled []byte) (instrumented []byte, codeHash types.Hash, ok bool) {
@@ -163,11 +167,16 @@ func (p *Plugin) deriveModule(assembled []byte) (instrumented []byte, codeHash t
 // applyDeployFinalize serves input_kind 4 (§11.3). It takes no StateAccess: a finalize reads no
 // state, so its witness set is empty on every path.
 func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployFinalizeArgs) (domain.Effects, error) {
-	codeHash, ok, err := p.prepareModule(args.CodeHash)
+	codeHash, metadata, ok, err := p.prepareModule(args.CodeHash)
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply deploy finalize: %w", err)
 	}
 	if !ok {
+		return domain.Effects{Status: codec.StatusValidationFailed}, nil
+	}
+
+	meta, err := codec.DecodeContractMetadata(metadata)
+	if err != nil {
 		return domain.Effects{Status: codec.StatusValidationFailed}, nil
 	}
 
@@ -179,11 +188,16 @@ func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployF
 	// nodes and silently commit a divergent state/receipt root.
 	id := contractID(ctx.L1Sender, ctx.GlobalInputIndex, p.chainID)
 
-	diff := sortStateDiff([]domain.StateDiffEntry{
+	entries := []domain.StateDiffEntry{
 		{Path: derive(id, keyCodeHash), Value: codeHash[:]},
 		{Path: derive(id, keyPreCodeHash), Value: args.CodeHash[:]},
-		{Path: derive(id, keyUpgradePolicy), Value: []byte{policyImmutable}},
-	})
+		{Path: derive(id, keyUpgradePolicy), Value: []byte{meta.UpgradePolicy}},
+	}
+	if meta.UpgradePolicy == policyOwnerUpgradeable {
+		owner := callerHash(meta.Owner)
+		entries = append(entries, domain.StateDiffEntry{Path: derive(id, keyOwner), Value: owner[:]})
+	}
+	diff := sortStateDiff(entries)
 
 	returnData := append(append([]byte{}, args.CodeHash[:]...), codeHash[:]...)
 
@@ -199,13 +213,13 @@ func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployF
 
 // applyUpgrade serves input_kind 5 (§12).
 func (p *Plugin) applyUpgrade(state domain.StateAccess, ctx domain.InputContext, args codec.UpgradeArgs) (domain.Effects, error) {
-	// D20: unconditional, in this fixed order, before any branch — the witness set is committed
-	// in DAHash and must not depend on which authorization branch is taken.
+	// Unconditional, in this fixed order, before any branch — the witness set is committed in
+	// DAHash and must not depend on which authorization branch is taken.
 	codeHashLeaf, codeHashPresent, err := state.Read(derive(args.ContractID, keyCodeHash))
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply upgrade: read code hash: %w", err)
 	}
-	// keyPreCodeHash's value is never used on this path; it is read only to keep D20's witness
+	// keyPreCodeHash's value is never used on this path; it is read only to keep the witness
 	// set a pure, branch-independent function of state.
 	_, _, err = state.Read(derive(args.ContractID, keyPreCodeHash))
 	if err != nil {
@@ -230,14 +244,11 @@ func (p *Plugin) applyUpgrade(state domain.StateAccess, ctx domain.InputContext,
 	var oldCodeHash types.Hash
 	copy(oldCodeHash[:], codeHashLeaf)
 
-	caller := callerHash(ctx.L1Sender)
-	authorized := policyPresent && len(policyLeaf) == 1 && policyLeaf[0] == policyOwnerUpgradeable &&
-		ownerPresent && bytes.Equal(ownerLeaf, caller[:])
-	if !authorized {
+	if !ownerAuthorized(policyLeaf, policyPresent, ownerLeaf, ownerPresent, callerHash(ctx.L1Sender)) {
 		return domain.Effects{Status: codec.StatusUnauthorized, ContractID: args.ContractID, CodeHash: oldCodeHash}, nil
 	}
 
-	codeHash, ok, err := p.prepareModule(args.NewCodeHash)
+	codeHash, _, ok, err := p.prepareModule(args.NewCodeHash)
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply upgrade: %w", err)
 	}
@@ -262,9 +273,70 @@ func (p *Plugin) applyUpgrade(state domain.StateAccess, ctx domain.InputContext,
 	}, nil
 }
 
+// ownerAuthorized reports whether the caller is the contract's current owner: the policy leaf
+// must be present, exactly one byte wide and OWNER_UPGRADEABLE, and the owner leaf must be
+// present and equal to caller. A policy leaf of any other width is unauthorized, for both
+// upgrade and transfer.
+func ownerAuthorized(policyLeaf []byte, policyPresent bool, ownerLeaf []byte, ownerPresent bool, caller types.Hash) bool {
+	return policyPresent && len(policyLeaf) == 1 && policyLeaf[0] == policyOwnerUpgradeable &&
+		ownerPresent && bytes.Equal(ownerLeaf, caller[:])
+}
+
+// applyTransferOwnership serves input_kind 6 (§12, §15).
+func (p *Plugin) applyTransferOwnership(state domain.StateAccess, ctx domain.InputContext, args codec.TransferOwnershipArgs) (domain.Effects, error) {
+	// Unconditional, in this order, before any branch: the runtime writes these reserved keys
+	// itself, so the step-3 reserved-key scan is not involved and this read order alone fixes
+	// the witness set.
+	codeHashLeaf, codeHashPresent, err := state.Read(derive(args.ContractID, keyCodeHash))
+	if err != nil {
+		return domain.Effects{}, fmt.Errorf("wasm: apply transfer ownership: read code hash: %w", err)
+	}
+	policyLeaf, policyPresent, err := state.Read(derive(args.ContractID, keyUpgradePolicy))
+	if err != nil {
+		return domain.Effects{}, fmt.Errorf("wasm: apply transfer ownership: read upgrade policy: %w", err)
+	}
+	ownerLeaf, ownerPresent, err := state.Read(derive(args.ContractID, keyOwner))
+	if err != nil {
+		return domain.Effects{}, fmt.Errorf("wasm: apply transfer ownership: read owner: %w", err)
+	}
+
+	if codeHashPresent && len(codeHashLeaf) != len(types.Hash{}) {
+		return domain.Effects{}, fmt.Errorf("wasm: apply transfer ownership: code hash leaf has width %d, want %d", len(codeHashLeaf), len(types.Hash{}))
+	}
+
+	if !codeHashPresent {
+		return domain.Effects{Status: codec.StatusValidationFailed, ContractID: args.ContractID}, nil
+	}
+	var current types.Hash
+	copy(current[:], codeHashLeaf)
+
+	if !ownerAuthorized(policyLeaf, policyPresent, ownerLeaf, ownerPresent, callerHash(ctx.L1Sender)) {
+		return domain.Effects{Status: codec.StatusUnauthorized, ContractID: args.ContractID, CodeHash: current}, nil
+	}
+
+	var diff []domain.StateDiffEntry
+	if args.NewOwner != (types.Address{}) {
+		newOwner := callerHash(args.NewOwner)
+		diff = []domain.StateDiffEntry{{Path: derive(args.ContractID, keyOwner), Value: newOwner[:]}}
+	} else {
+		diff = sortStateDiff([]domain.StateDiffEntry{
+			{Path: derive(args.ContractID, keyUpgradePolicy), Value: []byte{policyImmutable}},
+			{Path: derive(args.ContractID, keyOwner), Value: nil},
+		})
+	}
+
+	return domain.Effects{
+		Status:     codec.StatusSuccess,
+		GasUsed:    0,
+		ContractID: args.ContractID,
+		CodeHash:   current,
+		StateDiff:  diff,
+	}, nil
+}
+
 // contractID is §12's derivation (SPEC.md:640):
 // SHA3-256(deployer_l1_address(20) ‖ globalInputIndex(8B BE) ‖ chain_id(32)), over the raw
-// 20-byte L1 address (D4).
+// 20-byte L1 address.
 func contractID(deployer types.Address, globalInputIndex uint64, chainID types.Hash) types.Hash {
 	var idxBuf [8]byte
 	binary.BigEndian.PutUint64(idxBuf[:], globalInputIndex)

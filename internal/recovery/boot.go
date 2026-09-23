@@ -575,14 +575,13 @@ func momentumHashes(moms []*nom.DetailedMomentum) map[uint64]types.Hash {
 // A replayed canonical DeployStartArgs deletes every chunk slot and the pending record for its
 // code_hash before rewriting them, so a retracted start's slots are rewritten idempotently, and
 // a finalize or upgrade naming a code_hash whose start was retracted is not an input at all,
-// because Settlement accepted no matching start on the canonical chain. The known hazard is a
-// kind-3 chunk written by DecodeInput above the fork that no canonical DeployStartArgs
-// rewrites: it survives the rollback, so prepareModule reads a stale chunk where a node that
-// never reorged reads absence, and a local-recovery halt becomes a committed failed status.
-// That is a replay-determinism divergence between a reorged executor and a fresh replay. The
-// operator remedy is to stop the executor, remove the domain directory and the plugin's
-// code-store directory, and re-sync from genesis. The hazard is recorded in
-// EXECUTOR §15.
+// because Settlement accepted no matching start on the canonical chain. Replay rewrites every
+// chunk a canonical finalize assembles, because Settlement accepts a finalize only once every
+// chunk is present (§11.3). The unrepaired path (EXECUTOR §15): the retracted branch saw a
+// pending record expire (§11.5) and accepted a second DeployContractStart for the same
+// code_hash. That second record survives the rollback, and a canonical finalize for the first
+// record assembles against it. The operator remedy is to stop the executor, remove the domain
+// directory and the plugin's code-store directory, and re-sync from genesis.
 func Rollback(cfg Config, forkParent uint64) (Ready, error) {
 	if err := cfg.validate(needDomain); err != nil {
 		return Ready{}, err

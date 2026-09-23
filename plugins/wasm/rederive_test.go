@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"reflect"
 	"sort"
@@ -127,6 +128,7 @@ func statusOrdinal(t *testing.T, name string) byte {
 }
 
 var zeroHashHex = hex.EncodeToString(make([]byte, 32))
+var zeroAddrHex = hex.EncodeToString(make([]byte, 20))
 
 // --- A. file-level checks (once).
 
@@ -172,7 +174,7 @@ func checkPerVector(t *testing.T, vec vectorJSON) {
 	if gotInputHash != vec.Receipt.InputHash {
 		t.Fatalf("B1: sha3(canonical_input_hex) = %s, want receipt.input_hash %s", gotInputHash, vec.Receipt.InputHash)
 	}
-	if vec.InputKind <= 5 {
+	if vec.InputKind <= 6 {
 		decodedInput, err := codec.DecodeInput(canonical)
 		if err != nil {
 			t.Fatalf("B1: DecodeInput: %v", err)
@@ -210,7 +212,7 @@ func checkPerVector(t *testing.T, vec vectorJSON) {
 		checkExecutionResultBlob(t, vec, prePaths, preValues)
 	}
 
-	// B5: non-SUCCESS vectors (D33).
+	// B5: non-SUCCESS vectors (§14.3).
 	if vec.Status != "SUCCESS" {
 		checkNonSuccess(t, vec)
 	}
@@ -366,7 +368,7 @@ func checkExecutionResultBlob(t *testing.T, vec vectorJSON, prePaths []trie.Path
 		t.Fatalf("B4: len(outbox) = %d, want receipt.outbox_count %d", len(er.Outbox), vec.Receipt.OutboxCount)
 	}
 
-	// state_diff_hash (D32): the region length is computed arithmetically from the decoded
+	// state_diff_hash (§15): the region length is computed arithmetically from the decoded
 	// entries and sliced out of the encoded ExecutionResult at the fixed prefix offset 74
 	// (version:u16 + global_input_index:u64 + pre_state_root:32 + post_state_root:32).
 	const stateDiffRegionOffset = 74
@@ -393,7 +395,7 @@ func checkExecutionResultBlob(t *testing.T, vec vectorJSON, prePaths []trie.Path
 		}
 	}
 
-	// return_hash (D32/D33).
+	// return_hash (§15/§14.3).
 	if len(er.ReturnData) == 0 {
 		if vec.Receipt.ReturnHash != zeroHashHex {
 			t.Fatalf("B4: receipt.return_hash = %s, want zero for empty ReturnData", vec.Receipt.ReturnHash)
@@ -405,7 +407,7 @@ func checkExecutionResultBlob(t *testing.T, vec vectorJSON, prePaths []trie.Path
 		}
 	}
 
-	// witness keys (D14, generic half).
+	// witness keys (§20, generic half).
 	for i := 1; i < len(vec.WitnessKeys); i++ {
 		if vec.WitnessKeys[i] <= vec.WitnessKeys[i-1] {
 			t.Fatalf("B4: witness_keys not strictly ascending at index %d: %s <= %s", i, vec.WitnessKeys[i], vec.WitnessKeys[i-1])
@@ -446,10 +448,10 @@ func checkNonSuccess(t *testing.T, vec vectorJSON) {
 	detail := blobDetail(t, vec.ContractEffectsBlobHex)
 
 	if vec.Receipt.StateDiffHash != zeroHashHex {
-		t.Fatalf("B5 (D33): status %s carries state_diff_hash %s, want zero; %s", vec.Status, vec.Receipt.StateDiffHash, detail)
+		t.Fatalf("B5 (§14.3): status %s carries state_diff_hash %s, want zero; %s", vec.Status, vec.Receipt.StateDiffHash, detail)
 	}
 	if vec.Receipt.ReturnHash != zeroHashHex {
-		t.Fatalf("B5 (D33): status %s carries return_hash %s, want zero; %s", vec.Status, vec.Receipt.ReturnHash, detail)
+		t.Fatalf("B5 (§14.3): status %s carries return_hash %s, want zero; %s", vec.Status, vec.Receipt.ReturnHash, detail)
 	}
 
 	if vec.ExecutionResultBlobHex != "" {
@@ -493,6 +495,8 @@ func checkShape(t *testing.T, file vectorFile, vec vectorJSON) {
 		checkUnsupportedKind(t, vec)
 	case "deploy":
 		checkDeploy(t, file, vec)
+	case "ownership":
+		checkOwnership(t, vec)
 	case "validation_rejection":
 		checkValidationRejection(t, vec)
 	default:
@@ -710,13 +714,13 @@ func checkCallRefund(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkUnsupportedKind is the unsupported_kind shape's whole check, from the JSON alone (D18,
-// D34).
+// checkUnsupportedKind is the unsupported_kind shape's whole check, from the JSON alone (§15,
+// §27.5).
 func checkUnsupportedKind(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
-	if vec.InputKind <= 5 {
-		t.Fatalf("unsupported_kind: input_kind = %d, want > 5", vec.InputKind)
+	if vec.InputKind <= 6 {
+		t.Fatalf("unsupported_kind: input_kind = %d, want > 6", vec.InputKind)
 	}
 	if vec.Input != nil {
 		t.Fatalf("unsupported_kind: input = %+v, want absent", vec.Input)
@@ -749,8 +753,8 @@ func checkUnsupportedKind(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkDeploy is the deploy shape's whole check: the schema's shape rules, then the D29
-// receipt identity and the D3 ReturnData shape for the vector's own kind and status.
+// checkDeploy is the deploy shape's whole check: the schema's shape rules, then the §15
+// receipt identity and the §11.3/§12 ReturnData shape for the vector's own kind and status.
 func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 	t.Helper()
 
@@ -783,6 +787,16 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 	case 2:
 		if vec.Input.CodeHash != vec.CodeHash {
 			t.Fatalf("deploy: kind 2: input.code_hash = %s, want code_hash %s", vec.Input.CodeHash, vec.CodeHash)
+		}
+		if vec.Input.MetadataHex == nil {
+			t.Fatalf("deploy: kind 2: metadata_hex is absent")
+		}
+		metadataHash := hex.EncodeToString(crypto.Hash(mustHex(t, *vec.Input.MetadataHex)))
+		if metadataHash != vec.Input.MetadataHash {
+			t.Fatalf("deploy: kind 2: sha3(metadata_hex) = %s, want metadata_hash %s (§11.1)", metadataHash, vec.Input.MetadataHash)
+		}
+		if _, err := codec.DecodeContractMetadata(mustHex(t, *vec.Input.MetadataHex)); err != nil {
+			t.Fatalf("deploy: kind 2: DecodeContractMetadata(metadata_hex): %v, want nil", err)
 		}
 		if vec.Input.ChunkCount == nil || *vec.Input.ChunkCount != 1 {
 			t.Fatalf("deploy: kind 2: chunk_count = %v, want 1", vec.Input.ChunkCount)
@@ -844,10 +858,23 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 		key1 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x01}))
 		key2 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x02}))
 		key3 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x03}))
-		if len(er.StateDiff) != 3 {
-			t.Fatalf("deploy: kind 4: ExecutionResult.StateDiff has %d entries, want exactly 3", len(er.StateDiff))
+		key4 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x04}))
+
+		if vec.PendingMetadataHex == nil {
+			t.Fatalf("deploy: kind 4: pending_metadata_hex is absent")
 		}
-		gotByKey := make(map[string][]byte, 3)
+		meta, err := codec.DecodeContractMetadata(mustHex(t, *vec.PendingMetadataHex))
+		if err != nil {
+			t.Fatalf("deploy: kind 4: DecodeContractMetadata(pending_metadata_hex): %v, want nil (a SUCCESS finalize needs a well-formed pending record)", err)
+		}
+		wantEntries := 3
+		if meta.UpgradePolicy == codec.PolicyOwnerUpgradeable {
+			wantEntries = 4
+		}
+		if len(er.StateDiff) != wantEntries {
+			t.Fatalf("deploy: kind 4: ExecutionResult.StateDiff has %d entries, want exactly %d", len(er.StateDiff), wantEntries)
+		}
+		gotByKey := make(map[string][]byte, wantEntries)
 		for _, e := range er.StateDiff {
 			gotByKey[hex.EncodeToString(e.Key[:])] = e.Value
 		}
@@ -859,8 +886,16 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 		if v, ok := gotByKey[key2]; !ok || !bytes.Equal(v, codeHashBytes) {
 			t.Fatalf("deploy: kind 4: StateDiff[sha3(contract_id||0x0002)] = %x, want input.code_hash %x", v, codeHashBytes)
 		}
-		if v, ok := gotByKey[key3]; !ok || !bytes.Equal(v, []byte{0x00}) {
-			t.Fatalf("deploy: kind 4: StateDiff[sha3(contract_id||0x0003)] = %x, want {0x00} (IMMUTABLE)", v)
+		if v, ok := gotByKey[key3]; !ok || !bytes.Equal(v, []byte{meta.UpgradePolicy}) {
+			t.Fatalf("deploy: kind 4: StateDiff[sha3(contract_id||0x0003)] = %x, want policy byte %d (pending metadata's upgrade_policy)", v, meta.UpgradePolicy)
+		}
+		if meta.UpgradePolicy == codec.PolicyOwnerUpgradeable {
+			wantOwner := hashOf(crypto.Hash([]byte("L1_CALLER:"), meta.Owner[:]))
+			if v, ok := gotByKey[key4]; !ok || !bytes.Equal(v, wantOwner[:]) {
+				t.Fatalf("deploy: kind 4: StateDiff[sha3(contract_id||0x0004)] = %x, want caller(pending metadata's owner) %x", v, wantOwner[:])
+			}
+		} else if _, ok := gotByKey[key4]; ok {
+			t.Fatalf("deploy: kind 4: StateDiff has an owner entry for an IMMUTABLE deploy, want none")
 		}
 
 		wantReturnData := append(append([]byte{}, codeHashBytes...), instrumentedCodeHashBytes...)
@@ -929,9 +964,6 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 			if _, present := vec.PreState[key4]; !present {
 				t.Fatalf("deploy: kind 5 SUCCESS: pre_state has no entry for sha3(contract_id||0x0004)")
 			}
-			if _, present := vec.PreState[key2]; present {
-				t.Fatalf("deploy: kind 5 SUCCESS: pre_state has an entry for sha3(contract_id||0x0002), want absent")
-			}
 			policyHex, present := vec.PreState[key3]
 			if !present || policyHex != "01" {
 				t.Fatalf("deploy: kind 5 SUCCESS: pre_state[sha3(contract_id||0x0003)] = %q, want \"01\"", policyHex)
@@ -950,12 +982,18 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 				t.Fatalf("deploy: kind 5 VALIDATION_FAILED (undeployed): Validate: %v, want nil", err)
 			}
 		case "UNAUTHORIZED":
-			if len(vec.PreState) != 1 {
-				t.Fatalf("deploy: kind 5 UNAUTHORIZED: pre_state has %d entries, want exactly 1", len(vec.PreState))
-			}
 			oldHashHex, present := vec.PreState[key1]
 			if !present {
 				t.Fatalf("deploy: kind 5 UNAUTHORIZED: pre_state has no entry for sha3(contract_id||0x0001)")
+			}
+			policyHex, policyPresent := vec.PreState[key3]
+			l1Sender := mustHex(t, vec.L1Sender)
+			caller := hashOf(crypto.Hash([]byte("L1_CALLER:"), l1Sender))
+			ownerHex, ownerPresent := vec.PreState[key4]
+			policyOK := policyPresent && policyHex == "01"
+			ownerOK := ownerPresent && ownerHex == hex.EncodeToString(caller[:])
+			if policyOK && ownerOK {
+				t.Fatalf("deploy: kind 5 UNAUTHORIZED: pre_state's policy leaf is 01 and owner leaf is the caller, want at least one to disqualify the caller")
 			}
 			if vec.Receipt.CodeHash != oldHashHex || vec.Receipt.CodeHash == zeroHashHex {
 				t.Fatalf("deploy: kind 5 UNAUTHORIZED: receipt.code_hash = %s, want pre_state's old hash %s, non-zero", vec.Receipt.CodeHash, oldHashHex)
@@ -1010,9 +1048,124 @@ func checkDeployNoEffect(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// checkOwnership is the ownership shape's whole check, from the JSON alone (§12, §15).
+func checkOwnership(t *testing.T, vec vectorJSON) {
+	t.Helper()
+
+	if vec.InputKind != 6 {
+		t.Fatalf("ownership: input_kind = %d, want 6", vec.InputKind)
+	}
+	if vec.ModuleWasmHex != "" || vec.InputFrameHex != "" || vec.SourceDataHex != "" || vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("ownership: module_wasm_hex/input_frame_hex/source_data_hex/contract_effects_blob_hex must all be empty")
+	}
+	if vec.GasUsed != 0 || vec.Receipt.GasUsed != 0 {
+		t.Fatalf("ownership: gas_used = %d, receipt.gas_used = %d, want both 0", vec.GasUsed, vec.Receipt.GasUsed)
+	}
+	if vec.Input == nil {
+		t.Fatalf("ownership: input is absent")
+	}
+	if vec.Input.ContractID != vec.Receipt.ContractID {
+		t.Fatalf("ownership: input.contract_id = %s, want receipt.contract_id %s", vec.Input.ContractID, vec.Receipt.ContractID)
+	}
+	if vec.Receipt.EventCount != 0 || vec.Receipt.OutboxCount != 0 {
+		t.Fatalf("ownership: receipt.event_count = %d, receipt.outbox_count = %d, want both 0", vec.Receipt.EventCount, vec.Receipt.OutboxCount)
+	}
+
+	contractID := mustHex(t, vec.Input.ContractID)
+	key1 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x01}))
+	key3 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x03}))
+	key4 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x04}))
+	wantWitness := []string{key1, key3, key4}
+	sort.Strings(wantWitness)
+	if !reflect.DeepEqual(vec.WitnessKeys, wantWitness) {
+		t.Fatalf("ownership: witness_keys = %v, want the three reserved keys ascending %v", vec.WitnessKeys, wantWitness)
+	}
+
+	l1Sender := mustHex(t, vec.L1Sender)
+	caller := hashOf(crypto.Hash([]byte("L1_CALLER:"), l1Sender))
+	callerHex := hex.EncodeToString(caller[:])
+
+	switch vec.Status {
+	case "VALIDATION_FAILED":
+		if _, present := vec.PreState[key1]; present {
+			t.Fatalf("ownership: VALIDATION_FAILED: pre_state has a 0x0001 leaf, want absent")
+		}
+		if vec.Receipt.CodeHash != zeroHashHex {
+			t.Fatalf("ownership: VALIDATION_FAILED: receipt.code_hash = %s, want zero", vec.Receipt.CodeHash)
+		}
+	case "UNAUTHORIZED":
+		codeHashHex, present := vec.PreState[key1]
+		if !present {
+			t.Fatalf("ownership: UNAUTHORIZED: pre_state has no 0x0001 leaf")
+		}
+		if vec.Receipt.CodeHash != codeHashHex {
+			t.Fatalf("ownership: UNAUTHORIZED: receipt.code_hash = %s, want pre_state's 0x0001 leaf %s", vec.Receipt.CodeHash, codeHashHex)
+		}
+		policyHex, policyPresent := vec.PreState[key3]
+		ownerHex, ownerPresent := vec.PreState[key4]
+		policyOK := policyPresent && policyHex == "01"
+		ownerOK := ownerPresent && ownerHex == callerHex
+		if policyOK && ownerOK {
+			t.Fatalf("ownership: UNAUTHORIZED: pre_state's policy leaf is 01 and owner leaf is the caller, want at least one to disqualify the caller")
+		}
+	case "SUCCESS":
+		codeHashHex, present := vec.PreState[key1]
+		if !present {
+			t.Fatalf("ownership: SUCCESS: pre_state has no 0x0001 leaf")
+		}
+		if vec.Receipt.CodeHash != codeHashHex {
+			t.Fatalf("ownership: SUCCESS: receipt.code_hash = %s, want pre_state's 0x0001 leaf %s", vec.Receipt.CodeHash, codeHashHex)
+		}
+		policyHex, policyPresent := vec.PreState[key3]
+		if !policyPresent || policyHex != "01" {
+			t.Fatalf("ownership: SUCCESS: pre_state[0x0003] = %q, want \"01\"", policyHex)
+		}
+		ownerHex, ownerPresent := vec.PreState[key4]
+		if !ownerPresent || ownerHex != callerHex {
+			t.Fatalf("ownership: SUCCESS: pre_state[0x0004] = %q, want the caller %s", ownerHex, callerHex)
+		}
+
+		erBlob := mustHex(t, vec.ExecutionResultBlobHex)
+		er, err := codec.DecodeExecutionResult(erBlob)
+		if err != nil {
+			t.Fatalf("ownership: SUCCESS: DecodeExecutionResult: %v", err)
+		}
+		if len(er.ReturnData) != 0 {
+			t.Fatalf("ownership: SUCCESS: ExecutionResult.ReturnData = %x, want empty", er.ReturnData)
+		}
+
+		if vec.Input.NewOwner != "" && vec.Input.NewOwner != zeroAddrHex {
+			if len(er.StateDiff) != 1 {
+				t.Fatalf("ownership: SUCCESS non-zero new_owner: ExecutionResult.StateDiff has %d entries, want exactly 1", len(er.StateDiff))
+			}
+			newOwner := mustHex(t, vec.Input.NewOwner)
+			wantOwner := hashOf(crypto.Hash([]byte("L1_CALLER:"), newOwner))
+			if hex.EncodeToString(er.StateDiff[0].Key[:]) != key4 || !bytes.Equal(er.StateDiff[0].Value, wantOwner[:]) {
+				t.Fatalf("ownership: SUCCESS non-zero new_owner: StateDiff[0] = %+v, want {0x0004, caller(new_owner) %x}", er.StateDiff[0], wantOwner[:])
+			}
+		} else {
+			if len(er.StateDiff) != 2 {
+				t.Fatalf("ownership: SUCCESS zero new_owner: ExecutionResult.StateDiff has %d entries, want exactly 2", len(er.StateDiff))
+			}
+			gotByKey := make(map[string][]byte, 2)
+			for _, e := range er.StateDiff {
+				gotByKey[hex.EncodeToString(e.Key[:])] = e.Value
+			}
+			if v, ok := gotByKey[key3]; !ok || !bytes.Equal(v, []byte{0x00}) {
+				t.Fatalf("ownership: SUCCESS zero new_owner: StateDiff[0x0003] = %x, want {0x00} (IMMUTABLE)", v)
+			}
+			if v, ok := gotByKey[key4]; !ok || v != nil {
+				t.Fatalf("ownership: SUCCESS zero new_owner: StateDiff[0x0004] = %x, want a deletion (nil)", v)
+			}
+		}
+	default:
+		t.Fatalf("ownership: status %s has no branch: add one with its first vector", vec.Status)
+	}
+}
+
 // checkValidationRejection is the validation_rejection shape's whole check: a kind-4 finalize
-// whose module the validator refuses, with the rule it refuses it by named in
-// rejectionReasons.
+// rejected by a module the validator refuses, or by pending metadata §27.12 rejects, exactly
+// one of the two, with the rule it refuses it by named in rejectionReasons.
 func checkValidationRejection(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
@@ -1053,23 +1206,39 @@ func checkValidationRejection(t *testing.T, vec vectorJSON) {
 	if !ok {
 		t.Fatalf("validation_rejection: %s: add its rule to rejectionReasons", vec.ID)
 	}
-	if err := module.Validate(moduleRaw, moduleLimits()); !errors.Is(err, want) {
-		t.Fatalf("validation_rejection: %s: Validate err = %v, want errors.Is(..., %v)", vec.ID, err, want)
+	if vec.PendingMetadataHex == nil {
+		t.Fatalf("validation_rejection: %s: pending_metadata_hex is absent", vec.ID)
+	}
+
+	validateErr := module.Validate(moduleRaw, moduleLimits())
+	_, metadataErr := codec.DecodeContractMetadata(mustHex(t, *vec.PendingMetadataHex))
+
+	switch {
+	case validateErr != nil && metadataErr == nil:
+		if !errors.Is(validateErr, want) {
+			t.Fatalf("validation_rejection: %s: Validate err = %v, want errors.Is(..., %v)", vec.ID, validateErr, want)
+		}
+	case validateErr == nil && metadataErr != nil:
+		if !errors.Is(metadataErr, want) {
+			t.Fatalf("validation_rejection: %s: DecodeContractMetadata err = %v, want errors.Is(..., %v)", vec.ID, metadataErr, want)
+		}
+	default:
+		t.Fatalf("validation_rejection: %s: got Validate=%v DecodeContractMetadata=%v, want exactly one non-nil", vec.ID, validateErr, metadataErr)
 	}
 }
 
-// --- D. named per-vector invariants.
+// --- N. named per-vector invariants.
 
 // namedInvariants is keyed by vector ID; TestConformanceVectors asserts every key was seen.
 
-// checkD1WitnessBackendTripwire is D1: "probe" is a local key the fixture only ever passes to
+// checkN1WitnessBackendTripwire is N1: "probe" is a local key the fixture only ever passes to
 // storage_len and never writes, so its derived path is in the witness set only because
 // state.Accessor.Len records an absent-key observation -- exactly the entry a mapState-backed
 // generator, whose Len records nothing, would drop.
-func checkD1WitnessBackendTripwire(t *testing.T, vec vectorJSON) {
+func checkN1WitnessBackendTripwire(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	if len(vec.WitnessKeys) != 4 {
-		t.Fatalf("D1: witness_keys has %d entries, want exactly 4 (a mapState-backed generator, whose Len records nothing for an absent key, would produce 3)", len(vec.WitnessKeys))
+		t.Fatalf("N1: witness_keys has %d entries, want exactly 4 (a mapState-backed generator, whose Len records nothing for an absent key, would produce 3)", len(vec.WitnessKeys))
 	}
 	contractID := mustHex(t, vec.Receipt.ContractID)
 	probeKey := hex.EncodeToString(crypto.Hash(contractID, []byte("probe")))
@@ -1078,26 +1247,26 @@ func checkD1WitnessBackendTripwire(t *testing.T, vec vectorJSON) {
 			return
 		}
 	}
-	t.Fatalf("D1: witness_keys is missing sha3(contract_id || \"probe\") = %s; a mapState-backed generator would drop it", probeKey)
+	t.Fatalf("N1: witness_keys is missing sha3(contract_id || \"probe\") = %s; a mapState-backed generator would drop it", probeKey)
 }
 
-// checkD2DiscardNotVacuous is D2: proves D33's discard actually discarded something, by
+// checkN2DiscardNotVacuous is N2: proves §14.3's discard actually discarded something, by
 // asserting the returned blob carried a non-empty StateDiff and non-empty ReturnData.
-func checkD2DiscardNotVacuous(t *testing.T, vec vectorJSON) {
+func checkN2DiscardNotVacuous(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	if vec.ContractEffectsBlobHex == "" {
-		t.Fatalf("D2: contract_effects_blob_hex is absent")
+		t.Fatalf("N2: contract_effects_blob_hex is absent")
 	}
 	blob := mustHex(t, vec.ContractEffectsBlobHex)
 	eff, err := codec.DecodeContractEffects(blob)
 	if err != nil {
-		t.Fatalf("D2: DecodeContractEffects: %v", err)
+		t.Fatalf("N2: DecodeContractEffects: %v", err)
 	}
 	if len(eff.StateDiff) == 0 {
-		t.Fatalf("D2: returned blob has an empty StateDiff; the D33 discard would be vacuous")
+		t.Fatalf("N2: returned blob has an empty StateDiff; the §14.3 discard would be vacuous")
 	}
 	if len(eff.ReturnData) == 0 {
-		t.Fatalf("D2: returned blob has empty ReturnData; the D33 discard would be vacuous")
+		t.Fatalf("N2: returned blob has empty ReturnData; the §14.3 discard would be vacuous")
 	}
 }
 
@@ -1317,7 +1486,7 @@ func checkCVDUPKEY1DuplicateLocalKeys(t *testing.T, vec vectorJSON) {
 }
 
 // checkCVUNAUTH1ReservedKeyDiscardNotVacuous is INV-9: the decoded blob has a reserved-key entry
-// and a second, non-reserved entry, and a non-empty ReturnData, so the D33 discard is not
+// and a second, non-reserved entry, and a non-empty ReturnData, so the §14.3 discard is not
 // vacuous.
 func checkCVUNAUTH1ReservedKeyDiscardNotVacuous(t *testing.T, vec vectorJSON) {
 	t.Helper()
@@ -1392,7 +1561,7 @@ func checkCVRTLRESULT1ResultTooLargeFromRefund(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkOutOfGasBase is the shared assertion every CV-OOG-* named invariant starts with (D19):
+// checkOutOfGasBase is the shared assertion every CV-OOG-* named invariant starts with (§10.6):
 // status OUT_OF_GAS and gas_used equal to the vector's own plasma_limit.
 func checkOutOfGasBase(t *testing.T, vec vectorJSON) {
 	t.Helper()
@@ -1472,9 +1641,94 @@ func checkCVGROW1(t *testing.T, vec vectorJSON) {
 	checkPathGas(t, vec, 1, 0, []byte{0x41, 0x40, 0x41, 0x47, 0x04, 0x42, 0x0B})
 }
 
+// checkCVASSETSBase decodes contract_effects_blob_hex and asserts the common facts CV-ASSETS-1
+// and CV-ASSETS-2 both pin: attribution, no reserved local key, the claim bound, and the u256
+// half-range bound on every withdrawal amount. It returns the decoded blob's withdrawal assets,
+// in blob order, for the caller's own distinct-asset-count assertion.
+func checkCVASSETSBase(t *testing.T, vec vectorJSON) []codec.AssetID {
+	t.Helper()
+	if vec.ContractEffectsBlobHex == "" {
+		t.Fatalf("CV-ASSETS: contract_effects_blob_hex is absent")
+	}
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("CV-ASSETS: DecodeContractEffects: %v", err)
+	}
+	if eff.GlobalInputIndex != vec.GlobalInputIndex {
+		t.Fatalf("CV-ASSETS: blob GlobalInputIndex = %d, want global_input_index %d", eff.GlobalInputIndex, vec.GlobalInputIndex)
+	}
+	reserved := map[string]bool{"0001": true, "0002": true, "0003": true, "0004": true}
+	for _, e := range eff.StateDiff {
+		if reserved[hex.EncodeToString(e.LocalKey)] {
+			t.Fatalf("CV-ASSETS: StateDiff uses reserved local key %x", e.LocalKey)
+		}
+	}
+	if vec.Input == nil || vec.Input.DepositAmount == "" {
+		t.Fatalf("CV-ASSETS: input.deposit_amount is absent")
+	}
+	depositAmount := new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount))
+	claimed := new(big.Int).SetBytes(eff.ClaimedDeposit[:])
+	if claimed.Cmp(depositAmount) > 0 {
+		t.Fatalf("CV-ASSETS: ClaimedDeposit %s exceeds input.deposit_amount %s", claimed, depositAmount)
+	}
+	cap := new(big.Int).Lsh(big.NewInt(1), 255)
+	contractID := mustHex(t, vec.Receipt.ContractID)
+	var assets []codec.AssetID
+	for _, m := range eff.Outbox {
+		if !bytes.Equal(m.SourceContract[:], contractID) {
+			t.Fatalf("CV-ASSETS: outbox message SourceContract = %x, want receipt.contract_id %s", m.SourceContract, vec.Receipt.ContractID)
+		}
+		w, ok := m.Target.(codec.L1Withdrawal)
+		if !ok {
+			continue
+		}
+		amt := new(big.Int).SetBytes(w.Amount[:])
+		if amt.Cmp(cap) > 0 {
+			t.Fatalf("CV-ASSETS: withdrawal amount %s exceeds 2^255", amt)
+		}
+		assets = append(assets, w.Asset)
+	}
+	return assets
+}
+
+func distinctAssetCount(assets []codec.AssetID) int {
+	seen := map[codec.AssetID]bool{}
+	for _, a := range assets {
+		seen[a] = true
+	}
+	return len(seen)
+}
+
+// checkCVASSETS1 pins the RUNTIME_FAULT to the step-5a footprint: 17 distinct withdrawal
+// assets, one over MaxAssetsPerBatch.
+func checkCVASSETS1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	assets := checkCVASSETSBase(t, vec)
+	if n := distinctAssetCount(assets); n != 17 {
+		t.Fatalf("CV-ASSETS-1: %d distinct withdrawal assets, want 17", n)
+	}
+}
+
+// checkCVASSETS2 pins the RUNTIME_FAULT to the step-5a footprint: 16 distinct withdrawal
+// assets, none equal to the non-zero-amount deposit asset, so the deposit asset is the 17th
+// footprint entry.
+func checkCVASSETS2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	assets := checkCVASSETSBase(t, vec)
+	if n := distinctAssetCount(assets); n != 16 {
+		t.Fatalf("CV-ASSETS-2: %d distinct withdrawal assets, want 16", n)
+	}
+	depositAsset := vec.Input.DepositAsset
+	for _, a := range assets {
+		if hex.EncodeToString(a[:]) == depositAsset {
+			t.Fatalf("CV-ASSETS-2: a withdrawal asset equals the deposit asset %s, want all 16 distinct from it", depositAsset)
+		}
+	}
+}
+
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
-	"EXEC-002":           checkD1WitnessBackendTripwire,
-	"EXEC-FAIL-OUTBOX-1": checkD2DiscardNotVacuous,
+	"EXEC-002":           checkN1WitnessBackendTripwire,
+	"EXEC-FAIL-OUTBOX-1": checkN2DiscardNotVacuous,
 	"EXEC-006":           checkEXEC006DescendingLocalKeys,
 	"EXEC-012":           checkEXEC012AbsentRead,
 	"CV-READ-2":          checkCVREAD2PresentRead,
@@ -1495,6 +1749,8 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"CV-SEG-AFTEREND-1":  checkCVSEGAFTEREND1,
 	"CV-SEG-OUTER-1":     checkCVSEGOUTER1,
 	"CV-GROW-1":          checkCVGROW1,
+	"CV-ASSETS-1":        checkCVASSETS1,
+	"CV-ASSETS-2":        checkCVASSETS2,
 }
 
 // TestConformanceVectors re-derives every committed value in the artifact from the JSON

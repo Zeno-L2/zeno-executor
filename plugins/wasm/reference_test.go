@@ -15,7 +15,7 @@ import (
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
-// refStateDiffPreimage returns D32's stateDiffHash preimage: the §27.0 List<StateDiffEntry>
+// refStateDiffPreimage returns §15's stateDiffHash preimage: the §27.0 List<StateDiffEntry>
 // encoding of entries — count:u32 BE followed by each entry as key:bytes32 ‖ value, where a
 // nil value is §27.2's deletion sentinel (0xFFFFFFFF, no bytes) and any other value is
 // len:u32 BE ‖ bytes, including the zero-length present-empty case.
@@ -34,7 +34,7 @@ func refStateDiffPreimage(entries []codec.StateDiffEntry) []byte {
 	return buf
 }
 
-// refStateDiffHash is bytes32(0) for an empty list and SHA3-256(refStateDiffPreimage) otherwise (D32).
+// refStateDiffHash is bytes32(0) for an empty list and SHA3-256(refStateDiffPreimage) otherwise (§15).
 func refStateDiffHash(entries []codec.StateDiffEntry) types.Hash {
 	if len(entries) == 0 {
 		return types.Hash{}
@@ -42,7 +42,7 @@ func refStateDiffHash(entries []codec.StateDiffEntry) types.Hash {
 	return hashOf(crypto.Hash(refStateDiffPreimage(entries)))
 }
 
-// refReturnHash is bytes32(0) for empty return data and SHA3-256(returnData), unprefixed, otherwise (D32).
+// refReturnHash is bytes32(0) for empty return data and SHA3-256(returnData), unprefixed, otherwise (§15).
 func refReturnHash(returnData []byte) types.Hash {
 	if len(returnData) == 0 {
 		return types.Hash{}
@@ -78,7 +78,7 @@ func refOutboxRoot(t *testing.T, messages []codec.OutboxMessage) types.Hash {
 	return codec.MerkleRoot(elements)
 }
 
-// refWitnessKeys is D14's union: every path the accessor observed (Read or Len, present or
+// refWitnessKeys is §20's union: every path the accessor observed (Read or Len, present or
 // absent) unioned with every path the input wrote, ascending and deduplicated.
 func refWitnessKeys(witnesses []state.Witness, diff []domain.StateDiffEntry) []trie.Path {
 	set := make(map[trie.Path]struct{}, len(witnesses)+len(diff))
@@ -106,7 +106,7 @@ type refResult struct {
 }
 
 // refDerive assembles the canonical ExecutionResult (inserting the pre/post state roots the
-// contract cannot compute), D32's two hashes, the two §27.3 roots, the witness union and the
+// contract cannot compute), §15's two hashes, the two §27.3 roots, the witness union and the
 // §27.7 receipt, from what Apply returned for one vector.
 func refDerive(t *testing.T, eff domain.Effects, acc *state.Accessor,
 	globalInputIndex, batchID uint64, preRoot, postRoot, inputHash types.Hash) refResult {
