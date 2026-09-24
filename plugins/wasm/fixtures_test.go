@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
+
+	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
 // wasmFuncType is one declared function type: raw value-type bytes for params and results.
@@ -36,8 +38,15 @@ type wasmExport struct {
 	Index uint32
 }
 
+// wasmElem is one active element segment writing Funcs into table 0 from Offset.
+type wasmElem struct {
+	Offset uint32
+	Funcs  []uint32
+}
+
 // wasmModuleSpec describes a whole module: arbitrary types, arbitrary imports, arbitrary
-// function bodies, one memory, arbitrary exports and any number of active data segments.
+// function bodies, one memory, an optional table, optional globals, arbitrary exports, any
+// number of active element segments and any number of active data segments.
 // A data segment's offset must be below 2^31: it is emitted as an i32.const immediate, whose
 // signed LEB128 encoding of a larger value is six bytes and is not a valid i32 constant.
 type wasmModuleSpec struct {
@@ -45,7 +54,10 @@ type wasmModuleSpec struct {
 	Imports     []wasmImport
 	Funcs       []wasmFunc
 	MemoryPages uint32
+	TableMin    uint32
+	Globals     uint32
 	Exports     []wasmExport
+	Elements    []wasmElem
 	Data        []dataSeg
 }
 
@@ -82,8 +94,23 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 		out = append(out, section(3, funcSec)...)
 	}
 
+	if spec.TableMin > 0 {
+		tableSec := appendVarU32(nil, 1)        // one table
+		tableSec = append(tableSec, 0x70, 0x00) // funcref, min-only limits
+		tableSec = appendVarU32(tableSec, spec.TableMin)
+		out = append(out, section(4, tableSec)...)
+	}
+
 	memSec := appendVarU32([]byte{0x01, 0x00}, spec.MemoryPages)
 	out = append(out, section(5, memSec)...)
+
+	if spec.Globals > 0 {
+		globalSec := appendVarU32(nil, spec.Globals)
+		for i := uint32(0); i < spec.Globals; i++ {
+			globalSec = append(globalSec, 0x7F, 0x01, 0x41, 0x00, 0x0B) // mutable i32 = 0
+		}
+		out = append(out, section(6, globalSec)...)
+	}
 
 	if len(spec.Exports) > 0 {
 		exportSec := appendVarU32(nil, uint32(len(spec.Exports)))
@@ -93,6 +120,20 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 			exportSec = appendVarU32(exportSec, ex.Index)
 		}
 		out = append(out, section(7, exportSec)...)
+	}
+
+	if len(spec.Elements) > 0 {
+		elemSec := appendVarU32(nil, uint32(len(spec.Elements)))
+		for _, el := range spec.Elements {
+			elemSec = append(elemSec, 0x00, 0x41)
+			elemSec = appendVarS64(elemSec, int64(el.Offset))
+			elemSec = append(elemSec, 0x0B)
+			elemSec = appendVarU32(elemSec, uint32(len(el.Funcs)))
+			for _, f := range el.Funcs {
+				elemSec = appendVarU32(elemSec, f)
+			}
+		}
+		out = append(out, section(9, elemSec)...)
 	}
 
 	if len(spec.Funcs) > 0 {
@@ -184,5 +225,21 @@ func TestBuildWasmModuleSignsDataOffsets(t *testing.T) {
 	notWant := []byte{0x41, 0x64, 0x0B}
 	if bytes.Contains(got, notWant) {
 		t.Fatalf("buildWasmModule output contains the unsigned LEB128 encoding %x, want only the signed form", notWant)
+	}
+}
+
+// TestBuildWasmModuleEncodesTableGlobalsElements pins that a table, globals and element
+// segments encode into a module module.Validate accepts. The run body reads the last global
+// so a missing or short global section fails validation instead of passing unread.
+func TestBuildWasmModuleEncodesTableGlobalsElements(t *testing.T) {
+	spec := runModuleSpec(nil, 1, []byte{0x00}, []byte{0x23, 0x01, 0x1A, 0x42, 0x00, 0x0B}, nil)
+	spec.Types = append(spec.Types, wasmFuncType{})
+	spec.Funcs = append(spec.Funcs, wasmFunc{TypeIdx: 1, Locals: []byte{0x00}, Body: []byte{0x0B}})
+	spec.TableMin = 2
+	spec.Globals = 2
+	spec.Elements = []wasmElem{{Offset: 0, Funcs: []uint32{1}}, {Offset: 1, Funcs: []uint32{1}}}
+
+	if err := module.Validate(buildWasmModule(spec), moduleLimits()); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }
