@@ -35,6 +35,7 @@ type fakeStep struct {
 type fakeDomain struct {
 	steps []fakeStep
 	idx   int
+	accs  []domain.StateAccess
 }
 
 func (d *fakeDomain) Genesis() domain.StateInit { return domain.StateInit{} }
@@ -48,6 +49,7 @@ func (d *fakeDomain) DecodeInput(ctx domain.InputContext, payload []byte) (domai
 }
 
 func (d *fakeDomain) Apply(acc domain.StateAccess, in domain.Input) (domain.Effects, error) {
+	d.accs = append(d.accs, acc)
 	s := d.steps[d.idx]
 	d.idx++
 	for _, p := range s.reads {
@@ -934,4 +936,72 @@ func TestDriverSourceErrorMidBatch(t *testing.T) {
 	if !errors.Is(err, plainErr) {
 		t.Fatalf("second NextBatch err = %v, want it to wrap the re-presented error", err)
 	}
+}
+
+// --- test 11: accessor released before Apply ---
+
+// TestDriverReleasesAccessor proves every accessor computeRecord hands to a domain's Apply is
+// released by the time NextBatch returns, in both its success and error paths. The accessor is
+// released before any Store.Apply call runs: computeRecord's defer acc.Release() executes
+// before finishApply's Store.Apply, since a defer in computeRecord fires when computeRecord
+// returns, which is always before finishApply is called. That ordering, not this test, is what
+// rules out a clone on the driver's path; a reviewer confirms it by checking the defer's
+// placement in computeRecord directly.
+func TestDriverReleasesAccessor(t *testing.T) {
+	t.Run("batch", func(t *testing.T) {
+		contractID := hashN(2)
+		src := hashN(1)
+		p := pathN(3)
+		inputs := []ledger.Input{
+			ledgerInput(0, callPayload(t, src, contractID, codec.AssetID{}, codec.U256{})),
+			ledgerInput(1, unsupportedPayload(9, src)),
+		}
+		dom := &fakeDomain{steps: []fakeStep{
+			{reads: []trie.Path{p}, effects: domain.Effects{
+				Status:     codec.StatusSuccess,
+				ContractID: contractID,
+				StateDiff:  []domain.StateDiffEntry{{Path: p, Value: []byte("v1")}},
+			}},
+			{effects: domain.Effects{Status: codec.StatusRuntimeFault}},
+		}}
+		cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		if _, ok, err := d.NextBatch(); err != nil || !ok {
+			t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+		}
+		if len(dom.accs) != 2 {
+			t.Fatalf("len(dom.accs) = %d, want 2", len(dom.accs))
+		}
+		for i, acc := range dom.accs {
+			if _, _, err := acc.Read(p); !errors.Is(err, state.ErrAccessorReleased) {
+				t.Fatalf("accs[%d].Read after NextBatch: err = %v, want ErrAccessorReleased", i, err)
+			}
+		}
+	})
+
+	t.Run("apply error", func(t *testing.T) {
+		src := hashN(1)
+		applyErr := errors.New("domain apply failed")
+		inputs := []ledger.Input{ledgerInput(0, unsupportedPayload(9, src))}
+		dom := &fakeDomain{steps: []fakeStep{{applyErr: applyErr}}}
+		cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		if _, _, err := d.NextBatch(); err == nil {
+			t.Fatalf("NextBatch: err = nil, want an error")
+		}
+		if len(dom.accs) != 1 {
+			t.Fatalf("len(dom.accs) = %d, want 1", len(dom.accs))
+		}
+		if _, _, err := dom.accs[0].Read(pathN(1)); !errors.Is(err, state.ErrAccessorReleased) {
+			t.Fatalf("accs[0].Read after NextBatch: err = %v, want ErrAccessorReleased", err)
+		}
+	})
 }
