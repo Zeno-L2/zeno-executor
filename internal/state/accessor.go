@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"errors"
 	"sort"
 	"sync"
 
@@ -9,6 +10,9 @@ import (
 
 	"github.com/digitalSloth/go-executor/domain"
 )
+
+// ErrAccessorReleased is returned by Read and Len on an accessor after Release.
+var ErrAccessorReleased = errors.New("state: read through a released accessor")
 
 // Witness is one observation a domain plugin's Apply made during a single input: the path it
 // read (via Read or Len) and what it found there, including an absent observation.
@@ -21,9 +25,13 @@ type Witness struct {
 // Accessor is the witnessing, read-only domain.StateAccess implementation supplied to a
 // domain plugin's Apply for one input. It is a snapshot: reads never see writes made by the
 // same or a later input, since a domain's staged StateDiff is only adopted by Store.Apply
-// after the input succeeds.
+// after the input succeeds. It shares the store's leaf map until Release; afterwards Read and
+// Len return ErrAccessorReleased and Witnesses keeps working.
 type Accessor struct {
 	mu        sync.Mutex
+	store     *Store
+	gen       uint64
+	released  bool
 	leaves    map[trie.Path][]byte
 	witnesses map[trie.Path]Witness
 }
@@ -33,6 +41,9 @@ type Accessor struct {
 func (a *Accessor) Read(path domain.Path) ([]byte, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.released {
+		return nil, false, ErrAccessorReleased
+	}
 	value, present := a.leaves[trie.Path(path)]
 	a.record(trie.Path(path), present, value)
 	return value, present, nil
@@ -43,6 +54,9 @@ func (a *Accessor) Read(path domain.Path) ([]byte, bool, error) {
 func (a *Accessor) Len(path domain.Path) (int, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.released {
+		return 0, false, ErrAccessorReleased
+	}
 	value, present := a.leaves[trie.Path(path)]
 	a.record(trie.Path(path), present, value)
 	if !present {
@@ -73,4 +87,22 @@ func (a *Accessor) Witnesses() []Witness {
 		return bytes.Compare(out[i].Path[:], out[j].Path[:]) < 0
 	})
 	return out
+}
+
+// Release ends the accessor's use of the store's leaf map. Read and Len return
+// ErrAccessorReleased afterwards; Witnesses keeps working. Release is idempotent.
+func (a *Accessor) Release() {
+	a.mu.Lock()
+	if a.released {
+		a.mu.Unlock()
+		return
+	}
+	a.released = true
+	a.mu.Unlock()
+
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	if a.gen == a.store.gen {
+		a.store.live--
+	}
 }

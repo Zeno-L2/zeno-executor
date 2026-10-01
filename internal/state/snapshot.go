@@ -158,7 +158,7 @@ func openFresh(walPath string, leaves map[trie.Path][]byte) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("state: open %s: %w", walPath, err)
 	}
-	return &Store{leaves: leaves, log: f}, nil
+	return newStore(leaves, f), nil
 }
 
 func encodeSnapshot(hdr SnapshotHeader, leaves map[trie.Path][]byte) []byte {

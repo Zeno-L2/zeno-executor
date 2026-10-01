@@ -312,6 +312,7 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	}
 
 	acc := d.cfg.Store.Accessor()
+	defer acc.Release()
 
 	dIn, err := d.cfg.Domain.DecodeInput(in.Ctx, in.Payload)
 	if err != nil {
