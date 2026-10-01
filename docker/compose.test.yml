@@ -1,0 +1,11 @@
+services:
+  test:
+    build:
+      context: ..
+      target: build
+      additional_contexts:
+        go-zenon: ../../go-zenon
+    privileged: true
+    cgroup: private
+    user: "0:0"
+    command: ["go", "test", "-p", "1", "./..."]

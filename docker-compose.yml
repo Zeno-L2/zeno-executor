@@ -1,0 +1,34 @@
+# Privileged and cgroup: private only for this local environment: they give the supervisor the
+# uid and cgroup delegation a real deployment would grant through its own container runtime.
+services:
+  executor:
+    build:
+      context: .
+      target: runtime
+      additional_contexts:
+        go-zenon: ../go-zenon
+    command: ["-config", "/etc/executor/executor.json"]
+    init: true
+    privileged: true
+    cgroup: private
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - executor-data:/var/lib/executor
+      - ./docker/executor.json:/etc/executor/executor.json:ro
+    secrets:
+      - source: executor_key
+        uid: "0"
+        gid: "0"
+        mode: 0400
+    mem_limit: 1536m
+    cpus: 2
+    pids_limit: 256
+    stop_grace_period: 45s
+
+volumes:
+  executor-data:
+
+secrets:
+  executor_key:
+    environment: EXECUTOR_KEY

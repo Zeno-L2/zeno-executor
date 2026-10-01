@@ -75,8 +75,8 @@ type loop struct {
 
 	pos   recovery.Position
 	fresh bool
-	// pending holds the records of batches built since the last commit.
-	pending []recovery.BatchRecord
+	// pending holds the commitments of batches built since the last commit.
+	pending []codec.BatchCommitment
 
 	anchor     recovery.Anchor
 	haveAnchor bool
@@ -142,7 +142,7 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 	l.anchor, l.haveAnchor, l.verify = rdy.Anchor, rdy.HaveAnchor, rdy.VerifyAnchor
 	if err := l.build(rdy); err != nil {
 		rdy.Store.Close()
-		return err
+		return halt(err)
 	}
 	defer func() { l.store.Close() }()
 
@@ -167,7 +167,7 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 		case errors.Is(err, ledger.ErrSourceRead):
 			sourceFailures++
 			if sourceFailures >= policy.SourceAttempts {
-				return halt(fmt.Errorf("momentum source failed %d times in a row: %w", sourceFailures, err))
+				return fmt.Errorf("%w: momentum source failed %d times in a row: %w", recovery.ErrSourceUnavailable, sourceFailures, err)
 			}
 			if !sleep(ctx, policy.SourceInterval) {
 				return nil
@@ -184,16 +184,7 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 					return err
 				}
 			}
-			c := b.Commitment
-			l.pending = append(l.pending, recovery.BatchRecord{
-				BatchID:       c.BatchID,
-				Status:        recovery.StatusBuilt,
-				FirstInputSeq: c.FirstInputSeq,
-				LastInputSeq:  c.LastInputSeq,
-				PreStateRoot:  c.PreStateRoot,
-				PostStateRoot: c.PostStateRoot,
-				DAHash:        c.DAHash,
-			})
+			l.pending = append(l.pending, b.Commitment)
 		}
 
 		if err := l.commitStep(); err != nil {
@@ -237,12 +228,33 @@ func (l *loop) commitStep() error {
 	for i, m := range recent {
 		window[i] = recovery.MomentumRef{Height: m.Height, Hash: m.Hash}
 	}
-	// A commit failure is a local fault: a tree that cannot be made durable is never retried.
-	if err := recovery.Commit(l.rcfg, l.store, pos, l.pending, window); err != nil {
-		return halt(err)
+	records := make([]recovery.BatchRecord, len(l.pending))
+	for i, c := range l.pending {
+		records[i] = recovery.BatchRecord{
+			BatchID:       c.BatchID,
+			Status:        recovery.StatusBuilt,
+			FirstInputSeq: c.FirstInputSeq,
+			LastInputSeq:  c.LastInputSeq,
+			PreStateRoot:  c.PreStateRoot,
+			PostStateRoot: c.PostStateRoot,
+			DAHash:        c.DAHash,
+		}
 	}
-	l.pos, l.fresh = pos, false
-	l.pending = nil
+	// Every recovery.Commit failure is transient. That covers its write failures and its
+	// pre-write checks (config, malformed position, window contiguity, window end against the
+	// position, store.go:485-497). It returns unhalted, and a restart re-derives from the last
+	// durable position. A check that fails the same way on every attempt ends in the
+	// supervisor's crash-loop halt.
+	if err := recovery.Commit(l.rcfg, l.store, pos, records, window); err != nil {
+		return err
+	}
+	committed := l.pending
+	l.pos, l.fresh, l.pending = pos, false, nil
+	if l.cfg.OnCommit != nil {
+		if err := l.cfg.OnCommit(committed); err != nil {
+			return fmt.Errorf("runtime: report committed batches: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -308,6 +320,9 @@ func (l *loop) reorg() error {
 	} else {
 		height, ok, ferr := recovery.ForkParent(l.rcfg, l.pos)
 		if ferr != nil {
+			if errors.Is(ferr, recovery.ErrSourceUnavailable) {
+				return ferr
+			}
 			return halt(ferr)
 		}
 		if !ok {

@@ -205,6 +205,9 @@ func TestDecodeInputAcceptsChunkAtMaxSize(t *testing.T) {
 }
 
 func TestDecodeInputHaltsOnCodeStoreWriteFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
 	root := t.TempDir()
 	p, err := New(Config{NetworkName: "testnet", CodeStorePath: root})
 	if err != nil {
