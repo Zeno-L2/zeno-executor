@@ -50,6 +50,22 @@ func mustHalt(t *testing.T, cfg Config) error {
 	return err
 }
 
+func mustBeUnavailable(t *testing.T, cfg Config) error {
+	t.Helper()
+	rdy, err := Boot(cfg)
+	if err == nil {
+		rdy.Store.Close()
+		t.Fatalf("Boot succeeded, want ErrSourceUnavailable")
+	}
+	if !errors.Is(err, ErrSourceUnavailable) {
+		t.Fatalf("Boot error = %v, want one wrapping ErrSourceUnavailable", err)
+	}
+	if errors.Is(err, ErrHalted) {
+		t.Fatalf("Boot error = %v, wraps ErrHalted", err)
+	}
+	return err
+}
+
 func storeRoot(t *testing.T, s *state.Store) types.Hash {
 	t.Helper()
 	r, err := s.Root()
@@ -314,7 +330,7 @@ func TestBootAnchorReadFailure(t *testing.T) {
 	cfg.Momenta = newChainSource(6, 0)
 	anchors := &fakeAnchors{err: errors.New("down")}
 	cfg.Anchors = anchors
-	mustHalt(t, cfg)
+	mustBeUnavailable(t, cfg)
 	if anchors.calls != cfg.Retry.SourceAttempts {
 		t.Fatalf("anchor read attempted %d times, want %d", anchors.calls, cfg.Retry.SourceAttempts)
 	}
@@ -390,7 +406,7 @@ func TestBootContinuity(t *testing.T) {
 		src := newChainSource(6, 0)
 		cfg.Momenta = src
 		before, _, _ := ReadCursor(cfg.Layout)
-		err := mustHalt(t, cfg)
+		err := mustBeUnavailable(t, cfg)
 		if !strings.Contains(err.Error(), "frontier 6") || !strings.Contains(err.Error(), "top height 8") {
 			t.Fatalf("error %q does not name the frontier and the window's top", err)
 		}
@@ -405,7 +421,7 @@ func TestBootContinuity(t *testing.T) {
 		src.dropReads = true
 		cfg.Momenta = src
 		before, _, _ := ReadCursor(cfg.Layout)
-		err := mustHalt(t, cfg)
+		err := mustBeUnavailable(t, cfg)
 		if !strings.Contains(err.Error(), "frontier 12") {
 			t.Fatalf("error %q does not name the lag", err)
 		}
@@ -669,13 +685,13 @@ func TestForkParentUnavailableSource(t *testing.T) {
 		}
 	})
 
-	t.Run("failures past the budget halt", func(t *testing.T) {
+	t.Run("failures past the budget are unavailable", func(t *testing.T) {
 		cfg := buildTree(t, depth, 8)
 		src := &flakyMomenta{inner: newChainSource(12, 0), failures: cfg.Retry.SourceAttempts}
 		cfg.Momenta = src
 		_, ok, err := ForkParent(cfg, pos(cfg))
-		if ok || !errors.Is(err, ErrHalted) {
-			t.Fatalf("ForkParent = ok %v, err %v; want ErrHalted", ok, err)
+		if ok || !errors.Is(err, ErrSourceUnavailable) || errors.Is(err, ErrHalted) {
+			t.Fatalf("ForkParent = ok %v, err %v; want ErrSourceUnavailable, not ErrHalted", ok, err)
 		}
 		if src.calls != cfg.Retry.SourceAttempts {
 			t.Fatalf("source read %d times, want %d", src.calls, cfg.Retry.SourceAttempts)
@@ -701,8 +717,8 @@ func TestForkParentUnavailableSource(t *testing.T) {
 		delete(src.hashes, 6)
 		cfg.Momenta = src
 		_, ok, err := ForkParent(cfg, pos(cfg))
-		if ok || !errors.Is(err, ErrHalted) || !strings.Contains(err.Error(), "height 6") {
-			t.Fatalf("ForkParent = ok %v, err %v; want ErrHalted naming height 6", ok, err)
+		if ok || !errors.Is(err, ErrSourceUnavailable) || errors.Is(err, ErrHalted) || !strings.Contains(err.Error(), "height 6") {
+			t.Fatalf("ForkParent = ok %v, err %v; want ErrSourceUnavailable naming height 6, not ErrHalted", ok, err)
 		}
 	})
 

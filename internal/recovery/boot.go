@@ -32,6 +32,11 @@ const MaxConfirmationDepth = 1023
 // rather than sleeping through its budget on a failure that cannot become transient.
 var ErrHalted = errors.New("recovery: halted")
 
+// ErrSourceUnavailable marks a momentum or anchor source that stayed unavailable through the
+// bounded retry: read failures, or a node behind the recorded momentum window. No consistency
+// fault was found; a later attempt resumes from the durable position.
+var ErrSourceUnavailable = errors.New("recovery: source unavailable")
+
 // ErrBundleMissing reports that no bundle is stored for a DAHash.
 var ErrBundleMissing = errors.New("recovery: bundle missing")
 
@@ -55,7 +60,7 @@ type AnchorSource interface {
 // RetryPolicy is the bounded-retry schedule for the two transient conditions the machine
 // tolerates. A zero field takes its package default, so the zero RetryPolicy is the production
 // schedule and a test can shrink the intervals it would otherwise sleep through. EXECUTOR §14
-// tags both schedules [BINARY]: they shift how quickly an operator is paged, never correctness,
+// tags both schedules [BINARY]: they shift how soon a fault is reported, never correctness,
 // unlike ConfirmationDepth, which has no default at all.
 type RetryPolicy struct {
 	// AwaitDAAttempts/AwaitDAInterval re-check one bundle this process wrote itself, which is
@@ -64,7 +69,8 @@ type RetryPolicy struct {
 	AwaitDAAttempts int
 	AwaitDAInterval time.Duration
 	// SourceAttempts/SourceInterval bound a znnd read failure and a znnd that is behind the
-	// recorded momentum window (EXECUTOR §15). Defaults: 5, 1s.
+	// recorded momentum window (EXECUTOR §15). Defaults: 5, 1s; exhaustion returns an error
+	// wrapping ErrSourceUnavailable.
 	SourceAttempts int
 	SourceInterval time.Duration
 }
@@ -153,9 +159,11 @@ func halted(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrHalted, fmt.Sprintf(format, args...))
 }
 
-// asHalt makes err wrap ErrHalted unless it already does.
+// asHalt makes err wrap ErrHalted unless it already does, or unless it wraps
+// ErrSourceUnavailable, which it returns unchanged: a source that stayed unavailable through its
+// retry budget is not a consistency fault.
 func asHalt(err error) error {
-	if err == nil || errors.Is(err, ErrHalted) {
+	if err == nil || errors.Is(err, ErrHalted) || errors.Is(err, ErrSourceUnavailable) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrHalted, err)
@@ -167,7 +175,8 @@ func enter(state string) { log.Printf("recovery: %s", state) }
 // REPLAY_POST_ANCHOR's local preconditions and returns the position to resume from. Every
 // consistency fault — a substituted or unloadable snapshot, an anchor-root mismatch, a missing
 // bundle for an un-finalized batch, a reorg deeper than the recorded window — returns an error
-// wrapping ErrHalted.
+// wrapping ErrHalted. A source still unavailable through its retry budget returns an error
+// wrapping ErrSourceUnavailable instead.
 func Boot(cfg Config) (Ready, error) {
 	if err := cfg.validate(needDomain | needMomenta | needAnchors | needBundles); err != nil {
 		return Ready{}, err
@@ -334,8 +343,8 @@ func loadSnapshot(cfg Config, pos Position) (*state.Store, error) {
 }
 
 // withSourceRetry runs fn up to policy.SourceAttempts times, SourceInterval apart. An error
-// wrapping ErrHalted returns immediately. Exhaustion returns an error wrapping ErrHalted and the
-// last failure.
+// wrapping ErrHalted returns immediately. Exhaustion returns an error wrapping
+// ErrSourceUnavailable and the last failure.
 func withSourceRetry(p RetryPolicy, what string, fn func() error) error {
 	p = p.WithDefaults()
 	for attempt := 1; ; attempt++ {
@@ -347,7 +356,7 @@ func withSourceRetry(p RetryPolicy, what string, fn func() error) error {
 			return err
 		}
 		if attempt >= p.SourceAttempts {
-			return fmt.Errorf("%w: %s failed %d times: %w", ErrHalted, what, attempt, err)
+			return fmt.Errorf("%w: %s failed %d times: %w", ErrSourceUnavailable, what, attempt, err)
 		}
 		time.Sleep(p.SourceInterval)
 	}
@@ -486,7 +495,7 @@ func anchoredWindow(l Layout, pos Position) ([]MomentumRef, error) {
 //
 // A source whose frontier is below the window's top height, or whose ranged read does not reach
 // it, is unavailable rather than forked: ForkParent retries under the policy and then returns an
-// error wrapping ErrHalted that names the lag, never a fork.
+// error wrapping ErrSourceUnavailable that names the lag, never a fork.
 func ForkParent(cfg Config, pos Position) (height uint64, ok bool, err error) {
 	if err := cfg.validate(needMomenta); err != nil {
 		return 0, false, err
@@ -581,7 +590,7 @@ func momentumHashes(moms []*nom.DetailedMomentum) map[uint64]types.Hash {
 // pending record expire (§11.5) and accepted a second DeployContractStart for the same
 // code_hash. That second record survives the rollback, and a canonical finalize for the first
 // record assembles against it. The operator remedy is to stop the executor, remove the domain
-// directory and the plugin's code-store directory, and re-sync from genesis.
+// directory and any plugin state kept outside it, and re-sync from genesis.
 func Rollback(cfg Config, forkParent uint64) (Ready, error) {
 	if err := cfg.validate(needDomain); err != nil {
 		return Ready{}, err

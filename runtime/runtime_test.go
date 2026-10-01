@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -269,9 +270,13 @@ func TestConfigValidation(t *testing.T) {
 	for name, mutate := range cases {
 		cfg := validConfig(t, src)
 		mutate(&cfg)
-		if err := cfg.validate(); err == nil {
-			t.Errorf("%s: accepted", name)
+		if err := cfg.validate(); err == nil || !errors.Is(err, ErrConfig) {
+			t.Errorf("%s: err = %v, want one wrapping ErrConfig", name, err)
 		}
+	}
+
+	if err := New(validConfig(t, src)).Run(context.Background()); !errors.Is(err, ErrConfig) {
+		t.Fatalf("Run with no domain registered = %v, want one wrapping ErrConfig", err)
 	}
 }
 
@@ -341,14 +346,14 @@ func TestRunCommitsAndRecovers(t *testing.T) {
 	}
 }
 
-func TestRunHaltsOnUnwiredSource(t *testing.T) {
+func TestRunUnavailableOnFailingSource(t *testing.T) {
 	cfg := validConfig(t, failingSource{})
 	cfg.StoragePath = filepath.Join(t.TempDir(), "x")
 	rt := New(cfg)
 	rt.Register(scriptDomain{})
 	err := rt.Run(context.Background())
-	if !errors.Is(err, recovery.ErrHalted) {
-		t.Fatalf("Run = %v, want ErrHalted", err)
+	if !errors.Is(err, recovery.ErrSourceUnavailable) || errors.Is(err, recovery.ErrHalted) {
+		t.Fatalf("Run = %v, want ErrSourceUnavailable, not ErrHalted", err)
 	}
 }
 
@@ -1186,13 +1191,13 @@ func TestSourceRetryBudget(t *testing.T) {
 		}
 	}
 
-	t.Run("consecutive failures equal to the budget halt", func(t *testing.T) {
+	t.Run("consecutive failures equal to the budget are unavailable", func(t *testing.T) {
 		t.Parallel()
 		cfg, src := newRun(3, interval, func(int) error { return down })
 		start := time.Now()
 		err := runUntil(t, cfg, func() bool { return false })
-		if !errors.Is(err, recovery.ErrHalted) || !errors.Is(err, down) {
-			t.Fatalf("Run = %v, want ErrHalted wrapping the source error", err)
+		if !errors.Is(err, recovery.ErrSourceUnavailable) || !errors.Is(err, down) || errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("Run = %v, want ErrSourceUnavailable wrapping the source error, not ErrHalted", err)
 		}
 		if n := src.callCount(); n != 3 {
 			t.Fatalf("source called %d times, want 3", n)
@@ -1487,5 +1492,247 @@ func TestCommitBoundaryClosesAtAMomentumBoundary(t *testing.T) {
 	want := []string{"0", "2", "4", "drained", "6", "8", "10", "drained", "12"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("sequence = %v, want %v", got, want)
+	}
+}
+
+// --- domain lock ---
+
+// TestDomainLock checks that Run's worker.lock is per domain: a second Run on the same domain
+// is rejected before it ever reads a source, while a concurrent Run on another domain under the
+// same StoragePath and ExecutorID proceeds.
+func TestDomainLock(t *testing.T) {
+	chain := buildChain(t, 10, 0)
+
+	src := &chainSource{}
+	cfg := validConfig(t, src)
+	l := startRun(t, cfg, src, scriptDomain{})
+	l.step(chain, 12)
+
+	cfg2 := cfg
+	inner := &chainSource{}
+	inner.set(chain, 12)
+	flaky := &flakySource{MomentumSource: inner, fail: func(int) error { return nil }}
+	cfg2.Momenta = flaky
+	rt2 := New(cfg2)
+	rt2.Register(scriptDomain{})
+	if err := rt2.Run(context.Background()); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Run on the locked domain = %v, want one wrapping ErrLocked", err)
+	}
+	if n := flaky.callCount(); n != 0 {
+		t.Fatalf("second Run read the source %d times, want 0: a reached Boot would call FrontierHeight in ForkParent", n)
+	}
+
+	cfg3 := cfg
+	cfg3.DomainID = 2
+	src3 := &chainSource{}
+	src3.set(chain, 12)
+	cfg3.Momenta = src3
+	if err := runUntil(t, cfg3, func() bool {
+		_, ok := cursorAt(t, cfg3)
+		return ok
+	}); err != nil {
+		t.Fatalf("domain 2 Run: %v", err)
+	}
+
+	if err := l.stop(); err != nil {
+		t.Fatalf("domain 1 Run: %v", err)
+	}
+}
+
+// --- OnCommit ---
+
+// TestOnCommitReportsDurableCommitments checks that every OnCommit call carries exactly the
+// commitments of the batches its commit made durable, and fires only once the cursor covers
+// them.
+func TestOnCommitReportsDurableCommitments(t *testing.T) {
+	src := &chainSource{}
+	cfg := validConfig(t, src)
+	layout := layoutOf(t, cfg)
+
+	var mu sync.Mutex
+	var calls [][]codec.BatchCommitment
+	type read struct {
+		pos recovery.Position
+		ok  bool
+		err error
+	}
+	var reads []read
+	cfg.OnCommit = func(c []codec.BatchCommitment) error {
+		pos, ok, err := recovery.ReadCursor(layout)
+		mu.Lock()
+		calls = append(calls, c)
+		reads = append(reads, read{pos, ok, err})
+		mu.Unlock()
+		return nil
+	}
+
+	l := startRun(t, cfg, src, scriptDomain{})
+	chain := buildChain(t, 10, 0)
+	l.step(chain, 4)
+	l.step(chain, 8)
+	l.step(chain, 12)
+	if err := l.stop(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) < 3 {
+		t.Fatalf("%d OnCommit calls, want at least 3", len(calls))
+	}
+	var all []codec.BatchCommitment
+	for i, c := range calls {
+		r := reads[i]
+		if !r.ok || r.err != nil {
+			t.Fatalf("call %d: cursor read ok=%v err=%v", i, r.ok, r.err)
+		}
+		last := c[len(c)-1]
+		if r.pos.LastInputSeq != last.LastInputSeq {
+			t.Fatalf("call %d: cursor LastInputSeq %d, want %d", i, r.pos.LastInputSeq, last.LastInputSeq)
+		}
+		if r.pos.NextBatchID != last.BatchID+1 {
+			t.Fatalf("call %d: cursor NextBatchID %d, want %d", i, r.pos.NextBatchID, last.BatchID+1)
+		}
+		all = append(all, c...)
+	}
+	records, err := recovery.ListBatchRecords(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != len(records) {
+		t.Fatalf("%d reported commitments, want %d records", len(all), len(records))
+	}
+	for i, c := range all {
+		r := records[i]
+		if c.BatchID != r.BatchID || c.FirstInputSeq != r.FirstInputSeq || c.LastInputSeq != r.LastInputSeq ||
+			c.PreStateRoot != r.PreStateRoot || c.PostStateRoot != r.PostStateRoot || c.DAHash != r.DAHash {
+			t.Fatalf("commitment %d = %+v, want to match record %+v", i, c, r)
+		}
+		if c.DomainID != 1 {
+			t.Fatalf("commitment %d DomainID = %d, want 1", i, c.DomainID)
+		}
+		if c.ExecutorID != (types.Address{0x42}) {
+			t.Fatalf("commitment %d ExecutorID = %v, want {0x42}", i, c.ExecutorID)
+		}
+	}
+}
+
+// --- transient vs. halted local failures ---
+
+// TestCommitAndLocalWriteFailures checks that a failed recovery.Commit and a failed OnCommit are
+// transient, while a local write outside recovery.Commit still halts.
+func TestCommitAndLocalWriteFailures(t *testing.T) {
+	chain := buildChain(t, 10, 0)
+
+	t.Run("OnCommit error", func(t *testing.T) {
+		src := &chainSource{}
+		src.set(chain, 12)
+		cfg := validConfig(t, src)
+		reportErr := errors.New("report failed")
+		cfg.OnCommit = func([]codec.BatchCommitment) error { return reportErr }
+		err := runUntil(t, cfg, func() bool { return false })
+		if !errors.Is(err, reportErr) || errors.Is(err, recovery.ErrHalted) || errors.Is(err, recovery.ErrSourceUnavailable) {
+			t.Fatalf("Run = %v, want one wrapping the OnCommit error and neither sentinel", err)
+		}
+		if _, ok := cursorAt(t, cfg); !ok {
+			t.Fatalf("no cursor after a batch committed durably")
+		}
+	})
+
+	t.Run("commit write failure", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		src := &chainSource{}
+		src.set(chain, 12)
+		cfg := validConfig(t, src)
+		layout, err := recovery.NewLayout(cfg.StoragePath, cfg.DomainID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(layout.Batches, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(layout.Batches, 0o755) })
+		var count atomic.Int32
+		cfg.OnCommit = func([]codec.BatchCommitment) error { count.Add(1); return nil }
+		runErr := runUntil(t, cfg, func() bool { return false })
+		if errors.Is(runErr, recovery.ErrHalted) || errors.Is(runErr, recovery.ErrSourceUnavailable) {
+			t.Fatalf("Run = %v, want neither sentinel", runErr)
+		}
+		if _, ok := cursorAt(t, cfg); ok {
+			t.Fatalf("cursor exists after a commit write failure")
+		}
+		if n := count.Load(); n != 0 {
+			t.Fatalf("OnCommit called %d times, want 0", n)
+		}
+	})
+
+	t.Run("bundle write failure halts", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		src := &chainSource{}
+		src.set(chain, 12)
+		cfg := validConfig(t, src)
+		layout, err := recovery.NewLayout(cfg.StoragePath, cfg.DomainID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(layout.Bundles, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(layout.Bundles, 0o755) })
+		runErr := runUntil(t, cfg, func() bool { return false })
+		if !errors.Is(runErr, recovery.ErrHalted) || errors.Is(runErr, recovery.ErrSourceUnavailable) {
+			t.Fatalf("Run = %v, want ErrHalted, not ErrSourceUnavailable", runErr)
+		}
+		if _, ok := cursorAt(t, cfg); ok {
+			t.Fatalf("cursor exists after a bundle write failure")
+		}
+	})
+}
+
+// --- lagging source during a reorg ---
+
+// lagSource makes a ranged read below a chosen height return nothing once armed, without
+// touching FrontierHeight, so a reorg's ForkParent search finds the source unavailable rather
+// than forked.
+type lagSource struct {
+	*chainSource
+	below uint64
+	lag   atomic.Bool
+}
+
+func (s *lagSource) DetailedMomentumsByHeight(height, count uint64) ([]*nom.DetailedMomentum, error) {
+	if s.lag.Load() && height <= s.below {
+		return nil, nil
+	}
+	return s.chainSource.DetailedMomentumsByHeight(height, count)
+}
+
+// TestReorgWithLaggingSourceIsUnavailable checks that a reorg whose ForkParent search cannot
+// read far enough back ends unavailable rather than halted.
+func TestReorgWithLaggingSourceIsUnavailable(t *testing.T) {
+	a := buildShape(1, 12, saltFrom(1<<62, 0), dense)
+	b := buildShape(1, 16, saltFrom(9, 1), dense)
+
+	inner := &chainSource{}
+	src := &lagSource{chainSource: inner, below: 10}
+	cfg := validConfig(t, src)
+	l := startRun(t, cfg, inner, scriptDomain{})
+	l.step(a, 4)
+	l.step(a, 8)
+	l.step(a, 12)
+
+	src.lag.Store(true)
+	inner.set(b, 18)
+
+	err := l.exit()
+	if !errors.Is(err, recovery.ErrSourceUnavailable) || errors.Is(err, recovery.ErrHalted) {
+		t.Fatalf("Run = %v, want ErrSourceUnavailable, not ErrHalted", err)
+	}
+	if pos, ok := cursorAt(t, cfg); !ok || pos.MomentumHeight != 10 {
+		t.Fatalf("cursor = %+v, ok %v, want momentum height 10", pos, ok)
 	}
 }

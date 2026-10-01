@@ -1,0 +1,5 @@
+.git
+.pipeline
+.idea
+data
+docker/secrets

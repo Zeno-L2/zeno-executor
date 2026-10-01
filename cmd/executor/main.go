@@ -1,22 +1,22 @@
-// Command executor runs the off-chain executor binary for one execution domain.
+// Command executor is the executor supervisor, which starts and supervises one worker process
+// per configured domain.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/zenon-network/go-zenon/chain/nom"
-	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/ledger"
+	"github.com/digitalSloth/go-executor/internal/ipc"
 	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
-	"github.com/digitalSloth/go-executor/runtime"
+	"github.com/digitalSloth/go-executor/internal/supervisor"
 )
 
 // unwiredMomentumSource stands in for a znnd JSON-RPC client until one exists. Each method's
@@ -40,61 +40,47 @@ func (unwiredAnchorSource) FinalizedAnchor(domainID uint32) (recovery.Anchor, bo
 }
 
 func main() {
-	executorID := flag.String("executor-id", "", "bonded executor identity; keys the single-instance lease")
-	storagePath := flag.String("storage-path", "./data", "root directory for on-disk state")
-	domainID := flag.Uint("domain-id", 0, "execution domain served by this process")
-	network := flag.String("network", "", "network name (\"mainnet\" | \"testnet\" | a named devnet); fixes the WASM domain's chainID")
-	role := flag.String("role", "", "process role (\"EXECUTOR\"); only EXECUTOR is implemented")
-	stfSpecHash := flag.String("stf-spec-hash", "", "hex hash identifying the state-transition function this build implements; tags every snapshot")
-	confirmationDepth := flag.Uint("confirmation-depth", 0, "momenta behind the frontier treated as confirmed")
+	os.Exit(run())
+}
+
+// run loads the supervisor's configuration and key, then runs it until ctx ends or it fails to
+// start. It returns the process exit status.
+func run() int {
+	path := flag.String("config", "", "path to the supervisor configuration file")
 	flag.Parse()
 
-	if *executorID == "" {
-		log.Fatal("executor: -executor-id is required")
-	}
-	if *network == "" {
-		log.Fatal("executor: -network is required")
-	}
-	if *role == "" {
-		log.Fatal("executor: -role is required")
-	}
-	if *stfSpecHash == "" {
-		log.Fatal("executor: -stf-spec-hash is required")
-	}
-	specHash, err := types.HexToHash(*stfSpecHash)
+	cfg, err := supervisor.LoadConfig(*path)
 	if err != nil {
-		log.Fatalf("executor: -stf-spec-hash: %v", err)
+		log.Printf("executor: %v", err)
+		return exitStatus(err)
 	}
-	if *confirmationDepth == 0 {
-		log.Fatal("executor: -confirmation-depth is required")
+
+	key, err := supervisor.LoadKey(cfg.SubmissionKeySource)
+	if err != nil {
+		log.Printf("executor: %v", err)
+		return exitStatus(err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	exec := runtime.New(runtime.Config{
-		DomainID:    uint32(*domainID),
-		ExecutorID:  *executorID,
-		StoragePath: *storagePath,
-
-		Role:              *role,
-		STFSpecHash:       specHash,
-		ConfirmationDepth: uint64(*confirmationDepth),
-		Momenta:           unwiredMomentumSource{},
-		Filter:            ledger.UnwiredFilter{},
-		Anchors:           unwiredAnchorSource{},
-	})
-
-	plugin, err := wasm.New(wasm.Config{
-		NetworkName:   *network,
-		CodeStorePath: filepath.Join(*storagePath, "wasm-code"),
-	})
+	sup := supervisor.New(cfg, key, supervisor.Sources{Momenta: unwiredMomentumSource{}, Anchors: unwiredAnchorSource{}}, supervisor.Policy{})
+	err = sup.Run(ctx)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("executor: %v", err)
 	}
-	exec.Register(plugin)
+	return exitStatus(err)
+}
 
-	if err := exec.Run(ctx); err != nil {
-		log.Fatal(err)
+// exitStatus maps Run's result to the process exit status: ipc.ExitConfig for an error wrapping
+// supervisor.ErrConfig, 1 for any other error, 0 for nil.
+func exitStatus(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, supervisor.ErrConfig):
+		return ipc.ExitConfig
+	default:
+		return 1
 	}
 }

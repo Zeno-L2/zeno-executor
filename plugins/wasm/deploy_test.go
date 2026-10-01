@@ -737,6 +737,9 @@ func TestApplyDeployFinalizeHalts(t *testing.T) {
 
 func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 	t.Run("ReadFault", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
 		root := t.TempDir()
 		p, err := New(Config{NetworkName: "testnet", CodeStorePath: root})
 		if err != nil {
@@ -759,6 +762,9 @@ func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 	})
 
 	t.Run("WriteFault", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
 		root := t.TempDir()
 		p, err := New(Config{NetworkName: "testnet", CodeStorePath: root})
 		if err != nil {
