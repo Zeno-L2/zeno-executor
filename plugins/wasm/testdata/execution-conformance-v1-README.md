@@ -61,7 +61,7 @@ vectors.
 Declared as Go structs (`vectorFile`, `vectorJSON`, `vectorInput`, `vectorReceipt`) in
 `../vectors_test.go`.
 
-Five vector shapes, distinguished by `shape`:
+Six vector shapes, distinguished by `shape`:
 
 | Shape | `input_frame_hex` | `module_wasm_hex` | `source_data_hex` | `input` | notes |
 |---|---|---|---|---|---|
@@ -69,7 +69,8 @@ Five vector shapes, distinguished by `shape`:
 | `deploy` (kinds 2-5) | absent | present | present iff kind 3 | present | code-store seeding, §15 identity; ReturnData = code_hash ‖ CodeHash (§11.3, §12) on a SUCCESS finalize or upgrade only — a rejected upgrade carries no ReturnData and no state diff, and an UNAUTHORIZED one carries the target's unchanged receipt.code_hash; `pending_metadata_hex` for kinds 4/5 |
 | `ownership` (kind 6) | absent | absent | absent | present | frame absent, module absent, source data absent, input present |
 | `validation_rejection` | absent | present | absent | present | module never runs; `VALIDATION_FAILED` |
-| `unsupported_kind` (kind 7) | absent | absent | absent | absent | `canonical_input_hex` is §27.5's 33-byte prefix |
+| `buy_storage` (kind 7) | absent | absent | absent | present | frame absent, module absent, source data absent, input present; witness set is the `0x0001` and `0x0005` leaves on every outcome |
+| `unsupported_kind` (kind 8) | absent | absent | absent | absent | `canonical_input_hex` is §27.5's 33-byte prefix |
 
 Encoding rules:
 
@@ -79,7 +80,7 @@ Encoding rules:
 - `pre_state` and `witness_keys` are always marshalled, and the generator always assigns a
   non-nil map/slice, so a shape with neither renders `{}` and `[]`, never `null`.
 - `input`'s numeric/string fields that can legitimately be zero or empty for a kind that carries
-  them (`plasma_limit`, `total_size`, `chunk_count`, `chunk_index`, `payload_hex`) are pointer
+  them (`plasma_limit`, `total_size`, `chunk_count`, `chunk_index`, `payload_hex`, `bytes`) are pointer
   types, so `omitempty` cannot be confused with a genuinely absent field.
 - `contract_effects_blob_hex` absent means the run returned no blob. A module returning a
   zero-length blob is not distinguishable from that and no shape produces one; a future vector
@@ -147,6 +148,11 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 | `CV-RTL-BLOB-2` | the same, also malformed, proving step 0 precedes the decode |
 | `CV-ASSETS-1` | 17 distinct-asset withdrawals in one input breach the per-input asset footprint: `RUNTIME_FAULT` at the metered gas |
 | `CV-ASSETS-2` | 16 distinct-asset withdrawals plus a non-zero deposit in a 17th asset breach the footprint: `RUNTIME_FAULT`, full refund |
+| `CV-QUOTA-1` | a write that brings `used` exactly to `purchased` succeeds, and the committed StateDiff carries the updated `0x0005` leaf |
+| `CV-QUOTA-2` | net state growth one byte over the remaining quota is `STORAGE_QUOTA_EXCEEDED` at metered plus effect gas, with the full deposit refunded |
+| `CV-QUOTA-3` | at a fully used quota, deleting a leaf frees its bytes and a smaller write reuses them without buying more |
+| `CV-QUOTA-4` | writes that net to `delta = 0` succeed at a fully used quota, commit no quota entry, and leave `0x0005` out of the witness set |
+| `CV-QUOTA-5` | a contract writing the reserved quota key `0x0005` is `UNAUTHORIZED` |
 | `CV-DEPLOY-1` | single-chunk deployment start: `chunk_count` 1 for a module within `MaxDeployChunkData` |
 | `CV-DEPLOY-2` | the single deploy chunk carrying the whole module at `chunk_index` 0 |
 | `EXEC-DEPLOY-1` | deploy finalize: the three reserved leaves are written and `ReturnData` is `code_hash` then `CodeHash` |
@@ -172,6 +178,9 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 | `CV-DEPLOY-META-4` | a deploy finalize against pending metadata with an unlisted `upgrade_policy` is `VALIDATION_FAILED` |
 | `CV-DEPLOY-META-5` | a deploy finalize against `IMMUTABLE` pending metadata carrying a non-zero owner is `VALIDATION_FAILED` |
 | `CV-DEPLOY-META-6` | a deploy finalize against `OWNER_UPGRADEABLE` pending metadata carrying a zero owner is `VALIDATION_FAILED` |
+| `CV-QUOTA-6` | `BuyStorage` adds `bytes` to `purchased` and leaves `used` unchanged |
+| `CV-QUOTA-7` | `BuyStorage` naming a `contract_id` with no code-hash leaf is `VALIDATION_FAILED` |
+| `CV-QUOTA-8` | `BuyStorage` whose `purchased + bytes` is `2^64` is `VALIDATION_FAILED`, and its receipt carries the unchanged `CodeHash` |
 | `EXEC-UNSUP-1` | an unrecognized `input_kind` is refused deterministically as `UNSUPPORTED_OPERATION` |
 
 `CV-DEPLOY-1` and `CV-DEPLOY-2` together are the single-chunk sizing case: the kind-2 record

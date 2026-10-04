@@ -19,6 +19,7 @@ const (
 	StatusResultTooLarge       Status = 5
 	StatusUnauthorized         Status = 6
 	StatusUnsupportedOperation Status = 7
+	StatusStorageQuotaExceeded Status = 8
 )
 
 // String returns the §15 status name, or "UNKNOWN" for an out-of-range ordinal.
@@ -40,6 +41,8 @@ func (s Status) String() string {
 		return "UNAUTHORIZED"
 	case StatusUnsupportedOperation:
 		return "UNSUPPORTED_OPERATION"
+	case StatusStorageQuotaExceeded:
+		return "STORAGE_QUOTA_EXCEEDED"
 	default:
 		return "UNKNOWN"
 	}
@@ -69,7 +72,7 @@ func (rec Receipt) Encode() ([]byte, error) {
 	if rec.Version != ReceiptVersion {
 		return nil, fmt.Errorf("codec: encode receipt: %w", ErrUnknownVersion)
 	}
-	if rec.Status > StatusUnsupportedOperation {
+	if rec.Status > StatusStorageQuotaExceeded {
 		return nil, fmt.Errorf("codec: encode receipt: %w", ErrInvalidStatus)
 	}
 
@@ -93,7 +96,7 @@ func (rec Receipt) Encode() ([]byte, error) {
 }
 
 // DecodeReceipt decodes a canonical Receipt. It rejects receipt_version != ReceiptVersion
-// first (ErrUnknownVersion), then status > 7 (ErrInvalidStatus).
+// first (ErrUnknownVersion), then status > 8 (ErrInvalidStatus).
 func DecodeReceipt(b []byte) (Receipt, error) {
 	r := newReader(b)
 	var rec Receipt
@@ -127,7 +130,7 @@ func DecodeReceipt(b []byte) (Receipt, error) {
 	if err != nil {
 		return rec, fmt.Errorf("codec: decode receipt: %w", err)
 	}
-	if statusByte > uint8(StatusUnsupportedOperation) {
+	if statusByte > uint8(StatusStorageQuotaExceeded) {
 		return rec, fmt.Errorf("codec: decode receipt: %w", ErrInvalidStatus)
 	}
 	rec.Status = Status(statusByte)

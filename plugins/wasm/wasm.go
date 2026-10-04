@@ -73,7 +73,7 @@ func (p *Plugin) Genesis() domain.StateInit {
 // from an account block whose structure Settlement's method ABI already constrained, so a
 // malformed encoding, a kind-3 chunk-hash or chunk-size mismatch, or a SourceData/kind
 // mismatch is an internal fault, not a consensus outcome. An input_kind outside the Phase-1
-// set {0..6} is instead returned as Input{Unsupported: true} with a nil error, so Apply can
+// set {0..7} is instead returned as Input{Unsupported: true} with a nil error, so Apply can
 // emit the deterministic UNSUPPORTED_OPERATION status (§15).
 func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.Input, error) {
 	in, err := codec.DecodeInput(payload)
@@ -137,8 +137,8 @@ func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.In
 	return Input{Ctx: ctx, Args: in.Args}, nil
 }
 
-// Apply serves all seven input kinds: CallL2 and Deposit (0/1), the chunked-deployment
-// receipts and finalize (2-4), the upgrade (5), and the ownership transfer (6).
+// Apply serves all eight input kinds: CallL2 and Deposit (0/1), the chunked-deployment
+// receipts and finalize (2-4), the upgrade (5), the ownership transfer (6), and the storage purchase (7).
 func (p *Plugin) Apply(state domain.StateAccess, in domain.Input) (domain.Effects, error) {
 	input, ok := in.(Input)
 	if !ok {
@@ -161,6 +161,8 @@ func (p *Plugin) Apply(state domain.StateAccess, in domain.Input) (domain.Effect
 		return p.applyUpgrade(state, input.Ctx, args)
 	case codec.TransferOwnershipArgs:
 		return p.applyTransferOwnership(state, input.Ctx, args)
+	case codec.BuyStorageArgs:
+		return p.applyBuyStorage(state, args)
 	}
 
 	callArgs, ok := toCallArgs(input.Args)

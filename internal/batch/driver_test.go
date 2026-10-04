@@ -182,7 +182,7 @@ func callPayload(t *testing.T, src, target types.Hash, asset codec.AssetID, amou
 }
 
 // unsupportedPayload is a raw input_kind || source_account_block_hash prefix for a kind
-// outside 0..6, with no defined tail.
+// outside 0..7, with no defined tail.
 func unsupportedPayload(kind byte, src types.Hash) []byte {
 	b := make([]byte, 33)
 	b[0] = kind

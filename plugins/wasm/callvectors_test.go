@@ -17,6 +17,23 @@ import (
 // small helpers those bodies share. All fixtures go through buildWasmModule/runModuleSpec
 // (fixtures_test.go); no ad-hoc WASM bytes, no new builder.
 
+// vectorQuota is the purchased quota seedQuota gives a state-writing vector's contract.
+const vectorQuota = 1 << 16
+
+// seedQuota returns a copy of leaves plus the quota leaf of cid: purchased as given, and used
+// as the summed quota cost (StateLeafOverhead plus value length) of leaves. Every leaf passed
+// must be a non-reserved leaf of cid.
+func seedQuota(cid types.Hash, leaves map[domain.Path][]byte, purchased uint64) map[domain.Path][]byte {
+	out := make(map[domain.Path][]byte, len(leaves)+1)
+	var used uint64
+	for path, value := range leaves {
+		out[path] = value
+		used += StateLeafOverhead + uint64(len(value))
+	}
+	out[derive(cid, keyQuota)] = encodeQuota(purchased, used)
+	return out
+}
+
 // blobOffset is where a fixture's pre-encoded ContractEffects blob is placed when it is the
 // module's only data segment. It is clear of the input frame, which the runtime writes at
 // offset 0 after segment initialization (§7.3, §27.1).
@@ -223,7 +240,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 blobModule(blob),
-			ExtraPreState:          map[domain.Path][]byte{derive(cid1, []byte("counter")): {0x00, 0x00, 0x00, 0x2a}},
+			ExtraPreState:          seedQuota(cid1, map[domain.Path][]byte{derive(cid1, []byte("counter")): {0x00, 0x00, 0x00, 0x2a}}, vectorQuota),
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -245,10 +262,10 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 blobModule(blob),
-			ExtraPreState: map[domain.Path][]byte{
+			ExtraPreState: seedQuota(cid1, map[domain.Path][]byte{
 				derive(cid1, []byte("counter")): {0x00, 0x00, 0x00, 0x2a},
 				derive(cid1, []byte("other")):   {0xff},
-			},
+			}, vectorQuota),
 			WantStatus: codec.StatusSuccess,
 		})
 	}
@@ -270,6 +287,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid1, nil, vectorQuota),
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -296,6 +314,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid1, nil, vectorQuota),
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -370,6 +389,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid1, nil, vectorQuota),
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -431,6 +451,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 mod,
+			ExtraPreState:          seedQuota(cid1, nil, vectorQuota),
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -455,6 +476,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.DepositArgs{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
 			ContractID:             cid2,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, nil, vectorQuota),
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -598,6 +620,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid2,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, nil, vectorQuota),
 			WantStatus:             codec.StatusRuntimeFault,
 		})
 	}
@@ -623,6 +646,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid2,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, nil, vectorQuota),
 			WantStatus:             codec.StatusUnauthorized,
 		})
 	}
@@ -655,8 +679,9 @@ func callVectors(t *testing.T) []vectorSpec {
 		// A contract-only ExecutionResult with N state entries, no events, no outbox, empty
 		// ReturnData encodes to 122 + Σ(36+len(v)) bytes; k2's length is derived so k1+k2 land
 		// exactly at MaxExecutionResult, the largest contract-only result that still passes step
-		// 8, and the appended refund (133 bytes) pushes it over.
-		k2Len := MaxExecutionResult - 122 - 36 - codec.MaxStateValueSize - 36
+		// 8, and the appended refund (133 bytes) pushes it over. The runtime's quota entry
+		// (36 + 16 bytes) is part of that result, so k2 is shortened by it.
+		k2Len := MaxExecutionResult - 122 - 36 - codec.MaxStateValueSize - 36 - (36 + 16)
 		blob := encodeEffects(t, codec.ContractEffects{
 			Version:          codec.ExecutionResultVersion,
 			GlobalInputIndex: idx,
@@ -675,6 +700,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.DepositArgs{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
 			ContractID:             cid2,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, nil, vectorQuota),
 			WantStatus:             codec.StatusResultTooLarge,
 		})
 	}
@@ -760,6 +786,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: module.InitialMemoryCost(1) + costOf(t, 0x42, 0x0B)},
 			ContractID:             cid2,
 			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, nil, vectorQuota),
 			WantStatus:             codec.StatusOutOfGas,
 		})
 	}
@@ -1086,6 +1113,128 @@ func callVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
+	// --- storage quota (step 6a).
+
+	v8 := bytes.Repeat([]byte{0x08}, 8)
+	v4 := bytes.Repeat([]byte{0x04}, 4)
+	q := func(name string) domain.Path { return derive(cid2, []byte(name)) }
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: []byte("q1"), Value: v8}},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-1",
+			Purpose:                "a write that brings used exactly to purchased succeeds, and the committed StateDiff carries the updated 0x0005 leaf",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, map[domain.Path][]byte{q("q0"): v8}, 144),
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: []byte("q1"), Value: v8}},
+			ClaimedDeposit:   u256(1000),
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-2",
+			Purpose:                "net state growth one byte over the remaining quota is STORAGE_QUOTA_EXCEEDED at metered plus effect gas, with the full deposit refunded",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, map[domain.Path][]byte{q("q0"): v8}, 143),
+			WantStatus:             codec.StatusStorageQuotaExceeded,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff: []codec.LocalStateDiffEntry{
+				{LocalKey: []byte("q0"), Value: nil},
+				{LocalKey: []byte("q2"), Value: v4},
+			},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-3",
+			Purpose:                "at a fully used quota, deleting a leaf frees its bytes and a smaller write reuses them without buying more",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, map[domain.Path][]byte{q("q0"): v8, q("q1"): v8}, 144),
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff: []codec.LocalStateDiffEntry{
+				{LocalKey: []byte("q0"), Value: nil},
+				{LocalKey: []byte("q1"), Value: v8},
+			},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-4",
+			Purpose:                "writes that net to delta = 0 succeed at a fully used quota, commit no quota entry, and leave 0x0005 out of the witness set",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			ExtraPreState:          seedQuota(cid2, map[domain.Path][]byte{q("q0"): v8}, 72),
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: keyQuota, Value: encodeQuota(1<<20, 0)}},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-5",
+			Purpose:                "a contract writing the reserved quota key 0x0005 is UNAUTHORIZED",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WantStatus:             codec.StatusUnauthorized,
+		})
+	}
+
 	return specs
 }
 
@@ -1098,7 +1247,7 @@ func assetsTestAssetDistinct(b byte) codec.AssetID {
 	return a
 }
 
-// unsupportedVector returns EXEC-UNSUP-1's vectorSpec: input_kind 7 is outside the Phase-1 set,
+// unsupportedVector returns EXEC-UNSUP-1's vectorSpec: input_kind 8 is outside the Phase-1 set,
 // so DecodeInput returns Input{Unsupported: true} and Apply commits UNSUPPORTED_OPERATION (§15).
 func unsupportedVector() vectorSpec {
 	return vectorSpec{

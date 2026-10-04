@@ -10,7 +10,7 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
 )
 
-// Reserved local keys (§13.3): exactly these four two-byte strings, matched exactly and
+// Reserved local keys (§13.3): exactly these five two-byte strings, matched exactly and
 // never by prefix, so a contract keying its own state by a zero-padded big-endian integer
 // never collides with the reserved space.
 var (
@@ -24,11 +24,13 @@ var (
 	// keyOwner is the caller-domain owner identity; absent unless the policy is
 	// OWNER_UPGRADEABLE.
 	keyOwner = []byte{0x00, 0x04}
+	// keyQuota is the storage quota leaf: purchased:u64 || used:u64, both big-endian (§13.8).
+	keyQuota = []byte{0x00, 0x05}
 )
 
-var reservedKeys = [][]byte{keyCodeHash, keyPreCodeHash, keyUpgradePolicy, keyOwner}
+var reservedKeys = [][]byte{keyCodeHash, keyPreCodeHash, keyUpgradePolicy, keyOwner, keyQuota}
 
-// reserved reports whether localKey is one of the four protocol-reserved keys, matched
+// reserved reports whether localKey is one of the five protocol-reserved keys, matched
 // exactly. A StateDiff entry from a contract whose local_key is reserved is UNAUTHORIZED
 // (SPEC.md:694); contract reads of a reserved key need no special case.
 func reserved(localKey []byte) bool {

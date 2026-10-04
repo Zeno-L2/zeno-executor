@@ -67,6 +67,13 @@ func sampleInputs() []Input {
 				NewOwner:   fillAddress(0x12),
 			},
 		},
+		{
+			SourceAccountBlockHash: fillHash(0x13),
+			Args: BuyStorageArgs{
+				ContractID: fillHash(0x14),
+				Bytes:      4096,
+			},
+		},
 	}
 }
 
@@ -117,6 +124,8 @@ func argsTypeName(a InputArgs) string {
 		return "Upgrade"
 	case TransferOwnershipArgs:
 		return "TransferOwnership"
+	case BuyStorageArgs:
+		return "BuyStorage"
 	default:
 		return "unknown"
 	}
@@ -139,10 +148,33 @@ func TestInputHashMatchesIndependentSHA3(t *testing.T) {
 }
 
 func TestInputUnknownKind(t *testing.T) {
-	b := []byte{0x07} // kind 7 is out of the 0..6 range
+	b := []byte{0x08} // kind 8 is out of the 0..7 range
 	b = append(b, make([]byte, 32)...)
 	if _, err := DecodeInput(b); !errors.Is(err, ErrInvalidKind) {
 		t.Fatalf("got %v, want ErrInvalidKind", err)
+	}
+}
+
+func TestInputBuyStorageZeroBytes(t *testing.T) {
+	in := Input{
+		SourceAccountBlockHash: fillHash(0x13),
+		Args:                   BuyStorageArgs{ContractID: fillHash(0x14), Bytes: 0},
+	}
+	if _, err := in.Encode(); !errors.Is(err, ErrZeroStorageBytes) {
+		t.Fatalf("Encode: got %v, want ErrZeroStorageBytes", err)
+	}
+
+	valid := in
+	valid.Args = BuyStorageArgs{ContractID: fillHash(0x14), Bytes: 1}
+	b, err := valid.Encode()
+	if err != nil {
+		t.Fatalf("Encode valid: %v", err)
+	}
+	for i := len(b) - 8; i < len(b); i++ {
+		b[i] = 0
+	}
+	if _, err := DecodeInput(b); !errors.Is(err, ErrZeroStorageBytes) {
+		t.Fatalf("DecodeInput: got %v, want ErrZeroStorageBytes", err)
 	}
 }
 

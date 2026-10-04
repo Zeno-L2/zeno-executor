@@ -40,7 +40,7 @@ type vectorFile struct {
 type vectorJSON struct {
 	ID                     string            `json:"id"`
 	Purpose                string            `json:"purpose"`
-	Shape                  string            `json:"shape"` // "call" | "deploy" | "validation_rejection" | "unsupported_kind"
+	Shape                  string            `json:"shape"` // "call" | "deploy" | "buy_storage" | "validation_rejection" | "unsupported_kind"
 	BatchID                uint64            `json:"batch_id"`
 	GlobalInputIndex       uint64            `json:"global_input_index"`
 	MomentumHeight         uint64            `json:"momentum_height"`
@@ -86,9 +86,10 @@ type vectorInput struct {
 	ChunkCount     *uint32 `json:"chunk_count,omitempty"`     // kind 2
 	ChunkIndex     *uint32 `json:"chunk_index,omitempty"`     // kind 3; 0 is the single-chunk case
 	ChunkHash      string  `json:"chunk_hash,omitempty"`      // kind 3
-	ContractID     string  `json:"contract_id,omitempty"`     // kinds 5,6
+	ContractID     string  `json:"contract_id,omitempty"`     // kinds 5,6,7
 	NewCodeHash    string  `json:"new_code_hash,omitempty"`   // kind 5
 	NewOwner       string  `json:"new_owner,omitempty"`       // kind 6; 20-byte hex
+	Bytes          *uint64 `json:"bytes,omitempty"`           // kind 7; non-zero
 }
 
 // vectorReceipt is the decoded §27.7 receipt view. Its code_hash is §11.4's CodeHash, i.e.
@@ -232,9 +233,10 @@ func spineVectors(t *testing.T) []vectorSpec {
 			DepositAsset:   codec.AssetID{},
 			DepositAmount:  codec.U256{},
 		},
-		ContractID: contract1,
-		Module:     module2,
-		WantStatus: codec.StatusSuccess,
+		ContractID:    contract1,
+		Module:        module2,
+		ExtraPreState: seedQuota(contract1, nil, vectorQuota),
+		WantStatus:    codec.StatusSuccess,
 	}
 
 	// EXEC-FAIL-OUTBOX-1: a failed input carrying a deposit.
@@ -270,9 +272,10 @@ func spineVectors(t *testing.T) []vectorSpec {
 			DepositAsset:   asset3,
 			DepositAmount:  u256(1000),
 		},
-		ContractID: contract3,
-		Module:     module3,
-		WantStatus: codec.StatusRuntimeFault,
+		ContractID:    contract3,
+		Module:        module3,
+		ExtraPreState: seedQuota(contract3, nil, vectorQuota),
+		WantStatus:    codec.StatusRuntimeFault,
 	}
 
 	return []vectorSpec{exec001, exec002, exec3}
@@ -331,6 +334,11 @@ func inputView(args codec.InputArgs) *vectorInput {
 		return &vectorInput{
 			ContractID: hex.EncodeToString(a.ContractID[:]),
 			NewOwner:   hex.EncodeToString(a.NewOwner[:]),
+		}
+	case codec.BuyStorageArgs:
+		return &vectorInput{
+			ContractID: hex.EncodeToString(a.ContractID[:]),
+			Bytes:      u64p(a.Bytes),
 		}
 	default:
 		return nil
@@ -533,7 +541,7 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 
 // generateUnsupportedVector drives one unrecognized-kind input through the real
 // DecodeInput/Apply seam (§15). Its canonical input is assembled here rather than by
-// codec.Input.Encode, which refuses a kind outside {0..6} by design: §27.5 fixes the encoding as
+// codec.Input.Encode, which refuses a kind outside {0..7} by design: §27.5 fixes the encoding as
 // input_kind:u8 ‖ source_account_block_hash:bytes32, with no tail.
 func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainID types.Hash) vectorJSON {
 	t.Helper()
@@ -631,8 +639,8 @@ func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainI
 	}
 }
 
-// generateDeployVector runs one deploy-shape or validation_rejection-shape vector through the
-// real Plugin.DecodeInput/Plugin.Apply seam. No frame is built and no module is run: kinds 2-5
+// generateDeployVector runs one deploy-, buy_storage- or validation_rejection-shape vector through the
+// real Plugin.DecodeInput/Plugin.Apply seam. No frame is built and no module is run: kinds 2-5 and 7
 // invoke no contract.
 func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 	t.Helper()
@@ -851,7 +859,7 @@ func TestGenerateVectors(t *testing.T) {
 	for _, spec := range deploySpecs {
 		vectors = append(vectors, generateDeployVector(t, spec))
 	}
-	vectors = append(vectors, generateUnsupportedVector(t, unsupported, 7, chainID))
+	vectors = append(vectors, generateUnsupportedVector(t, unsupported, 8, chainID))
 
 	assertChainedRoots(t, vectors, [][2]string{
 		{"EXEC-UPGRADE-2", "EXEC-DEPLOY-2"},
@@ -929,7 +937,7 @@ func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "9e850651b8febc92f4ee2fa26d4f1cd6dca1626cc890b4d9ae01f792d0041b56"
+const vectorFileDigest = "639b677689bfe066c5ca0a4553eb4ba623671c726f63973aa9249d58259c43fb"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {

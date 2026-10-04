@@ -9,7 +9,7 @@ const (
 	SerializationVersion   uint16 = 1
 	StateDiffVersion       uint16 = 1
 	ExecutionResultVersion uint16 = 1
-	ReceiptVersion         uint16 = 2
+	ReceiptVersion         uint16 = 1
 	OutboxVersion          uint16 = 1
 	DAModeVersion          uint16 = 1
 )

@@ -20,7 +20,7 @@ func TestReservedExactMatch(t *testing.T) {
 
 	rejected := [][]byte{
 		{0x00},
-		{0x00, 0x05},
+		{0x00, 0x06},
 		{0x00, 0x01, 0x00},
 		nil,
 		{},
