@@ -166,9 +166,10 @@ type applied struct {
 //     non-consensus store outside the state trie. Replay rewrites every chunk a canonical
 //     finalize assembles, because Settlement accepts a finalize only once every chunk is present
 //     (§11.3). The unrepaired path (EXECUTOR §15): the retracted branch saw a pending record
-//     expire (§11.5) and accepted a second DeployContractStart for the same code_hash; that
-//     second record survives the rollback, and a canonical finalize for the first record
-//     assembles against it. Operator remedy: EXECUTOR §15.
+//     expire (§11.5) and accepted a second DeployContractStart from the same deployer for the
+//     same code_hash; that second record survives the rollback, and a canonical finalize for
+//     the first record assembles against it. Another deployer's start cannot reach the
+//     record. Operator remedy: EXECUTOR §15.
 //
 //   - After a *ledger.ReorgError, the caller MUST NOT reuse this Driver instance: it caches the
 //     store's current root (currentRoot) and only ever refreshes it from its own Store.Apply

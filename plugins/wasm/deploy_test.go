@@ -28,10 +28,10 @@ func decodeStart(t *testing.T, p *Plugin, args codec.DeployStartArgs, ctx domain
 	}
 }
 
-func decodeChunk(t *testing.T, p *Plugin, codeHash types.Hash, idx uint32, data []byte) {
+func decodeChunk(t *testing.T, p *Plugin, sender types.Address, codeHash types.Hash, idx uint32, data []byte) {
 	t.Helper()
 	args := codec.DeployChunkArgs{CodeHash: codeHash, ChunkIndex: idx, ChunkHash: hashOf(crypto.Hash(data))}
-	ctx := domain.InputContext{SourceData: data}
+	ctx := domain.InputContext{L1Sender: sender, SourceData: data}
 	if _, err := p.DecodeInput(ctx, encodeInput(t, args)); err != nil {
 		t.Fatalf("DecodeInput(DeployChunk %d): %v", idx, err)
 	}
@@ -69,7 +69,7 @@ func seedDeployment(t *testing.T, p *Plugin, raw []byte, sender types.Address, m
 		Metadata:     metadata,
 	}, domain.InputContext{L1Sender: sender})
 	for i, c := range chunks {
-		decodeChunk(t, p, codeHash, uint32(i), c)
+		decodeChunk(t, p, sender, codeHash, uint32(i), c)
 	}
 	return codeHash
 }
@@ -154,25 +154,24 @@ func buildElementModule(tableMin, elemOffset uint32) []byte {
 
 func TestDecodePendingRecordRoundTrip(t *testing.T) {
 	h := types.Hash{1, 2, 3}
-	addr := types.Address{4, 5, 6}
-	b := encodePendingRecord(h, 12345, 3, addr, immutableMetadata)
+	b := encodePendingRecord(h, 12345, 3, immutableMetadata)
 
 	rec, ok := decodePendingRecord(b)
 	if !ok {
 		t.Fatal("decodePendingRecord: ok = false for a well-formed record")
 	}
-	if rec.MetadataHash != h || rec.TotalSize != 12345 || rec.ChunkCount != 3 || rec.Deployer != addr || !bytes.Equal(rec.Metadata, immutableMetadata) {
-		t.Fatalf("decodePendingRecord = %+v, want MetadataHash=%x TotalSize=12345 ChunkCount=3 Deployer=%x Metadata=%x", rec, h, addr, immutableMetadata)
+	if rec.MetadataHash != h || rec.TotalSize != 12345 || rec.ChunkCount != 3 || !bytes.Equal(rec.Metadata, immutableMetadata) {
+		t.Fatalf("decodePendingRecord = %+v, want MetadataHash=%x TotalSize=12345 ChunkCount=3 Metadata=%x", rec, h, immutableMetadata)
 	}
 
 	// A length below pendingRecordPrefixSize is rejected; exactly the prefix width (empty
 	// metadata) and a length above it are accepted.
-	for _, n := range []int{63} {
+	for _, n := range []int{43} {
 		if _, ok := decodePendingRecord(make([]byte, n)); ok {
 			t.Fatalf("decodePendingRecord: ok = true for length %d, want false", n)
 		}
 	}
-	for _, n := range []int{64, 65} {
+	for _, n := range []int{44, 45} {
 		if _, ok := decodePendingRecord(make([]byte, n)); !ok {
 			t.Fatalf("decodePendingRecord: ok = false for length %d, want true", n)
 		}
@@ -225,90 +224,120 @@ func TestContractIDFixedVector(t *testing.T) {
 	}
 }
 
-// --- applyDeployFinalize: a stale pending record's deployer.
-//
-// Reproduces attempt A's record expiring (§11.5), a retracted branch's second start B reusing
-// A's code_hash, and a canonical finalize for A reading B's surviving record. The halt runs
-// before the validation-failure branch, so it also covers a stale record that would otherwise
-// fail record-bounds validation.
+// --- pending records and chunks are keyed by (deployer, code_hash).
 
-func TestApplyDeployFinalizeStalePendingRecord(t *testing.T) {
+// finalizeAs applies a DeployFinalize for codeHash from sender at input index idx.
+func finalizeAs(t *testing.T, p *Plugin, sender types.Address, idx uint64, codeHash types.Hash) domain.Effects {
+	t.Helper()
+	ctx := domain.InputContext{GlobalInputIndex: idx, L1Sender: sender}
+	eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
+	if err != nil {
+		t.Fatalf("Apply(finalize by %x): %v", sender[:], err)
+	}
+	if eff.Status != codec.StatusSuccess {
+		t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
+	}
+	return eff
+}
+
+func hasOwnerLeaf(eff domain.Effects) bool {
+	for _, e := range eff.StateDiff {
+		if e.Path == derive(eff.ContractID, keyOwner) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestApplyDeployFinalizeTwoDeployersSameCodeHash(t *testing.T) {
 	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	chunks := splitChunks(raw)
+	codeHash := CodeHash(raw)
 	a := types.Address{1}
 	b := types.Address{2}
 	bMeta := codec.ContractMetadata{Version: codec.ContractMetadataVersion, UpgradePolicy: codec.PolicyOwnerUpgradeable, Owner: b}.Encode()
 
-	t.Run("DeployerMismatchHalts", func(t *testing.T) {
-		p := newTestPlugin(t)
-		seedDeployment(t, p, raw, a, immutableMetadata)
-		codeHash := seedDeployment(t, p, raw, b, bMeta)
-
-		ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: a}
-		eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
-		if err == nil || !strings.Contains(err.Error(), "stale pending record") {
-			t.Fatalf("Apply: err = %v, want a \"stale pending record\" error", err)
-		}
-		if !reflect.DeepEqual(eff, domain.Effects{}) {
-			t.Fatalf("Effects = %+v, want zero value", eff)
-		}
-	})
-
-	t.Run("DeployerMismatchHaltsEvenWhenRecordFailsValidation", func(t *testing.T) {
-		p := newTestPlugin(t)
-		codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
-
-		// B's start reuses A's code_hash with a record that would fail the record-bounds check
-		// (ChunkCount does not match TotalSize's ceiling) were it ever reached; the deployer
-		// comparison runs before that check, so the halt must fire regardless.
+	p := newTestPlugin(t)
+	start := func(sender types.Address, metadata []byte) {
 		decodeStart(t, p, codec.DeployStartArgs{
 			CodeHash:     codeHash,
 			MetadataHash: types.Hash{0x09},
 			TotalSize:    uint64(len(raw)),
-			ChunkCount:   2,
-			Metadata:     bMeta,
-		}, domain.InputContext{L1Sender: b})
+			ChunkCount:   uint32(len(chunks)),
+			Metadata:     metadata,
+		}, domain.InputContext{L1Sender: sender})
+	}
 
-		ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: a}
-		eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
-		if err == nil || !strings.Contains(err.Error(), "stale pending record") {
-			t.Fatalf("Apply: err = %v, want a \"stale pending record\" error", err)
-		}
-		if !reflect.DeepEqual(eff, domain.Effects{}) {
-			t.Fatalf("Effects = %+v, want zero value", eff)
-		}
-	})
+	// A and B interleave their starts and chunks for one code_hash.
+	start(a, immutableMetadata)
+	start(b, bMeta)
+	for i, c := range chunks {
+		decodeChunk(t, p, a, codeHash, uint32(i), c)
+		decodeChunk(t, p, b, codeHash, uint32(i), c)
+	}
 
-	t.Run("DeployerMatchSucceeds", func(t *testing.T) {
-		p := newTestPlugin(t)
-		seedDeployment(t, p, raw, a, immutableMetadata)
-		codeHash := seedDeployment(t, p, raw, b, bMeta)
+	effA := finalizeAs(t, p, a, 7, codeHash)
+	effB := finalizeAs(t, p, b, 8, codeHash)
 
-		ctx := domain.InputContext{GlobalInputIndex: 7, L1Sender: b}
-		eff, err := p.Apply(nil, Input{Ctx: ctx, Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
-		if err != nil {
-			t.Fatalf("Apply: %v", err)
-		}
-		if eff.Status != codec.StatusSuccess {
-			t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
-		}
-		wantID := contractID(b, ctx.GlobalInputIndex, p.chainID)
-		if eff.ContractID != wantID {
-			t.Fatalf("ContractID = %x, want %x", eff.ContractID, wantID)
-		}
-		wantOwnerHash := callerHash(b)
-		found := false
-		for _, e := range eff.StateDiff {
-			if e.Path == derive(wantID, keyOwner) {
-				found = true
-				if !bytes.Equal(e.Value, wantOwnerHash[:]) {
-					t.Fatalf("keyOwner leaf = %x, want %x", e.Value, wantOwnerHash)
-				}
-			}
-		}
-		if !found {
-			t.Fatal("StateDiff has no keyOwner leaf")
-		}
-	})
+	if effA.ContractID != contractID(a, 7, p.chainID) || effB.ContractID != contractID(b, 8, p.chainID) {
+		t.Fatalf("ContractIDs = %x/%x, want each derived from its own sender", effA.ContractID, effB.ContractID)
+	}
+	if hasOwnerLeaf(effA) {
+		t.Fatal("A's finalize carries a keyOwner leaf: it read B's metadata")
+	}
+	if !hasOwnerLeaf(effB) {
+		t.Fatal("B's finalize has no keyOwner leaf: it did not read its own metadata")
+	}
+}
+
+func TestDeployStartLeavesOtherDeployersEntriesIntact(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	a := types.Address{1}
+	b := types.Address{2}
+
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
+	recordBefore, ok, err := p.store.get(entryPendingRecord, pendingRecordKey(a, codeHash))
+	if err != nil || !ok {
+		t.Fatalf("store.get(A record) = ok %v, err %v", ok, err)
+	}
+
+	seedDeployment(t, p, raw, b, immutableMetadata)
+	decodeStart(t, p, codec.DeployStartArgs{CodeHash: codeHash, MetadataHash: types.Hash{0x09}, TotalSize: uint64(len(raw)), ChunkCount: 1}, domain.InputContext{L1Sender: b})
+
+	recordAfter, ok, err := p.store.get(entryPendingRecord, pendingRecordKey(a, codeHash))
+	if err != nil || !ok {
+		t.Fatalf("A's record is gone after B's start: ok %v, err %v", ok, err)
+	}
+	if !bytes.Equal(recordBefore, recordAfter) {
+		t.Fatal("A's record changed after B's start")
+	}
+	if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(a, codeHash, 0)); err != nil || !ok {
+		t.Fatalf("A's chunk 0 is gone after B's start: ok %v, err %v", ok, err)
+	}
+	if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(b, codeHash, 0)); err != nil {
+		t.Fatalf("store.get: %v", err)
+	} else if ok {
+		t.Fatal("B's chunk 0 survived B's own start")
+	}
+}
+
+func TestApplyUpgradeByOtherDeployerHalts(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	a := types.Address{1}
+	b := types.Address{2}
+
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
+
+	id := types.Hash{0x20}
+	owner := callerHash(b)
+	state := upgradeState(id, types.Hash{0xBB}, true, []byte{policyOwnerUpgradeable}, true, owner[:])
+	ctx := domain.InputContext{L1Sender: b}
+	_, err := p.Apply(state, Input{Ctx: ctx, Args: codec.UpgradeArgs{ContractID: id, NewCodeHash: codeHash}})
+	if err == nil || !strings.Contains(err.Error(), "no pending record") {
+		t.Fatalf("Apply: err = %v, want a \"no pending record\" halt", err)
+	}
 }
 
 // --- kinds 2/3 through Apply.
@@ -357,15 +386,15 @@ func TestDeployStartClearsPreviousAttempt(t *testing.T) {
 	total := uint64(len(chunk0) + len(chunk1))
 
 	decodeStart(t, p, codec.DeployStartArgs{CodeHash: x, MetadataHash: types.Hash{9}, TotalSize: total, ChunkCount: 2}, domain.InputContext{L1Sender: sender})
-	decodeChunk(t, p, x, 0, chunk0)
-	decodeChunk(t, p, x, 1, chunk1)
+	decodeChunk(t, p, sender, x, 0, chunk0)
+	decodeChunk(t, p, sender, x, 1, chunk1)
 
 	// A second DeployStart for the same code_hash, declaring a smaller attempt.
 	newChunk0 := bytes.Repeat([]byte{0x33}, MaxDeployChunkData)
 	decodeStart(t, p, codec.DeployStartArgs{CodeHash: x, MetadataHash: types.Hash{9}, TotalSize: uint64(MaxDeployChunkData), ChunkCount: 1}, domain.InputContext{L1Sender: sender})
-	decodeChunk(t, p, x, 0, newChunk0)
+	decodeChunk(t, p, sender, x, 0, newChunk0)
 
-	if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(x, 1)); err != nil {
+	if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(sender, x, 1)); err != nil {
 		t.Fatalf("store.get: %v", err)
 	} else if ok {
 		t.Fatal("attempt one's chunk 1 is still present after a fresh DeployStart")
@@ -567,7 +596,7 @@ func TestApplyDeployFinalizeRecordBounds(t *testing.T) {
 				t.Fatalf("StateDiff = %+v, want empty", eff.StateDiff)
 			}
 
-			if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(codeHash, 0)); err != nil {
+			if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(types.Address{}, codeHash, 0)); err != nil {
 				t.Fatalf("store.get: %v", err)
 			} else if ok {
 				t.Fatal("chunk 0 present though the bound check should have rejected the record before any lookup")
@@ -615,7 +644,7 @@ func TestApplyDeployFinalizeAssemblyVerification(t *testing.T) {
 		codeHash := types.Hash{0x55}
 		data := []byte("hello world, this is some chunk data")
 		decodeStart(t, p, codec.DeployStartArgs{CodeHash: codeHash, MetadataHash: types.Hash{1}, TotalSize: uint64(len(data)) + 1, ChunkCount: 1}, domain.InputContext{})
-		decodeChunk(t, p, codeHash, 0, data)
+		decodeChunk(t, p, types.Address{}, codeHash, 0, data)
 
 		eff, err := p.Apply(nil, Input{Args: codec.DeployFinalizeArgs{CodeHash: codeHash}})
 		if err != nil {
@@ -637,7 +666,7 @@ func TestApplyDeployFinalizeAssemblyVerification(t *testing.T) {
 		declaredCodeHash := types.Hash{0x66}
 		data := []byte("some assembled module bytes that do not hash to declaredCodeHash")
 		decodeStart(t, p, codec.DeployStartArgs{CodeHash: declaredCodeHash, MetadataHash: types.Hash{1}, TotalSize: uint64(len(data)), ChunkCount: 1}, domain.InputContext{})
-		decodeChunk(t, p, declaredCodeHash, 0, data)
+		decodeChunk(t, p, types.Address{}, declaredCodeHash, 0, data)
 
 		eff, err := p.Apply(nil, Input{Args: codec.DeployFinalizeArgs{CodeHash: declaredCodeHash}})
 		if err != nil {
@@ -714,7 +743,7 @@ func TestApplyDeployFinalizeHalts(t *testing.T) {
 	t.Run("PendingRecordWrongLength", func(t *testing.T) {
 		p := newTestPlugin(t)
 		codeHash := types.Hash{0x22}
-		if err := p.store.put(entryPendingRecord, codeHash[:], make([]byte, 8)); err != nil {
+		if err := p.store.put(entryPendingRecord, pendingRecordKey(types.Address{}, codeHash), make([]byte, 8)); err != nil {
 			t.Fatalf("store.put: %v", err)
 		}
 		if _, err := p.Apply(nil, Input{Args: codec.DeployFinalizeArgs{CodeHash: codeHash}}); err == nil {
@@ -726,7 +755,7 @@ func TestApplyDeployFinalizeHalts(t *testing.T) {
 		p := newTestPlugin(t)
 		codeHash := types.Hash{0x33}
 		decodeStart(t, p, codec.DeployStartArgs{CodeHash: codeHash, MetadataHash: types.Hash{1}, TotalSize: uint64(MaxDeployChunkData) + 1, ChunkCount: 2}, domain.InputContext{})
-		decodeChunk(t, p, codeHash, 0, make([]byte, MaxDeployChunkData))
+		decodeChunk(t, p, types.Address{}, codeHash, 0, make([]byte, MaxDeployChunkData))
 		if _, err := p.Apply(nil, Input{Args: codec.DeployFinalizeArgs{CodeHash: codeHash}}); err == nil {
 			t.Fatal("Apply: got nil error for chunk_count=2 with only chunk 0 stored, want a halt")
 		}
@@ -992,8 +1021,8 @@ func TestApplyUpgradeAssemblyVerificationFailure(t *testing.T) {
 
 	newCodeHash := types.Hash{0x44}
 	data := []byte("bytes that do not hash to newCodeHash")
-	decodeStart(t, p, codec.DeployStartArgs{CodeHash: newCodeHash, MetadataHash: types.Hash{1}, TotalSize: uint64(len(data)), ChunkCount: 1}, domain.InputContext{})
-	decodeChunk(t, p, newCodeHash, 0, data)
+	decodeStart(t, p, codec.DeployStartArgs{CodeHash: newCodeHash, MetadataHash: types.Hash{1}, TotalSize: uint64(len(data)), ChunkCount: 1}, domain.InputContext{L1Sender: sender})
+	decodeChunk(t, p, sender, newCodeHash, 0, data)
 
 	state := upgradeState(id, oldCodeHash, true, []byte{policyOwnerUpgradeable}, true, owner[:])
 	ctx := domain.InputContext{L1Sender: sender}

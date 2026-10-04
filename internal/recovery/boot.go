@@ -582,15 +582,17 @@ func momentumHashes(moms []*nom.DetailedMomentum) map[uint64]types.Hash {
 //
 // The plugin's local code store is not rolled back: domain.Domain exposes no rollback hook.
 // A replayed canonical DeployStartArgs deletes every chunk slot and the pending record for its
-// code_hash before rewriting them, so a retracted start's slots are rewritten idempotently, and
-// a finalize or upgrade naming a code_hash whose start was retracted is not an input at all,
+// (deployer, code_hash) before rewriting them, so a retracted start's slots are rewritten
+// idempotently, and a finalize or upgrade naming a code_hash whose start was retracted is not an input at all,
 // because Settlement accepted no matching start on the canonical chain. Replay rewrites every
 // chunk a canonical finalize assembles, because Settlement accepts a finalize only once every
 // chunk is present (§11.3). The unrepaired path (EXECUTOR §15): the retracted branch saw a
 // pending record expire (§11.5) and accepted a second DeployContractStart for the same
-// code_hash. That second record survives the rollback, and a canonical finalize for the first
-// record assembles against it. The operator remedy is to stop the executor, remove the domain
-// directory and any plugin state kept outside it, and re-sync from genesis.
+// deployer and code_hash. That second record survives the rollback, and a canonical finalize
+// for the first record assembles against it. Records are keyed by (deployer, code_hash), so
+// another deployer's start cannot reach the record. The operator remedy is to stop the
+// executor, remove the domain directory and any plugin state kept outside it, and re-sync from
+// genesis.
 func Rollback(cfg Config, forkParent uint64) (Ready, error) {
 	if err := cfg.validate(needDomain); err != nil {
 		return Ready{}, err

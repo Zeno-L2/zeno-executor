@@ -22,18 +22,16 @@ const (
 )
 
 // pendingRecordPrefixSize is the fixed width of encodePendingRecord's prefix, before the raw
-// metadata bytes: metadata_hash(32) + total_size(8) + chunk_count(4) + deployer_l1_address(20).
-const pendingRecordPrefixSize = 64
+// metadata bytes: metadata_hash(32) + total_size(8) + chunk_count(4).
+const pendingRecordPrefixSize = 44
 
 // pendingRecord is the decoded kind-2 record DecodeInput wrote to the local store.
-// MetadataHash is decoded for round-trip fidelity with encodePendingRecord. Deployer is read
-// only by applyDeployFinalize's same-node halt comparison, never on the consensus path (see
-// contractID); Metadata feeds finalize's §27.12 validation.
+// MetadataHash is decoded for round-trip fidelity with encodePendingRecord. The deployer is
+// not stored: the record's key carries it. Metadata feeds finalize's §27.12 validation.
 type pendingRecord struct {
 	MetadataHash types.Hash
 	TotalSize    uint64
 	ChunkCount   uint32
-	Deployer     types.Address
 	Metadata     []byte
 }
 
@@ -48,23 +46,19 @@ func decodePendingRecord(b []byte) (pendingRecord, bool) {
 	copy(rec.MetadataHash[:], b[0:32])
 	rec.TotalSize = binary.BigEndian.Uint64(b[32:40])
 	rec.ChunkCount = binary.BigEndian.Uint32(b[40:44])
-	copy(rec.Deployer[:], b[44:64])
 	rec.Metadata = append([]byte(nil), b[pendingRecordPrefixSize:]...)
 	return rec, true
 }
 
 // prepareModule runs §11.3's finalize steps 1-6 plus step 7's CodeHash derivation against a
-// pre-instrumentation code_hash, and memoizes both derived module tiers on success. It returns
-// the derived CodeHash, the pending record's metadata for the caller's §27.12 validation, and
-// the record's deployer. deployer is populated whenever a pending record was decoded, on both
-// the ok == true and ok == false returns, so the caller's same-node deployer comparison runs
-// before the validation-failure branch too; it is the zero value only when no record could be
-// decoded (err != nil). The deployer may leave the function only for that same-node comparison
-// against the finalize's own sender; it must never feed contractID or become consensus-visible.
+// pre-instrumentation code_hash, and memoizes both derived module tiers on success. It reads
+// the pending record and chunks keyed by (deployer, preCodeHash), so it only ever sees the
+// given deployer's own staged deployment. It returns the derived CodeHash and the pending
+// record's metadata for the caller's §27.12 validation.
 //
 // Call-site contract, mandatory and in this order:
 //
-//	codeHash, metadata, deployer, ok, err := p.prepareModule(h)
+//	codeHash, metadata, ok, err := p.prepareModule(deployer, h)
 //	if err != nil {
 //		return domain.Effects{}, err   // halt: this node cannot see what other nodes can
 //	}
@@ -76,65 +70,65 @@ func decodePendingRecord(b []byte) (pendingRecord, bool) {
 // testing ok first would silently commit a halt as a status. The shape is codeStore.get's and
 // domain.StateAccess.Read's (value, ok, err), which every existing call site in call.go already
 // handles error-first.
-func (p *Plugin) prepareModule(preCodeHash types.Hash) (codeHash types.Hash, metadata []byte, deployer types.Address, ok bool, err error) {
+func (p *Plugin) prepareModule(deployer types.Address, preCodeHash types.Hash) (codeHash types.Hash, metadata []byte, ok bool, err error) {
 	// 1. Pending record.
-	recBytes, ok, err := p.store.get(entryPendingRecord, preCodeHash[:])
+	recBytes, ok, err := p.store.get(entryPendingRecord, pendingRecordKey(deployer, preCodeHash))
 	if err != nil {
-		return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x: %w", preCodeHash, err)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x: %w", preCodeHash, err)
 	}
 	if !ok {
-		return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: no pending record for code hash %x; local recovery required", preCodeHash)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: no pending record for code hash %x; local recovery required", preCodeHash)
 	}
 	record, ok := decodePendingRecord(recBytes)
 	if !ok {
-		return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x has unexpected length %d; local recovery required", preCodeHash, len(recBytes))
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: pending record for code hash %x has unexpected length %d; local recovery required", preCodeHash, len(recBytes))
 	}
 
 	// 2. Record bounds, before any chunk lookup.
 	if record.ChunkCount < 1 || record.ChunkCount > MaxChunkCount {
-		return types.Hash{}, nil, record.Deployer, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 	if record.TotalSize < 1 || record.TotalSize > MaxCodeSize {
-		return types.Hash{}, nil, record.Deployer, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 	wantChunkCount := uint32((record.TotalSize + MaxDeployChunkData - 1) / MaxDeployChunkData)
 	if record.ChunkCount != wantChunkCount {
-		return types.Hash{}, nil, record.Deployer, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 
 	// 3. Chunks.
 	assembled := make([]byte, 0, record.TotalSize)
 	for i := uint32(0); i < record.ChunkCount; i++ {
-		chunk, ok, err := p.store.get(entryDeployChunk, deployChunkKey(preCodeHash, i))
+		chunk, ok, err := p.store.get(entryDeployChunk, deployChunkKey(deployer, preCodeHash, i))
 		if err != nil {
-			return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: chunk %d for code hash %x: %w", i, preCodeHash, err)
+			return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: chunk %d for code hash %x: %w", i, preCodeHash, err)
 		}
 		if !ok {
-			return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: missing chunk %d for code hash %x; local recovery required", i, preCodeHash)
+			return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: missing chunk %d for code hash %x; local recovery required", i, preCodeHash)
 		}
 		assembled = append(assembled, chunk...)
 	}
 
 	// 4. Assembly verification.
 	if uint64(len(assembled)) != record.TotalSize || CodeHash(assembled) != preCodeHash {
-		return types.Hash{}, nil, record.Deployer, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 
 	// 5. Derive.
 	instrumented, derivedHash, ok := p.deriveModule(assembled)
 	if !ok {
-		return types.Hash{}, nil, record.Deployer, false, nil
+		return types.Hash{}, nil, false, nil
 	}
 
 	// 6. Memoize.
 	if err := p.store.put(entryAssembledModule, preCodeHash[:], assembled); err != nil {
-		return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: memoize assembled module for code hash %x: %w", preCodeHash, err)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: memoize assembled module for code hash %x: %w", preCodeHash, err)
 	}
 	if err := p.store.put(entryInstrumentedModule, derivedHash[:], instrumented); err != nil {
-		return types.Hash{}, nil, types.Address{}, false, fmt.Errorf("wasm: prepare module: memoize instrumented module for code hash %x: %w", derivedHash, err)
+		return types.Hash{}, nil, false, fmt.Errorf("wasm: prepare module: memoize instrumented module for code hash %x: %w", derivedHash, err)
 	}
 
-	return derivedHash, record.Metadata, record.Deployer, true, nil
+	return derivedHash, record.Metadata, true, nil
 }
 
 // deriveModule runs finalize steps 5-7 over assembled bytes: validation, the engine compile of
@@ -170,19 +164,9 @@ func (p *Plugin) deriveModule(assembled []byte) (instrumented []byte, codeHash t
 // applyDeployFinalize serves input_kind 4 (§11.3). It takes no StateAccess: a finalize reads no
 // state, so its witness set is empty on every path.
 func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployFinalizeArgs) (domain.Effects, error) {
-	codeHash, metadata, deployer, ok, err := p.prepareModule(args.CodeHash)
+	codeHash, metadata, ok, err := p.prepareModule(ctx.L1Sender, args.CodeHash)
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply deploy finalize: %w", err)
-	}
-
-	// The pending record is node-local, and a reorg rollback does not reach it (EXECUTOR §15).
-	// Honest Settlement makes the record's deployer equal this finalize's sender (§11.3), so a
-	// mismatch means this node's record is stale. Checked here, before the validation-failure
-	// branch, so a stale record halts whether or not it would otherwise pass validation; halting
-	// stops the finalize committing metadata another deployer chose. The comparison is local
-	// only; contractID still reads ctx.L1Sender.
-	if deployer != ctx.L1Sender {
-		return domain.Effects{}, fmt.Errorf("wasm: apply deploy finalize: pending record for code hash %x names deployer %x, not the finalize sender %x: stale pending record; local recovery required", args.CodeHash[:], deployer[:], ctx.L1Sender[:])
 	}
 
 	if !ok {
@@ -194,12 +178,9 @@ func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployF
 		return domain.Effects{Status: codec.StatusValidationFailed}, nil
 	}
 
-	// The deployer comes from this finalize input's own L1Sender, never from the pending
-	// record: §11.3 requires the finalize caller to be the recorded deployer and Settlement
-	// verifies that on-chain, so the two values agree under every honest scenario, but only
-	// ctx.L1Sender is consensus-sourced. Reading the record's deployer would let a stale local
-	// entry (code_hash is reusable across attempts) derive a different ContractID than honest
-	// nodes and silently commit a divergent state/receipt root.
+	// The deployer comes from this finalize input's own L1Sender, the same value that keys the
+	// pending record and chunks prepareModule read, so only ctx.L1Sender, which is
+	// consensus-sourced, feeds the ContractID.
 	id := contractID(ctx.L1Sender, ctx.GlobalInputIndex, p.chainID)
 
 	entries := []domain.StateDiffEntry{
@@ -262,7 +243,7 @@ func (p *Plugin) applyUpgrade(state domain.StateAccess, ctx domain.InputContext,
 		return domain.Effects{Status: codec.StatusUnauthorized, ContractID: args.ContractID, CodeHash: oldCodeHash}, nil
 	}
 
-	codeHash, _, _, ok, err := p.prepareModule(args.NewCodeHash)
+	codeHash, _, ok, err := p.prepareModule(ctx.L1Sender, args.NewCodeHash)
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply upgrade: %w", err)
 	}
