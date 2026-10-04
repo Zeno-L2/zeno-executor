@@ -101,35 +101,35 @@ func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.In
 		if len(ctx.SourceData) > MaxDeployChunkData {
 			return nil, fmt.Errorf("wasm: decode input: chunk for code_hash %x chunk %d exceeds MaxDeployChunkData", args.CodeHash, args.ChunkIndex)
 		}
-		if err := p.store.put(entryDeployChunk, deployChunkKey(args.CodeHash, args.ChunkIndex), ctx.SourceData); err != nil {
+		if err := p.store.put(entryDeployChunk, deployChunkKey(ctx.L1Sender, args.CodeHash, args.ChunkIndex), ctx.SourceData); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
 	case codec.DeployStartArgs:
 		// A code_hash is reusable across deployment attempts (§11.5 expiry frees it, and §11.1
-		// rejects only a duplicate live record), and both the pending record and the chunk
-		// entries are keyed by it, so a new start must leave no entry from an earlier attempt
-		// behind. Each chunk's bytes are verified only against that input's own chunk_hash,
-		// never against code_hash as a set, so a surviving stale chunk would assemble into a
-		// mix that passes every per-chunk check and commits a status where a node with a
-		// complete view commits another. Deleting first restores the property the finalize path
-		// relies on: a missing part of the prefix is absence, and absence is a halt. The loop
-		// bound is a constant, the deletes are unconditional, and absence is not an error, so
-		// this is a pure function of the input.
+		// rejects only a duplicate live record). The pending record and the chunk entries are
+		// keyed by (deployer, code_hash), so a start clears only its own deployer's earlier
+		// attempt and never reaches another deployer's. Each chunk's bytes are verified only
+		// against that input's own chunk_hash, never against code_hash as a set, so a surviving
+		// stale chunk would assemble into a mix that passes every per-chunk check and commits a
+		// status where a node with a complete view commits another. Deleting first restores the
+		// property the finalize path relies on: a missing part of the prefix is absence, and
+		// absence is a halt. The loop bound is a constant, the deletes are unconditional, and
+		// absence is not an error, so this is a pure function of the input.
 		//
 		// This relies on DecodeInput and Apply being interleaved per input (decode i, apply i,
 		// decode i+1, ...), never batch-decoded ahead of Apply: a later DeployStart for the same
-		// code_hash deletes the chunks an already-decoded, not-yet-applied DeployFinalize for an
+		// deployer and code_hash deletes the chunks an already-decoded, not-yet-applied DeployFinalize for an
 		// earlier attempt still needs to read.
 		for i := uint32(0); i < MaxChunkCount; i++ {
-			if err := p.store.delete(entryDeployChunk, deployChunkKey(args.CodeHash, i)); err != nil {
+			if err := p.store.delete(entryDeployChunk, deployChunkKey(ctx.L1Sender, args.CodeHash, i)); err != nil {
 				return nil, fmt.Errorf("wasm: decode input: %w", err)
 			}
 		}
-		if err := p.store.delete(entryPendingRecord, args.CodeHash[:]); err != nil {
+		if err := p.store.delete(entryPendingRecord, pendingRecordKey(ctx.L1Sender, args.CodeHash)); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
-		record := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, ctx.L1Sender, args.Metadata)
-		if err := p.store.put(entryPendingRecord, args.CodeHash[:], record); err != nil {
+		record := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, args.Metadata)
+		if err := p.store.put(entryPendingRecord, pendingRecordKey(ctx.L1Sender, args.CodeHash), record); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
 	}
@@ -172,26 +172,33 @@ func (p *Plugin) Apply(state domain.StateAccess, in domain.Input) (domain.Effect
 	return p.applyCall(state, input.Ctx, callArgs)
 }
 
-// deployChunkKey is the composite (code_hash, chunk_index) code-store key for one deploy
-// chunk.
-func deployChunkKey(codeHash types.Hash, chunkIndex uint32) []byte {
-	key := make([]byte, len(codeHash)+4)
-	copy(key, codeHash[:])
-	binary.BigEndian.PutUint32(key[len(codeHash):], chunkIndex)
+// pendingRecordKey is the (deployer, code_hash) code-store key for a pending deploy record.
+func pendingRecordKey(deployer types.Address, codeHash types.Hash) []byte {
+	key := make([]byte, 0, len(deployer)+len(codeHash))
+	key = append(key, deployer[:]...)
+	return append(key, codeHash[:]...)
+}
+
+// deployChunkKey is the composite (deployer, code_hash, chunk_index) code-store key for one
+// deploy chunk.
+func deployChunkKey(deployer types.Address, codeHash types.Hash, chunkIndex uint32) []byte {
+	key := make([]byte, len(deployer)+len(codeHash)+4)
+	copy(key, deployer[:])
+	copy(key[len(deployer):], codeHash[:])
+	binary.BigEndian.PutUint32(key[len(deployer)+len(codeHash):], chunkIndex)
 	return key
 }
 
 // encodePendingRecord is the local, non-consensus encoding of a chunked deployment's pending
-// record: the fixed-width prefix metadata_hash(32) ‖ total_size(8, BE) ‖ chunk_count(4, BE) ‖
-// deployer_l1_address(20), followed by the raw metadata bytes with no length prefix. Any
+// record: the fixed-width prefix metadata_hash(32) ‖ total_size(8, BE) ‖ chunk_count(4, BE),
+// followed by the raw metadata bytes with no length prefix. Any
 // encoding is legitimate here — the record never crosses the consensus boundary — but it must
 // be a pure function of the kind-2 input alone (§4).
-func encodePendingRecord(metadataHash types.Hash, totalSize uint64, chunkCount uint32, deployerL1Address types.Address, metadata []byte) []byte {
-	buf := make([]byte, 0, len(metadataHash)+8+4+len(deployerL1Address)+len(metadata))
+func encodePendingRecord(metadataHash types.Hash, totalSize uint64, chunkCount uint32, metadata []byte) []byte {
+	buf := make([]byte, 0, len(metadataHash)+8+4+len(metadata))
 	buf = append(buf, metadataHash[:]...)
 	buf = binary.BigEndian.AppendUint64(buf, totalSize)
 	buf = binary.BigEndian.AppendUint32(buf, chunkCount)
-	buf = append(buf, deployerL1Address[:]...)
 	buf = append(buf, metadata...)
 	return buf
 }

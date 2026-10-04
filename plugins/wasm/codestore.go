@@ -15,11 +15,11 @@ import (
 type entryKind uint8
 
 const (
-	// entryDeployChunk holds one chunk's raw bytes, keyed by (code_hash, chunk_index).
+	// entryDeployChunk holds one chunk's raw bytes, keyed by (deployer, code_hash, chunk_index).
 	// Written by DecodeInput on an input_kind = 3; read by Apply on kind 4/5.
 	entryDeployChunk entryKind = iota
-	// entryPendingRecord holds a chunked deployment's {metadata_hash, total_size, chunk_count,
-	// deployer_l1_address}, keyed by code_hash. Written by DecodeInput on kind 2; read by Apply
+	// entryPendingRecord holds a chunked deployment's {metadata_hash, total_size, chunk_count},
+	// keyed by (deployer, code_hash). Written by DecodeInput on kind 2; read by Apply
 	// on kind 4/5.
 	entryPendingRecord
 	// entryAssembledModule holds the concatenated, pre-instrumentation module bytes, keyed by

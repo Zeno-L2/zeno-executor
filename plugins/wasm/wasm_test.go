@@ -246,13 +246,14 @@ func TestDecodeInputKind3WritesChunkToStore(t *testing.T) {
 	data := []byte("some module chunk")
 	args := codec.DeployChunkArgs{CodeHash: types.Hash{7}, ChunkIndex: 3, ChunkHash: hashOf(crypto.Hash(data))}
 	payload := encodeInput(t, args)
-	ctx := domain.InputContext{SourceData: data}
+	sender := types.Address{4, 5}
+	ctx := domain.InputContext{L1Sender: sender, SourceData: data}
 
 	if _, err := p.DecodeInput(ctx, payload); err != nil {
 		t.Fatalf("DecodeInput: %v", err)
 	}
 
-	got, ok, err := p.store.get(entryDeployChunk, deployChunkKey(args.CodeHash, args.ChunkIndex))
+	got, ok, err := p.store.get(entryDeployChunk, deployChunkKey(sender, args.CodeHash, args.ChunkIndex))
 	if err != nil {
 		t.Fatalf("store.get: %v", err)
 	}
@@ -276,14 +277,14 @@ func TestDecodeInputKind2WritesPendingRecord(t *testing.T) {
 		t.Fatalf("DecodeInput: %v", err)
 	}
 
-	got, ok, err := p.store.get(entryPendingRecord, args.CodeHash[:])
+	got, ok, err := p.store.get(entryPendingRecord, pendingRecordKey(sender, args.CodeHash))
 	if err != nil {
 		t.Fatalf("store.get: %v", err)
 	}
 	if !ok {
 		t.Fatal("store.get: pending record not found after DecodeInput")
 	}
-	want := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, sender, args.Metadata)
+	want := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, args.Metadata)
 	if string(got) != string(want) {
 		t.Fatalf("store.get: record = %x, want %x", got, want)
 	}
