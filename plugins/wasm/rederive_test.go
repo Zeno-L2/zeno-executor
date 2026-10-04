@@ -118,7 +118,7 @@ func inlineMerkleRoot(elements [][]byte) types.Hash {
 // String() rendering.
 func statusOrdinal(t *testing.T, name string) byte {
 	t.Helper()
-	for s := codec.StatusSuccess; s <= codec.StatusUnsupportedOperation; s++ {
+	for s := codec.StatusSuccess; s <= codec.StatusStorageQuotaExceeded; s++ {
 		if s.String() == name {
 			return byte(s)
 		}
@@ -174,7 +174,7 @@ func checkPerVector(t *testing.T, vec vectorJSON) {
 	if gotInputHash != vec.Receipt.InputHash {
 		t.Fatalf("B1: sha3(canonical_input_hex) = %s, want receipt.input_hash %s", gotInputHash, vec.Receipt.InputHash)
 	}
-	if vec.InputKind <= 6 {
+	if vec.InputKind <= 7 {
 		decodedInput, err := codec.DecodeInput(canonical)
 		if err != nil {
 			t.Fatalf("B1: DecodeInput: %v", err)
@@ -491,12 +491,17 @@ func checkShape(t *testing.T, file vectorFile, vec vectorJSON) {
 		checkCallReservedWitnesses(t, vec)
 		checkCallEffects(t, vec)
 		checkCallRefund(t, vec)
+		if vec.Status == "SUCCESS" || vec.Status == "STORAGE_QUOTA_EXCEEDED" {
+			checkCallQuota(t, vec)
+		}
 	case "unsupported_kind":
 		checkUnsupportedKind(t, vec)
 	case "deploy":
 		checkDeploy(t, file, vec)
 	case "ownership":
 		checkOwnership(t, vec)
+	case "buy_storage":
+		checkBuyStorage(t, vec)
 	case "validation_rejection":
 		checkValidationRejection(t, vec)
 	default:
@@ -657,8 +662,120 @@ func checkCallEffects(t *testing.T, vec vectorJSON) {
 	for _, e := range er.StateDiff {
 		gotSet[hex.EncodeToString(e.Key[:])] = true
 	}
+	// The runtime's quota entry is not a contract-declared key; C6 owns it.
+	delete(gotSet, hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x05})))
 	if !reflect.DeepEqual(wantSet, gotSet) {
 		t.Fatalf("C4: inline-derived local StateDiff key set disagrees with ExecutionResult.StateDiff key set:\n got  %v\n want %v", gotSet, wantSet)
+	}
+}
+
+// quotaLeaf reads the quota leaf (local key 0x0005) of the vector's contract from pre_state,
+// returning purchased and used, both 0 when the leaf is absent. The leaf layout is
+// purchased:u64 || used:u64, big-endian.
+func quotaLeaf(t *testing.T, vec vectorJSON) (quotaKey string, purchased, used uint64) {
+	t.Helper()
+	contractID := mustHex(t, vec.Receipt.ContractID)
+	quotaKey = hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x05}))
+	leafHex, present := vec.PreState[quotaKey]
+	if !present {
+		return quotaKey, 0, 0
+	}
+	leaf := mustHex(t, leafHex)
+	if len(leaf) != 16 {
+		t.Fatalf("quota leaf in pre_state has width %d, want 16", len(leaf))
+	}
+	return quotaKey, binary.BigEndian.Uint64(leaf[:8]), binary.BigEndian.Uint64(leaf[8:])
+}
+
+// blobQuotaDelta is the net change in counted leaf bytes the returned blob's StateDiff makes
+// against pre_state: a leaf counts as 64 plus its value length, and a deletion or an absent
+// pre-state leaf counts as 0.
+func blobQuotaDelta(t *testing.T, vec vectorJSON) int64 {
+	t.Helper()
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("quota delta: DecodeContractEffects: %v", err)
+	}
+	contractID := mustHex(t, vec.Receipt.ContractID)
+	var delta int64
+	for _, e := range eff.StateDiff {
+		if e.Value != nil {
+			delta += 64 + int64(len(e.Value))
+		}
+		preHex, present := vec.PreState[hex.EncodeToString(crypto.Hash(contractID, e.LocalKey))]
+		if present {
+			delta -= 64 + int64(len(preHex)/2)
+		}
+	}
+	return delta
+}
+
+// C6. Storage quota (call, SUCCESS or STORAGE_QUOTA_EXCEEDED).
+func checkCallQuota(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.ContractEffectsBlobHex == "" {
+		t.Fatalf("C6: contract_effects_blob_hex is absent")
+	}
+	quotaKey, purchased, used := quotaLeaf(t, vec)
+	delta := blobQuotaDelta(t, vec)
+
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("C6: DecodeExecutionResult: %v", err)
+	}
+	witnessed := make(map[string]bool, len(vec.WitnessKeys))
+	for _, k := range vec.WitnessKeys {
+		witnessed[k] = true
+	}
+	var quotaEntry *codec.StateDiffEntry
+	for i, e := range er.StateDiff {
+		if hex.EncodeToString(e.Key[:]) == quotaKey {
+			quotaEntry = &er.StateDiff[i]
+		}
+	}
+
+	if vec.Status == "STORAGE_QUOTA_EXCEEDED" {
+		after := new(big.Int).Add(new(big.Int).SetUint64(used), big.NewInt(delta))
+		if delta <= 0 || after.Cmp(new(big.Int).SetUint64(purchased)) <= 0 {
+			t.Fatalf("C6: STORAGE_QUOTA_EXCEEDED: delta = %d, used = %d, purchased = %d, want delta > 0 and used + delta > purchased", delta, used, purchased)
+		}
+		if !witnessed[quotaKey] {
+			t.Fatalf("C6: STORAGE_QUOTA_EXCEEDED: witness_keys is missing the quota key %s", quotaKey)
+		}
+		eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+		if err != nil {
+			t.Fatalf("C6: DecodeContractEffects: %v", err)
+		}
+		contractID := mustHex(t, vec.Receipt.ContractID)
+		for _, e := range eff.StateDiff {
+			if k := hex.EncodeToString(crypto.Hash(contractID, e.LocalKey)); !witnessed[k] {
+				t.Fatalf("C6: STORAGE_QUOTA_EXCEEDED: witness_keys is missing the derived blob key %s", k)
+			}
+		}
+		return
+	}
+
+	if delta == 0 {
+		if quotaEntry != nil {
+			t.Fatalf("C6: delta = 0: ExecutionResult.StateDiff carries a quota entry, want none")
+		}
+		if witnessed[quotaKey] {
+			t.Fatalf("C6: delta = 0: witness_keys holds the quota key %s, want it absent", quotaKey)
+		}
+		return
+	}
+	after := new(big.Int).Add(new(big.Int).SetUint64(used), big.NewInt(delta))
+	if after.Sign() < 0 || after.Cmp(new(big.Int).SetUint64(purchased)) > 0 {
+		t.Fatalf("C6: SUCCESS: used + delta = %s outside [0, purchased %d]", after, purchased)
+	}
+	if quotaEntry == nil {
+		t.Fatalf("C6: delta = %d: ExecutionResult.StateDiff has no quota entry", delta)
+	}
+	want := make([]byte, 16)
+	binary.BigEndian.PutUint64(want[:8], purchased)
+	binary.BigEndian.PutUint64(want[8:], after.Uint64())
+	if !bytes.Equal(quotaEntry.Value, want) {
+		t.Fatalf("C6: quota entry value = %x, want purchased || used + delta %x", quotaEntry.Value, want)
 	}
 }
 
@@ -719,8 +836,8 @@ func checkCallRefund(t *testing.T, vec vectorJSON) {
 func checkUnsupportedKind(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
-	if vec.InputKind <= 6 {
-		t.Fatalf("unsupported_kind: input_kind = %d, want > 6", vec.InputKind)
+	if vec.InputKind <= 7 {
+		t.Fatalf("unsupported_kind: input_kind = %d, want > 7", vec.InputKind)
 	}
 	if vec.Input != nil {
 		t.Fatalf("unsupported_kind: input = %+v, want absent", vec.Input)
@@ -1163,6 +1280,89 @@ func checkOwnership(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// checkBuyStorage is the buy_storage shape's whole check, from the JSON alone (§13.8, §15).
+func checkBuyStorage(t *testing.T, vec vectorJSON) {
+	t.Helper()
+
+	if vec.InputKind != 7 {
+		t.Fatalf("buy_storage: input_kind = %d, want 7", vec.InputKind)
+	}
+	if vec.ModuleWasmHex != "" || vec.InputFrameHex != "" || vec.SourceDataHex != "" || vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("buy_storage: module_wasm_hex/input_frame_hex/source_data_hex/contract_effects_blob_hex must all be empty")
+	}
+	if vec.GasUsed != 0 || vec.Receipt.GasUsed != 0 {
+		t.Fatalf("buy_storage: gas_used = %d, receipt.gas_used = %d, want both 0", vec.GasUsed, vec.Receipt.GasUsed)
+	}
+	if vec.Receipt.EventCount != 0 || vec.Receipt.OutboxCount != 0 {
+		t.Fatalf("buy_storage: receipt.event_count = %d, receipt.outbox_count = %d, want both 0", vec.Receipt.EventCount, vec.Receipt.OutboxCount)
+	}
+	if vec.Input == nil {
+		t.Fatalf("buy_storage: input is absent")
+	}
+	if vec.Input.ContractID != vec.Receipt.ContractID {
+		t.Fatalf("buy_storage: input.contract_id = %s, want receipt.contract_id %s", vec.Input.ContractID, vec.Receipt.ContractID)
+	}
+	if vec.Input.Bytes == nil || *vec.Input.Bytes == 0 {
+		t.Fatalf("buy_storage: input.bytes is absent or zero, want non-zero")
+	}
+
+	contractID := mustHex(t, vec.Input.ContractID)
+	key1 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x01}))
+	key5 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x05}))
+	wantWitness := []string{key1, key5}
+	sort.Strings(wantWitness)
+	if !reflect.DeepEqual(vec.WitnessKeys, wantWitness) {
+		t.Fatalf("buy_storage: witness_keys = %v, want the 0x0001 and 0x0005 keys ascending %v", vec.WitnessKeys, wantWitness)
+	}
+
+	_, purchased, used := quotaLeaf(t, vec)
+	sum := new(big.Int).Add(new(big.Int).SetUint64(purchased), new(big.Int).SetUint64(*vec.Input.Bytes))
+	overflow := sum.Cmp(new(big.Int).SetUint64(^uint64(0))) > 0
+
+	switch vec.Status {
+	case "VALIDATION_FAILED":
+		codeHashHex, present := vec.PreState[key1]
+		if !present {
+			if vec.Receipt.CodeHash != zeroHashHex {
+				t.Fatalf("buy_storage: VALIDATION_FAILED without a 0x0001 leaf: receipt.code_hash = %s, want zero", vec.Receipt.CodeHash)
+			}
+			return
+		}
+		if vec.Receipt.CodeHash != codeHashHex {
+			t.Fatalf("buy_storage: VALIDATION_FAILED: receipt.code_hash = %s, want pre_state's 0x0001 leaf %s", vec.Receipt.CodeHash, codeHashHex)
+		}
+		if !overflow {
+			t.Fatalf("buy_storage: VALIDATION_FAILED with a 0x0001 leaf: purchased %d + bytes %d = %s does not exceed 2^64 - 1", purchased, *vec.Input.Bytes, sum)
+		}
+	case "SUCCESS":
+		codeHashHex, present := vec.PreState[key1]
+		if !present {
+			t.Fatalf("buy_storage: SUCCESS: pre_state has no 0x0001 leaf")
+		}
+		if vec.Receipt.CodeHash != codeHashHex {
+			t.Fatalf("buy_storage: SUCCESS: receipt.code_hash = %s, want pre_state's 0x0001 leaf %s", vec.Receipt.CodeHash, codeHashHex)
+		}
+		er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+		if err != nil {
+			t.Fatalf("buy_storage: SUCCESS: DecodeExecutionResult: %v", err)
+		}
+		if len(er.ReturnData) != 0 {
+			t.Fatalf("buy_storage: SUCCESS: ExecutionResult.ReturnData = %x, want empty", er.ReturnData)
+		}
+		if len(er.StateDiff) != 1 {
+			t.Fatalf("buy_storage: SUCCESS: ExecutionResult.StateDiff has %d entries, want exactly 1", len(er.StateDiff))
+		}
+		want := make([]byte, 16)
+		binary.BigEndian.PutUint64(want[:8], purchased+*vec.Input.Bytes)
+		binary.BigEndian.PutUint64(want[8:], used)
+		if hex.EncodeToString(er.StateDiff[0].Key[:]) != key5 || !bytes.Equal(er.StateDiff[0].Value, want) {
+			t.Fatalf("buy_storage: SUCCESS: StateDiff[0] = %+v, want {0x0005, purchased+bytes || used %x}", er.StateDiff[0], want)
+		}
+	default:
+		t.Fatalf("buy_storage: status %s has no branch: add one with its first vector", vec.Status)
+	}
+}
+
 // checkValidationRejection is the validation_rejection shape's whole check: a kind-4 finalize
 // rejected by a module the validator refuses, or by pending metadata §27.12 rejects, exactly
 // one of the two, with the rule it refuses it by named in rejectionReasons.
@@ -1237,8 +1437,8 @@ func checkValidationRejection(t *testing.T, vec vectorJSON) {
 // generator, whose Len records nothing, would drop.
 func checkN1WitnessBackendTripwire(t *testing.T, vec vectorJSON) {
 	t.Helper()
-	if len(vec.WitnessKeys) != 4 {
-		t.Fatalf("N1: witness_keys has %d entries, want exactly 4 (a mapState-backed generator, whose Len records nothing for an absent key, would produce 3)", len(vec.WitnessKeys))
+	if len(vec.WitnessKeys) != 5 {
+		t.Fatalf("N1: witness_keys has %d entries, want exactly 5 (the two reserved leaves, the quota leaf EXEC-002's write adds, the written key and the probe; a mapState-backed generator, whose Len records nothing for an absent key, would produce 4)", len(vec.WitnessKeys))
 	}
 	contractID := mustHex(t, vec.Receipt.ContractID)
 	probeKey := hex.EncodeToString(crypto.Hash(contractID, []byte("probe")))
@@ -1276,8 +1476,8 @@ func checkN2DiscardNotVacuous(t *testing.T, vec vectorJSON) {
 // call plugins/wasm's effectCharge, which is the generator's own path.
 func checkPathGas(t *testing.T, vec vectorJSON, pages uint32, hostGas uint64, path []byte) {
 	t.Helper()
-	if vec.Status != "SUCCESS" {
-		t.Fatalf("checkPathGas: status = %s, want SUCCESS", vec.Status)
+	if vec.Status != "SUCCESS" && vec.Status != "STORAGE_QUOTA_EXCEEDED" {
+		t.Fatalf("checkPathGas: status = %s, want SUCCESS or STORAGE_QUOTA_EXCEEDED", vec.Status)
 	}
 	if vec.ContractEffectsBlobHex == "" {
 		t.Fatalf("checkPathGas: contract_effects_blob_hex is absent")
@@ -1548,8 +1748,8 @@ func checkCVRTLRESULT1ResultTooLargeFromRefund(t *testing.T, vec vectorJSON) {
 	}
 	// A contract-only ExecutionResult with N state entries, no events, no outbox, empty
 	// ReturnData encodes to 122 + Σ(36+len(v)) bytes (§27.1a's fixed prefix/suffix plus one
-	// 36-byte-overhead StateDiffEntry per entry).
-	contractOnly := 122
+	// 36-byte-overhead StateDiffEntry per entry). The runtime's quota entry adds 36 + 16.
+	contractOnly := 122 + 36 + 16
 	for _, e := range eff.StateDiff {
 		contractOnly += 36 + len(e.Value)
 	}
@@ -1657,7 +1857,7 @@ func checkCVASSETSBase(t *testing.T, vec vectorJSON) []codec.AssetID {
 	if eff.GlobalInputIndex != vec.GlobalInputIndex {
 		t.Fatalf("CV-ASSETS: blob GlobalInputIndex = %d, want global_input_index %d", eff.GlobalInputIndex, vec.GlobalInputIndex)
 	}
-	reserved := map[string]bool{"0001": true, "0002": true, "0003": true, "0004": true}
+	reserved := map[string]bool{"0001": true, "0002": true, "0003": true, "0004": true, "0005": true}
 	for _, e := range eff.StateDiff {
 		if reserved[hex.EncodeToString(e.LocalKey)] {
 			t.Fatalf("CV-ASSETS: StateDiff uses reserved local key %x", e.LocalKey)
@@ -1726,6 +1926,38 @@ func checkCVASSETS2(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// checkCVQUOTA4ZeroDelta is the CV-QUOTA-4 invariant: the returned blob's StateDiff is
+// non-empty yet nets to a zero quota delta, so step 6a reads no quota leaf.
+func checkCVQUOTA4ZeroDelta(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("CV-QUOTA-4: DecodeContractEffects: %v", err)
+	}
+	if len(eff.StateDiff) == 0 {
+		t.Fatalf("CV-QUOTA-4: StateDiff is empty, want non-empty")
+	}
+	if delta := blobQuotaDelta(t, vec); delta != 0 {
+		t.Fatalf("CV-QUOTA-4: quota delta = %d, want 0", delta)
+	}
+}
+
+// checkCVQUOTA5ReservedQuotaKey is the CV-QUOTA-5 invariant: the returned blob's StateDiff
+// carries the reserved local key 0x0005.
+func checkCVQUOTA5ReservedQuotaKey(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("CV-QUOTA-5: DecodeContractEffects: %v", err)
+	}
+	for _, e := range eff.StateDiff {
+		if bytes.Equal(e.LocalKey, []byte{0x00, 0x05}) {
+			return
+		}
+	}
+	t.Fatalf("CV-QUOTA-5: StateDiff carries no local key 0x0005")
+}
+
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-002":           checkN1WitnessBackendTripwire,
 	"EXEC-FAIL-OUTBOX-1": checkN2DiscardNotVacuous,
@@ -1751,6 +1983,11 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"CV-GROW-1":          checkCVGROW1,
 	"CV-ASSETS-1":        checkCVASSETS1,
 	"CV-ASSETS-2":        checkCVASSETS2,
+	"CV-QUOTA-2": func(t *testing.T, vec vectorJSON) {
+		checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+	},
+	"CV-QUOTA-4": checkCVQUOTA4ZeroDelta,
+	"CV-QUOTA-5": checkCVQUOTA5ReservedQuotaKey,
 }
 
 // TestConformanceVectors re-derives every committed value in the artifact from the JSON

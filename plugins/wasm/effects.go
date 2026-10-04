@@ -24,6 +24,7 @@ type settlement struct {
 	DepositAsset     codec.AssetID
 	DepositAmount    codec.U256
 	GasBudget        uint64 // the input's plasma_limit, one budget unit per unit
+	State            domain.StateAccess
 }
 
 // settle maps a completed Outcome onto the §15 status, the gas_used that status defines, the
@@ -157,6 +158,16 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusOutOfGas, s.GasBudget), nil
 	}
 	gasUsed := metered + charge
+
+	// Step 6a (§13.8): charge the net growth of the contract's leaves against its storage
+	// quota, and add the updated quota leaf to the diff.
+	derived, quotaOK, err := s.chargeQuota(derived)
+	if err != nil {
+		return domain.Effects{}, err
+	}
+	if !quotaOK {
+		return s.fail(codec.StatusStorageQuotaExceeded, gasUsed), nil
+	}
 
 	// Step 7: return-data size.
 	if len(eff.ReturnData) > MaxReturnData {

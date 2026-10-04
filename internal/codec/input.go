@@ -19,6 +19,7 @@ const (
 	DeployFinalize    InputKind = 4
 	Upgrade           InputKind = 5
 	TransferOwnership InputKind = 6
+	BuyStorage        InputKind = 7
 )
 
 // InputArgs is the kind-specific tail of a canonical input encoding (§27.5).
@@ -102,6 +103,16 @@ type TransferOwnershipArgs struct {
 // Kind returns TransferOwnership.
 func (TransferOwnershipArgs) Kind() InputKind { return TransferOwnership }
 
+// BuyStorageArgs is the input_kind = 7 tail (§27.5): bytes of additional storage quota
+// purchased for contract_id. bytes is non-zero (§10.7).
+type BuyStorageArgs struct {
+	ContractID types.Hash
+	Bytes      uint64
+}
+
+// Kind returns BuyStorage.
+func (BuyStorageArgs) Kind() InputKind { return BuyStorage }
+
 // Input is the canonical input encoding's source: input_kind:u8 || source_hash:bytes32 ||
 // <kind-specific tail> (§27.5). This is byte-identical to the inputHash preimage and the
 // inputRoot leaf.
@@ -159,6 +170,12 @@ func (in Input) Encode() ([]byte, error) {
 	case TransferOwnershipArgs:
 		w.hash(args.ContractID)
 		w.address(args.NewOwner)
+	case BuyStorageArgs:
+		if args.Bytes == 0 {
+			return nil, fmt.Errorf("codec: encode input: %w", ErrZeroStorageBytes)
+		}
+		w.hash(args.ContractID)
+		w.u64(args.Bytes)
 	default:
 		return nil, fmt.Errorf("codec: encode input: %w", ErrInvalidKind)
 	}
@@ -282,6 +299,19 @@ func DecodeInput(b []byte) (Input, error) {
 			return in, fmt.Errorf("codec: decode input: %w", err)
 		}
 		in.Args = TransferOwnershipArgs{ContractID: contractID, NewOwner: newOwner}
+	case BuyStorage:
+		contractID, err := r.hash()
+		if err != nil {
+			return in, fmt.Errorf("codec: decode input: %w", err)
+		}
+		storageBytes, err := r.u64()
+		if err != nil {
+			return in, fmt.Errorf("codec: decode input: %w", err)
+		}
+		if storageBytes == 0 {
+			return in, fmt.Errorf("codec: decode input: %w", ErrZeroStorageBytes)
+		}
+		in.Args = BuyStorageArgs{ContractID: contractID, Bytes: storageBytes}
 	default:
 		return in, fmt.Errorf("codec: decode input: %w", ErrInvalidKind)
 	}
@@ -293,7 +323,7 @@ func DecodeInput(b []byte) (Input, error) {
 }
 
 // CanonicalInput returns the §27.5 canonical input encoding for a raw payload: the payload
-// itself when it decodes as one of the seven defined kinds, and the input_kind ||
+// itself when it decodes as one of the eight defined kinds, and the input_kind ||
 // source_account_block_hash prefix alone for any other kind, which defines no tail. This is
 // the inputHash preimage, the inputRoot leaf, and the bundle record's inputData.
 //

@@ -422,6 +422,7 @@ func (f successFixture) state() *mapState {
 	return &mapState{values: map[domain.Path][]byte{
 		derive(f.contractID, keyCodeHash):    f.codeHash[:],
 		derive(f.contractID, keyPreCodeHash): f.preCodeHash[:],
+		derive(f.contractID, keyQuota):       encodeQuota(1<<20, 0),
 	}}
 }
 

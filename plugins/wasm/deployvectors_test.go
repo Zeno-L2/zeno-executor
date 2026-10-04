@@ -1,6 +1,7 @@
 package wasm
 
 import (
+	"math"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -32,6 +33,9 @@ var (
 	unauthOldHash = repeatedHash(0x9B) // the keyCodeHash leaf CV-UPGRADE-UNAUTH-1 seeds
 
 	upOwnerHash = callerHash(repeatedAddr(0x01)) // EXEC-UPGRADE-1's seeded keyOwner leaf
+
+	quotaCid      = repeatedHash(0x69) // the BuyStorage vectors' deployed target
+	quotaCodeHash = repeatedHash(0x9C) // the keyCodeHash leaf the BuyStorage vectors seed for quotaCid
 )
 
 // rejectionReasons binds each §7.2 rejection vector to the validator rule its module
@@ -509,6 +513,60 @@ func deployVectors(t *testing.T) []vectorSpec {
 			Module:                 deployModule,
 			PendingMetadata:        tc.metadata,
 			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	// --- CV-QUOTA-6..8: BuyStorage (kind 7), one vector per outcome.
+	{
+		idx, src := newIdentity()
+		v8 := []byte{8, 8, 8, 8, 8, 8, 8, 8}
+		pre := seedQuota(quotaCid, map[domain.Path][]byte{derive(quotaCid, []byte("q0")): v8}, 1000)
+		pre[derive(quotaCid, keyCodeHash)] = quotaCodeHash[:]
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-6",
+			Purpose:                "BuyStorage adds bytes to purchased and leaves used unchanged",
+			Shape:                  "buy_storage",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             quotaCid,
+			Args:                   codec.BuyStorageArgs{ContractID: quotaCid, Bytes: 4096},
+			ExtraPreState:          pre,
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-7",
+			Purpose:                "BuyStorage naming a contract_id with no code-hash leaf is VALIDATION_FAILED",
+			Shape:                  "buy_storage",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             undeployedCid,
+			Args:                   codec.BuyStorageArgs{ContractID: undeployedCid, Bytes: 4096},
+			WantStatus:             codec.StatusValidationFailed,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-QUOTA-8",
+			Purpose:                "BuyStorage whose purchased + bytes is 2^64 is VALIDATION_FAILED, and its receipt carries the unchanged CodeHash",
+			Shape:                  "buy_storage",
+			BatchID:                4,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			ContractID:             quotaCid,
+			Args:                   codec.BuyStorageArgs{ContractID: quotaCid, Bytes: 4096},
+			ExtraPreState: map[domain.Path][]byte{
+				derive(quotaCid, keyCodeHash): quotaCodeHash[:],
+				derive(quotaCid, keyQuota):    encodeQuota(math.MaxUint64-4095, 0),
+			},
+			WantStatus: codec.StatusValidationFailed,
 		})
 	}
 

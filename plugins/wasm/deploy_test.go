@@ -787,8 +787,8 @@ func TestApplyDeployFinalizeStoreFaultHalts(t *testing.T) {
 	})
 }
 
-// --- deploy then call: the reserved-key paths and the two code-store keys agree across both
-// halves of the pipeline.
+// --- deploy, buy, call: the reserved-key paths and the two code-store keys agree across the
+// lifecycle, and a deployed contract's first state write needs purchased quota.
 
 func TestDeployThenCall(t *testing.T) {
 	p := newTestPlugin(t)
@@ -822,6 +822,17 @@ func TestDeployThenCall(t *testing.T) {
 
 	state := &mapState{values: map[domain.Path][]byte{}}
 	for _, e := range eff.StateDiff {
+		state.values[e.Path] = e.Value
+	}
+
+	buyEff, err := p.Apply(state, Input{Ctx: domain.InputContext{GlobalInputIndex: 5}, Args: codec.BuyStorageArgs{ContractID: eff.ContractID, Bytes: 4096}})
+	if err != nil {
+		t.Fatalf("Apply(buy): %v", err)
+	}
+	if buyEff.Status != codec.StatusSuccess {
+		t.Fatalf("buy Status = %v, want StatusSuccess", buyEff.Status)
+	}
+	for _, e := range buyEff.StateDiff {
 		state.values[e.Path] = e.Value
 	}
 

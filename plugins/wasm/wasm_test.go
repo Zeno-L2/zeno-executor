@@ -44,7 +44,7 @@ func encodeInput(t *testing.T, args codec.InputArgs) []byte {
 	return b
 }
 
-func TestDecodeInputAcceptsAllSevenKinds(t *testing.T) {
+func TestDecodeInputAcceptsAllEightKinds(t *testing.T) {
 	p := newTestPlugin(t)
 
 	chunkData := []byte("chunk bytes")
@@ -62,6 +62,7 @@ func TestDecodeInputAcceptsAllSevenKinds(t *testing.T) {
 		{"DeployFinalize", codec.DeployFinalizeArgs{CodeHash: types.Hash{2}}, domain.InputContext{}},
 		{"Upgrade", codec.UpgradeArgs{ContractID: types.Hash{4}, NewCodeHash: types.Hash{5}}, domain.InputContext{}},
 		{"TransferOwnership", codec.TransferOwnershipArgs{ContractID: types.Hash{6}, NewOwner: types.Address{7}}, domain.InputContext{}},
+		{"BuyStorage", codec.BuyStorageArgs{ContractID: types.Hash{8}, Bytes: 4096}, domain.InputContext{}},
 	}
 
 	for _, tc := range cases {
@@ -88,9 +89,9 @@ func TestDecodeInputAcceptsAllSevenKinds(t *testing.T) {
 func TestDecodeInputUnsupportedKindNoError(t *testing.T) {
 	p := newTestPlugin(t)
 
-	// input_kind = 7 is outside the Phase-1 set {0..6}; the tail is irrelevant since
+	// input_kind = 8 is outside the Phase-1 set {0..7}; the tail is irrelevant since
 	// codec.DecodeInput rejects on the kind byte before reading it.
-	payload := append([]byte{7}, make([]byte, 32)...)
+	payload := append([]byte{8}, make([]byte, 32)...)
 
 	got, err := p.DecodeInput(domain.InputContext{}, payload)
 	if err != nil {
@@ -101,7 +102,7 @@ func TestDecodeInputUnsupportedKindNoError(t *testing.T) {
 		t.Fatalf("DecodeInput: got %T, want wasm.Input", got)
 	}
 	if !in.Unsupported {
-		t.Fatal("DecodeInput: Unsupported = false, want true for input_kind = 7")
+		t.Fatal("DecodeInput: Unsupported = false, want true for input_kind = 8")
 	}
 }
 
@@ -110,6 +111,12 @@ func TestDecodeInputHaltsOnMalformedEncoding(t *testing.T) {
 
 	if _, err := p.DecodeInput(domain.InputContext{}, []byte{}); err == nil {
 		t.Fatal("DecodeInput: got nil error for a truncated payload, want a halt error")
+	}
+
+	// A kind-7 input whose bytes is zero is not a canonical encoding.
+	zeroBytes := append([]byte{7}, make([]byte, 32+32+8)...)
+	if _, err := p.DecodeInput(domain.InputContext{}, zeroBytes); err == nil {
+		t.Fatal("DecodeInput: got nil error for a BuyStorage input with bytes = 0, want a halt error")
 	}
 }
 

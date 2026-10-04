@@ -140,9 +140,28 @@ func TestReceiptUnknownStatus(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 	// status byte offset: version(2)+input_index(8)+input_hash(32)+batch_id(8)+contract_id(32)+code_hash(32) = 114
-	b[114] = 8
+	b[114] = 9
 	if _, err := DecodeReceipt(b); !errors.Is(err, ErrInvalidStatus) {
 		t.Fatalf("got %v, want ErrInvalidStatus", err)
+	}
+}
+
+func TestReceiptStorageQuotaExceededRoundTrip(t *testing.T) {
+	rec := sampleReceipt()
+	rec.Status = StatusStorageQuotaExceeded
+	b, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := DecodeReceipt(b)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got != rec {
+		t.Errorf("got %+v, want %+v", got, rec)
+	}
+	if got.Status.String() != "STORAGE_QUOTA_EXCEEDED" {
+		t.Errorf("String: got %q", got.Status.String())
 	}
 }
 
@@ -164,13 +183,16 @@ func TestReceiptAbortCodeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestReceiptVersion1Rejected(t *testing.T) {
+func TestReceiptVersion1AcceptedVersion2Rejected(t *testing.T) {
 	rec := sampleReceipt()
 	b, err := rec.Encode()
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
-	b[1] = 1 // receipt_version = 1, big-endian u16 low byte
+	if _, err := DecodeReceipt(b); err != nil {
+		t.Fatalf("version 1: %v", err)
+	}
+	b[1] = 2 // receipt_version = 2, big-endian u16 low byte
 	if _, err := DecodeReceipt(b); !errors.Is(err, ErrUnknownVersion) {
 		t.Fatalf("got %v, want ErrUnknownVersion", err)
 	}

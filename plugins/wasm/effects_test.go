@@ -33,7 +33,8 @@ func u256(v uint64) codec.U256 {
 }
 
 // baseSettlement is the fixture settlement every effects_test builds on: GlobalInputIndex 42,
-// a 1000-unit deposit and a 1,000,000-gas budget.
+// a 1000-unit deposit, a 1,000,000-gas budget and a quota leaf holding 1 MiB purchased and
+// nothing used.
 func baseSettlement() settlement {
 	return settlement{
 		ContractID:       testContractID,
@@ -43,6 +44,9 @@ func baseSettlement() settlement {
 		DepositAsset:     codec.AssetID{},
 		DepositAmount:    u256(1000),
 		GasBudget:        1_000_000,
+		State: &mapState{values: map[domain.Path][]byte{
+			derive(testContractID, keyQuota): encodeQuota(1<<20, 0),
+		}},
 	}
 }
 
@@ -124,6 +128,13 @@ func TestSettleStatusMap(t *testing.T) {
 	}
 	oversizedResultCharge := effectCharge(oversizedResultEff)
 
+	// validEffects nets 66 bytes (one 2-byte value plus the 64-byte leaf overhead), so a quota
+	// of 65 purchased bytes is exceeded by one.
+	quotaExceededSettlement := s
+	quotaExceededSettlement.State = &mapState{values: map[domain.Path][]byte{
+		derive(testContractID, keyQuota): encodeQuota(65, 0),
+	}}
+
 	unaffordableSettlement := s
 	unaffordableSettlement.GasBudget = metered
 	unaffordableEff := codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: s.GlobalInputIndex, ClaimedDeposit: codec.U256{}}
@@ -145,6 +156,7 @@ func TestSettleStatusMap(t *testing.T) {
 		{"ForgedEventContractID", s, engine.Outcome{Kind: engine.Returned, Ret: 0, GasUsed: metered, ResultBlob: encodeEffects(t, forgedEventEff)}, codec.StatusRuntimeFault, metered, 0},
 		{"ReservedKeyWrite", s, engine.Outcome{Kind: engine.Returned, Ret: 0, GasUsed: metered, ResultBlob: encodeEffects(t, reservedKeyEff)}, codec.StatusUnauthorized, metered, 0},
 		{"UnaffordableEffectCharge", unaffordableSettlement, engine.Outcome{Kind: engine.Returned, Ret: 0, GasUsed: metered, ResultBlob: encodeEffects(t, unaffordableEff)}, codec.StatusOutOfGas, unaffordableSettlement.GasBudget, 0},
+		{"StorageQuotaExceeded", quotaExceededSettlement, engine.Outcome{Kind: engine.Returned, Ret: 0, GasUsed: metered, ResultBlob: encodeEffects(t, validBlobEff)}, codec.StatusStorageQuotaExceeded, metered + validCharge, 0},
 		{"ResultTooLargeReturnData", s, engine.Outcome{Kind: engine.Returned, Ret: 0, GasUsed: metered, ResultBlob: encodeEffects(t, oversizedReturnEff)}, codec.StatusResultTooLarge, metered + oversizedReturnCharge, 0},
 		{"ResultTooLargeExecutionResult", s, engine.Outcome{Kind: engine.Returned, Ret: 0, GasUsed: metered, ResultBlob: encodeEffects(t, oversizedResultEff)}, codec.StatusResultTooLarge, metered + oversizedResultCharge, 0},
 	}
@@ -163,6 +175,9 @@ func TestSettleStatusMap(t *testing.T) {
 			}
 			if eff.AbortCode != tc.wantAbortCode {
 				t.Errorf("AbortCode = %d, want %d", eff.AbortCode, tc.wantAbortCode)
+			}
+			if tc.wantStatus == codec.StatusStorageQuotaExceeded {
+				assertRefundOnlyShape(t, tc.s, eff)
 			}
 		})
 	}
@@ -661,10 +676,11 @@ func TestSettleResultTooLargeBecauseOfRefund(t *testing.T) {
 	eff.Events = nil
 
 	// Size two StateDiff entries, each within codec.MaxStateValueSize, so the contract-only
-	// ExecutionResult fits under MaxExecutionResult but the ~133-byte refund pushes it over.
+	// ExecutionResult and the 52-byte quota entry fit under MaxExecutionResult but the
+	// ~133-byte refund pushes it over.
 	eff.StateDiff = []codec.LocalStateDiffEntry{
 		{LocalKey: []byte("k1"), Value: make([]byte, codec.MaxStateValueSize)},
-		{LocalKey: []byte("k2"), Value: make([]byte, codec.MaxStateValueSize-215)},
+		{LocalKey: []byte("k2"), Value: make([]byte, codec.MaxStateValueSize-267)},
 	}
 	eff.ReturnData = nil
 
@@ -714,8 +730,9 @@ func TestSettleSuccessStateDiffSortedAndDeletionsPreserved(t *testing.T) {
 	if got.Status != codec.StatusSuccess {
 		t.Fatalf("Status = %v, want StatusSuccess", got.Status)
 	}
-	if len(got.StateDiff) != 2 {
-		t.Fatalf("len(StateDiff) = %d, want 2", len(got.StateDiff))
+	// The two contract entries plus the runtime's quota entry.
+	if len(got.StateDiff) != 3 {
+		t.Fatalf("len(StateDiff) = %d, want 3", len(got.StateDiff))
 	}
 	for i := 1; i < len(got.StateDiff); i++ {
 		if string(got.StateDiff[i-1].Path[:]) > string(got.StateDiff[i].Path[:]) {

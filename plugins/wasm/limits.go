@@ -80,6 +80,9 @@ const (
 	// parameter and MaxTotalParams already caps the section's parameters), against ~800 KiB for
 	// the worst uncapped shape.
 	MaxTypeCount = 1024
+	// StateLeafOverhead is the per-leaf byte cost added to a leaf's value length when counting
+	// it against the storage quota (§25.1, §13.8).
+	StateLeafOverhead = 64
 )
 
 // moduleLimits is the plugin's structural caps in the shape internal/module consumes.

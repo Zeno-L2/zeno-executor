@@ -24,8 +24,10 @@ var (
 	ErrInvalidAssetID = errors.New("codec: invalid asset id")
 	// ErrInvalidKind is returned for an out-of-range kind ordinal or an inconsistent branch.
 	ErrInvalidKind = errors.New("codec: invalid kind")
-	// ErrInvalidStatus is returned for a status ordinal outside 0…7.
+	// ErrInvalidStatus is returned for a status ordinal outside 0…8.
 	ErrInvalidStatus = errors.New("codec: invalid status")
+	// ErrZeroStorageBytes is returned when a BuyStorage input's bytes is zero (§10.7).
+	ErrZeroStorageBytes = errors.New("codec: BuyStorage bytes is zero")
 	// ErrNonEmptyWithdrawalPayload is returned when an L1Withdrawal outbox message carries a
 	// non-empty payload.
 	ErrNonEmptyWithdrawalPayload = errors.New("codec: non-empty withdrawal payload")

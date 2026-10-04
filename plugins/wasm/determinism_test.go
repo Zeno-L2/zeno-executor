@@ -102,7 +102,7 @@ func seedCodeStore(t *testing.T, p *Plugin, vec vectorJSON, warmInstrumented boo
 	t.Helper()
 
 	if vec.ModuleWasmHex == "" {
-		return // the unsupported_kind and ownership vectors: nothing to seed.
+		return // the unsupported_kind, ownership and buy_storage vectors: nothing to seed.
 	}
 	raw := mustHex(t, vec.ModuleWasmHex)
 
