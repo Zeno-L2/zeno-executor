@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -19,10 +20,12 @@ import (
 // wrong-direction type, a bad payload, or a Committed that fails a field check.
 var ErrMalformed = errors.New("supervisor: malformed worker message")
 
-// Sources is what serve reads to answer a worker's requests.
+// Sources is what serve reads to answer a worker's requests. Run also reads it: it calls Ready
+// before starting any worker.
 type Sources struct {
 	Momenta ledger.MomentumSource
 	Anchors recovery.AnchorSource
+	Ready   func(ctx context.Context) bool // nil: Run starts workers without waiting
 }
 
 // workerState is shared by serve and the worker's supervision goroutine, guarded by mu.
