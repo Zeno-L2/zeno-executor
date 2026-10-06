@@ -41,6 +41,7 @@ func baseConfig(storage, binary string) map[string]any {
 	return map[string]any{
 		"executorAddress":   types.Address{0x01}.String(),
 		"networkName":       "devnet",
+		"znndEndpoint":      "http://127.0.0.1:35997",
 		"confirmationDepth": float64(10),
 		"storagePath":       storage,
 		"submissionKeySource": map[string]any{
@@ -96,6 +97,9 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 	if cfg.NetworkName != "devnet" {
 		t.Errorf("NetworkName = %q, want devnet", cfg.NetworkName)
+	}
+	if cfg.ZnndEndpoint != "http://127.0.0.1:35997" {
+		t.Errorf("ZnndEndpoint = %q, want http://127.0.0.1:35997", cfg.ZnndEndpoint)
 	}
 	if cfg.ConfirmationDepth != 10 {
 		t.Errorf("ConfirmationDepth = %d, want 10", cfg.ConfirmationDepth)
@@ -246,7 +250,7 @@ func TestLoadConfigInvalid(t *testing.T) {
 		{name: "missing file", path: filepath.Join(missingDir, "does-not-exist.json")},
 		{name: "malformed JSON", content: `{"executorAddress": `},
 		{name: "trailing second value", content: mustJSON(t, base()) + "\n" + mustJSON(t, map[string]any{"x": 1})},
-		{name: "unknown field top level", mutate: func(m map[string]any) { m["znndEndpoint"] = "x" }},
+		{name: "unknown field top level", mutate: func(m map[string]any) { m["maxBatchInputs"] = float64(1) }},
 		{name: "unknown field worker", mutate: func(m map[string]any) { worker0(m)["maxBatchInputs"] = float64(1) }},
 		{name: "unknown field submissionKeySource", mutate: func(m map[string]any) {
 			m["submissionKeySource"].(map[string]any)["extra"] = "x"
@@ -255,6 +259,11 @@ func TestLoadConfigInvalid(t *testing.T) {
 		{name: "executorAddress non-bech32", mutate: func(m map[string]any) { m["executorAddress"] = "not-an-address" }},
 		{name: "networkName empty", mutate: func(m map[string]any) { m["networkName"] = "" }},
 		{name: "networkName 257 bytes", mutate: func(m map[string]any) { m["networkName"] = strings.Repeat("a", 257) }},
+		{name: "znndEndpoint missing", mutate: func(m map[string]any) { delete(m, "znndEndpoint") }},
+		{name: "znndEndpoint empty", mutate: func(m map[string]any) { m["znndEndpoint"] = "" }},
+		{name: "znndEndpoint no scheme", mutate: func(m map[string]any) { m["znndEndpoint"] = "127.0.0.1:35997" }},
+		{name: "znndEndpoint ws scheme", mutate: func(m map[string]any) { m["znndEndpoint"] = "ws://host:1" }},
+		{name: "znndEndpoint no host", mutate: func(m map[string]any) { m["znndEndpoint"] = "http://" }},
 		{name: "confirmationDepth 0", mutate: func(m map[string]any) { m["confirmationDepth"] = float64(0) }},
 		{name: "confirmationDepth 1024", mutate: func(m map[string]any) { m["confirmationDepth"] = float64(1024) }},
 		{name: "storagePath relative", mutate: func(m map[string]any) { m["storagePath"] = "relative/path" }},

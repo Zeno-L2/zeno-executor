@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +22,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/internal/ipc"
+	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/digitalSloth/go-executor/internal/supervisor"
+	"github.com/digitalSloth/go-executor/internal/znnd/znndtest"
 )
 
 // validHash is a well-formed stfSpecHash: 63 zeros then "1" (internal/supervisor/config_test.go:36).
@@ -257,9 +262,13 @@ func runWithProbe(t *testing.T, marker string, keySource map[string]any, inherit
 
 	storage := openTempDir(t)
 
+	fx := znndtest.Load(t)
+	node := znndtest.NewServer(t, fx, fx.ReadHeight+2)
+
 	cfg := map[string]any{
 		"executorAddress":     types.Address{0x01}.String(),
 		"networkName":         "test",
+		"znndEndpoint":        node.URL,
 		"confirmationDepth":   float64(2),
 		"storagePath":         storage,
 		"submissionKeySource": keySource,
@@ -564,4 +573,67 @@ func fdNumbers(fds []probeFD) []int {
 		out[i] = e.FD
 	}
 	return out
+}
+
+func TestWaitForNode(t *testing.T) {
+	p := supervisor.Policy{BackoffMin: time.Millisecond, BackoffMax: 2 * time.Millisecond}
+	const endpoint = "http://node.example:35997"
+
+	var lines []string
+	logf := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+
+	calls := 0
+	check := func() error {
+		calls++
+		switch calls {
+		case 1:
+			return errors.New("down\nforged")
+		case 2:
+			return fmt.Errorf("%w: root mismatch", recovery.ErrHalted)
+		}
+		return nil
+	}
+	if !waitForNode(context.Background(), endpoint, check, p, logf) {
+		t.Fatalf("waitForNode = false, want true")
+	}
+	if calls != 3 || len(lines) != 2 {
+		t.Fatalf("calls = %d, lines = %d; want 3 and 2", calls, len(lines))
+	}
+	if !strings.Contains(lines[0], "is unusable") || !strings.Contains(lines[0], `down\nforged`) ||
+		strings.Contains(lines[0], "\n") || strings.Contains(lines[0], "returned inconsistent data") {
+		t.Fatalf("first line = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "returned inconsistent data") || strings.Contains(lines[1], "is unusable") {
+		t.Fatalf("second line = %q", lines[1])
+	}
+	for _, l := range lines {
+		if !strings.Contains(l, endpoint) {
+			t.Fatalf("line %q lacks the endpoint", l)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	failing := func() error { return errors.New("down") }
+	if waitForNode(ctx, endpoint, failing, p, func(string, ...any) {}) {
+		t.Fatalf("waitForNode with a cancelled context = true, want false")
+	}
+
+	// A signal ends the wait while a check is still in flight.
+	ctx, cancel = context.WithCancel(context.Background())
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	done := make(chan bool, 1)
+	go func() {
+		done <- waitForNode(ctx, endpoint, func() error { <-stuck; return nil }, p, func(string, ...any) {})
+	}()
+	cancel()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatalf("waitForNode with an in-flight check = true, want false")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("waitForNode did not return while a check was in flight")
+	}
 }

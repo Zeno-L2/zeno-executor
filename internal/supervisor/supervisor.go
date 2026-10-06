@@ -80,8 +80,9 @@ func New(cfg Config, key []byte, src Sources, policy Policy) *Supervisor {
 }
 
 // Run acquires the executor's single-instance lease, prepares every worker's storage directory
-// and starts one supervision goroutine per configured worker. It returns once ctx is done and
-// every worker has stopped. Call it at most once.
+// and, once Sources.Ready reports true, starts one supervision goroutine per configured worker.
+// It returns nil without starting a worker if Ready returns false. It returns once ctx is done
+// and every worker has stopped. Call it at most once.
 func (s *Supervisor) Run(ctx context.Context) error {
 	if err := workerproc.SealInheritedFDs(); err != nil {
 		return fmt.Errorf("supervisor: %w", err)
@@ -124,6 +125,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if err := host.PrepareDir(dir, workerUID(sl.w.DomainID)); err != nil {
 			return fmt.Errorf("supervisor: %w", err)
 		}
+	}
+
+	if s.src.Ready != nil && !s.src.Ready(ctx) {
+		return nil
 	}
 
 	var wg sync.WaitGroup

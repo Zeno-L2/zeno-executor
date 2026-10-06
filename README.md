@@ -56,6 +56,7 @@ listed below. `docker/executor.json` is a complete example.
 |---|---|---|
 | `executorAddress` | Zenon address | Required; identifies this executor instance and names the supervisor's own lease file. |
 | `networkName` | string | Required. |
+| `znndEndpoint` | URL | Required; the znnd JSON-RPC endpoint, an absolute `http` or `https` URL. The supervisor reads momenta and Settlement state from it, and the workers never see it. |
 | `confirmationDepth` | integer | Required; 1 to 1023. |
 | `storagePath` | absolute path | Required; see "On-disk layout" below. |
 | `submissionKeySource` | object | Required; see "Submission key" below. |
@@ -154,9 +155,8 @@ docker compose -f docker/compose.test.yml run --build --rm test   # run the test
 ```
 
 `docker compose logs executor` shows, in order: the `supervisor: enforcement: ...` line, then
-`supervisor: domain 1 worker started: pid <n>, uid 10001, limits on`, then `supervisor: domain 1
-HALTED: worker halted (exit status 3)` — every worker in this environment halts at boot, because
-the znnd client and Settlement anchor reader are not wired up yet.
+repeating `executor: znnd node at http://znnd:35997 is unusable: ...; retrying in <delay>` lines.
+No worker starts, because this environment runs no znnd.
 
 The elevated privileges above (`privileged: true`, `cgroup: private`) are for this local
 environment only, to let the supervisor delegate a cgroup and separate worker uids inside the

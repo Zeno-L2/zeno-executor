@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -615,6 +616,79 @@ func TestSecondSupervisorFailsOnLease(t *testing.T) {
 	if got := statusFor(supA, 1).PID; got != pidA {
 		t.Fatalf("A's PID = %d, want unchanged %d", got, pidA)
 	}
+}
+
+func TestReadyGatesWorkerStart(t *testing.T) {
+	chain := buildChain(t, 4, func(uint64, byte) string { return "" })
+	frontier := newFrontier(4)
+
+	t.Run("blocking", func(t *testing.T) {
+		storage := openTempDir(t)
+		src := chainSources(chain, frontier)
+		called := make(chan struct{})
+		release := make(chan struct{})
+		var once sync.Once
+		releaseOnce := func() { once.Do(func() { close(release) }) }
+		defer releaseOnce()
+		src.Ready = func(ctx context.Context) bool {
+			close(called)
+			select {
+			case <-release:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1))
+
+		sup, _, _ := startSupervisor(t, cfg, src, shrunkPolicy)
+		select {
+		case <-called:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("Ready was not called")
+		}
+
+		// The lease is held during the wait, so a second supervisor fails fast.
+		other := New(cfg, []byte("test-key"), chainSources(chain, frontier), shrunkPolicy)
+		errOther := make(chan error, 1)
+		go func() { errOther <- other.Run(context.Background()) }()
+		select {
+		case err := <-errOther:
+			if err == nil || errors.Is(err, ErrConfig) {
+				t.Fatalf("second Run = %v, want a non-ErrConfig error", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("second Run did not return in time")
+		}
+
+		if st := statusFor(sup, 1); st.State != StateStopped || st.PID != 0 {
+			t.Fatalf("worker 1 during the wait = %+v, want STOPPED, PID 0", st)
+		}
+		releaseOnce()
+		waitFor(t, 30*time.Second, "worker 1 RUNNING", func() bool { return statusFor(sup, 1).State == StateRunning })
+	})
+
+	t.Run("shutdown", func(t *testing.T) {
+		storage := openTempDir(t)
+		src := chainSources(chain, frontier)
+		src.Ready = func(context.Context) bool { return false }
+		cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1))
+
+		sup, _, done := startSupervisor(t, cfg, src, shrunkPolicy)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Run = %v, want nil", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("Run did not return in time")
+		}
+		for _, st := range sup.Status() {
+			if st.State != StateStopped || st.PID != 0 || st.Restarts != 0 {
+				t.Fatalf("status = %+v, want STOPPED, PID 0, Restarts 0", st)
+			}
+		}
+	})
 }
 
 func TestShutdownStopsWorkers(t *testing.T) {

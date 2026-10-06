@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -38,6 +39,7 @@ const cpuLimitMax = 1024.0
 type Config struct {
 	ExecutorAddress     types.Address  `json:"executorAddress"`
 	NetworkName         string         `json:"networkName"`
+	ZnndEndpoint        string         `json:"znndEndpoint"`
 	ConfirmationDepth   uint64         `json:"confirmationDepth"`
 	StoragePath         string         `json:"storagePath"`
 	SubmissionKeySource KeySource      `json:"submissionKeySource"`
@@ -97,6 +99,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.NetworkName == "" {
 		return Config{}, fmt.Errorf("%w: networkName is required", ErrConfig)
+	}
+	if u, err := url.Parse(cfg.ZnndEndpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return Config{}, fmt.Errorf("%w: znndEndpoint %q is not an absolute http or https URL", ErrConfig, cfg.ZnndEndpoint)
 	}
 	if cfg.ConfirmationDepth < 1 || cfg.ConfirmationDepth > recovery.MaxConfirmationDepth {
 		return Config{}, fmt.Errorf("%w: confirmationDepth %d is outside [1, %d]", ErrConfig, cfg.ConfirmationDepth, recovery.MaxConfirmationDepth)

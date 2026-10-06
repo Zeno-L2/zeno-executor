@@ -1,6 +1,7 @@
 {
   "executorAddress": "z1qp3yph55qgresyytz83anynr2f4z39x2z3ej3e",
   "networkName": "devnet",
+  "znndEndpoint": "http://znnd:35997",
   "confirmationDepth": 10,
   "storagePath": "/var/lib/executor",
   "submissionKeySource": { "kind": "FILE", "path": "/run/secrets/executor_key" },
