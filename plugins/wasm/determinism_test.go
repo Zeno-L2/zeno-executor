@@ -165,6 +165,7 @@ func runVector(t *testing.T, p *Plugin, vec vectorJSON, coldCache bool) runOutco
 		MomentumTime:     vec.MomentumTime,
 		L1Sender:         mustAddress(t, vec.L1Sender),
 		SourceData:       mustHex(t, vec.SourceDataHex),
+		Caps:             capTableFromJSON(t, vec.WithdrawalCaps),
 	}
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
@@ -398,6 +399,7 @@ func TestDeterminismWitnessBackendTripwire(t *testing.T) {
 		MomentumTime:     vec.MomentumTime,
 		L1Sender:         mustAddress(t, vec.L1Sender),
 		SourceData:       mustHex(t, vec.SourceDataHex),
+		Caps:             capTableFromJSON(t, vec.WithdrawalCaps),
 	}
 	in, err := p.DecodeInput(ctx, mustHex(t, vec.CanonicalInputHex))
 	if err != nil {

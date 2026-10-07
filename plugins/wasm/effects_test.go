@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
 	"math/big"
 	"path/filepath"
@@ -47,7 +48,39 @@ func baseSettlement() settlement {
 		State: &mapState{values: map[domain.Path][]byte{
 			derive(testContractID, keyQuota): encodeQuota(1<<20, 0),
 		}},
+		Caps: capFunc(func(codec.AssetID) (codec.U256, error) { return codec.U256{0x80}, nil }),
 	}
+}
+
+// capFunc is a domain.CapLookup backed by a function.
+type capFunc func(codec.AssetID) (codec.U256, error)
+
+func (f capFunc) MaxBatchWithdrawals(assets []codec.AssetID) ([]codec.U256, error) {
+	out := make([]codec.U256, len(assets))
+	for i, a := range assets {
+		v, err := f(a)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
+// capRecorder is a domain.CapLookup that records each call's assets and answers v for every
+// asset.
+type capRecorder struct {
+	v     codec.U256
+	calls [][]codec.AssetID
+}
+
+func (r *capRecorder) MaxBatchWithdrawals(assets []codec.AssetID) ([]codec.U256, error) {
+	r.calls = append(r.calls, append([]codec.AssetID(nil), assets...))
+	out := make([]codec.U256, len(assets))
+	for i := range out {
+		out[i] = r.v
+	}
+	return out, nil
 }
 
 // validEffects returns a ContractEffects blob correctly attributed to s.ContractID: one
@@ -756,7 +789,7 @@ func TestSettleSuccessStateDiffSortedAndDeletionsPreserved(t *testing.T) {
 // domainEffects is a local alias so this file's helper signatures stay short.
 type domainEffects = domain.Effects
 
-// twoPow255 is codec.MaxBatchWithdrawal's value as a big.Int.
+// twoPow255 is the cap baseSettlement's lookup answers for every asset.
 func twoPow255() *big.Int { return new(big.Int).Lsh(big.NewInt(1), 255) }
 
 // u256FromBig converts v into a codec.U256, failing the test on overflow.
@@ -775,6 +808,109 @@ func withdrawalAsset(b byte) codec.AssetID {
 	var a codec.AssetID
 	a[31] = b
 	return a
+}
+
+// TestSettleStep5aCaps covers how step 5a reads the per-asset cap from the input's Caps lookup
+// (§27.9): per-asset totals, an asset with no AssetConfig (cap 0), the ascending lookup order,
+// a lookup error and a missing lookup.
+func TestSettleStep5aCaps(t *testing.T) {
+	const metered = uint64(1000)
+	assetA, assetB, assetC := withdrawalAsset(1), withdrawalAsset(2), withdrawalAsset(3)
+	assetD, assetE, assetF := withdrawalAsset(4), withdrawalAsset(5), withdrawalAsset(6)
+
+	type withdrawal struct {
+		asset  codec.AssetID
+		amount uint64
+	}
+	settle := func(t *testing.T, s settlement, ws ...withdrawal) (domain.Effects, error) {
+		t.Helper()
+		eff := validEffects(s, 0)
+		eff.Outbox = nil
+		for i, w := range ws {
+			eff.Outbox = append(eff.Outbox, codec.OutboxMessage{
+				SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: uint32(i),
+				Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: w.asset, Amount: u256(w.amount)},
+			})
+		}
+		return s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: metered, ResultBlob: encodeEffects(t, eff)})
+	}
+	table := func(m capTable) capFunc {
+		return func(a codec.AssetID) (codec.U256, error) { return m[a], nil }
+	}
+
+	t.Run("PerAssetCaps", func(t *testing.T) {
+		s := baseSettlement()
+		s.Caps = table(capTable{assetA: u256(10), assetB: u256(5)})
+		got, err := settle(t, s, withdrawal{assetA, 4}, withdrawal{assetA, 4}, withdrawal{assetB, 5})
+		if err != nil || got.Status != codec.StatusSuccess {
+			t.Fatalf("settle = %v, %v; want StatusSuccess", got.Status, err)
+		}
+	})
+
+	t.Run("SummedAboveCap", func(t *testing.T) {
+		s := baseSettlement()
+		s.Caps = table(capTable{assetA: u256(10)})
+		got, err := settle(t, s, withdrawal{assetA, 6}, withdrawal{assetA, 5})
+		if err != nil || got.Status != codec.StatusRuntimeFault || got.GasUsed != metered {
+			t.Fatalf("settle = %v, gas %d, %v; want RUNTIME_FAULT at %d", got.Status, got.GasUsed, err, metered)
+		}
+		if want := s.refund(codec.U256{}, 0); !reflect.DeepEqual(got.OutboxMessages, want) {
+			t.Fatalf("OutboxMessages = %+v, want the refund %+v", got.OutboxMessages, want)
+		}
+	})
+
+	t.Run("UnconfiguredNonZero", func(t *testing.T) {
+		s := baseSettlement()
+		s.Caps = table(capTable{assetA: u256(10)})
+		got, err := settle(t, s, withdrawal{assetC, 1})
+		if err != nil || got.Status != codec.StatusRuntimeFault {
+			t.Fatalf("settle = %v, %v; want RUNTIME_FAULT", got.Status, err)
+		}
+	})
+
+	t.Run("UnconfiguredZero", func(t *testing.T) {
+		s := baseSettlement()
+		s.Caps = table(capTable{assetA: u256(10)})
+		got, err := settle(t, s, withdrawal{assetC, 0})
+		if err != nil || got.Status != codec.StatusSuccess {
+			t.Fatalf("settle = %v, %v; want StatusSuccess", got.Status, err)
+		}
+	})
+
+	t.Run("OneAscendingLookup", func(t *testing.T) {
+		s := baseSettlement()
+		s.DepositAsset = assetF
+		rec := &capRecorder{v: u256(100)}
+		s.Caps = rec
+		got, err := settle(t, s, withdrawal{assetE, 1}, withdrawal{assetB, 1}, withdrawal{assetD, 1}, withdrawal{assetA, 1}, withdrawal{assetC, 1})
+		if err != nil || got.Status != codec.StatusSuccess {
+			t.Fatalf("settle = %v, %v; want StatusSuccess", got.Status, err)
+		}
+		if want := [][]codec.AssetID{{assetA, assetB, assetC, assetD, assetE}}; !reflect.DeepEqual(rec.calls, want) {
+			t.Fatalf("lookups = %x, want %x (one call, ascending, the deposit asset never looked up)", rec.calls, want)
+		}
+	})
+
+	t.Run("LookupError", func(t *testing.T) {
+		s := baseSettlement()
+		errCap := errors.New("cap source down")
+		s.Caps = capFunc(func(codec.AssetID) (codec.U256, error) { return codec.U256{}, errCap })
+		if _, err := settle(t, s, withdrawal{assetA, 1}); !errors.Is(err, errCap) {
+			t.Fatalf("settle err = %v, want errCap", err)
+		}
+	})
+
+	t.Run("NilCaps", func(t *testing.T) {
+		s := baseSettlement()
+		s.Caps = nil
+		if _, err := settle(t, s, withdrawal{assetA, 1}); err == nil {
+			t.Fatalf("settle with a withdrawal and no lookup: err = nil, want an error")
+		}
+		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: metered, ResultBlob: encodeEffects(t, validEffects(s, 0))})
+		if err != nil || got.Status != codec.StatusSuccess {
+			t.Fatalf("settle without a withdrawal = %v, %v; want StatusSuccess", got.Status, err)
+		}
+	})
 }
 
 // TestSettleStep5aRejects covers the four ways the per-asset withdrawal cap (§27.9, §10.6)
@@ -841,7 +977,7 @@ func TestSettleStep5aAdmits(t *testing.T) {
 		s := baseSettlement() // DepositAsset is the zero AssetID, DepositAmount 1000
 		eff := validEffects(s, 0)
 		eff.Outbox = []codec.OutboxMessage{
-			{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(1), Amount: codec.MaxBatchWithdrawal}},
+			{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(1), Amount: u256FromBig(t, twoPow255())}},
 		}
 		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: encodeEffects(t, eff)})
 		if err != nil {
@@ -858,7 +994,7 @@ func TestSettleStep5aAdmits(t *testing.T) {
 		s.DepositAmount = u256FromBig(t, new(big.Int).Sub(twoPow255(), big.NewInt(1)))
 		eff := validEffects(s, 0)
 		eff.Outbox = []codec.OutboxMessage{
-			{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(1), Amount: codec.MaxBatchWithdrawal}},
+			{SourceContract: s.ContractID, InputIndex: s.GlobalInputIndex, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: withdrawalAsset(1), Amount: u256FromBig(t, twoPow255())}},
 		}
 		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: 1000, ResultBlob: encodeEffects(t, eff)})
 		if err != nil {

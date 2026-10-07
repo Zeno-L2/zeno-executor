@@ -3,6 +3,7 @@ package ipc
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
+	"github.com/digitalSloth/go-executor/internal/ledger"
 )
 
 func validCommitment() codec.BatchCommitment {
@@ -74,6 +76,14 @@ func validTable() []msgCase {
 		{"momentaRequest", Worker, MomentaRequest{Height: 1, Count: 10}},
 		{"anchorRequest", Worker, AnchorRequest{}},
 		{"committed", Worker, Committed{Commitment: validCommitment()}},
+		{"assignmentRequest", Worker, AssignmentRequest{Height: 9, Hash: types.Hash{0x0A}, NextOrdinal: 3}},
+		{"assignment", Supervisor, Assignment{Entries: []ledger.AssignmentEntry{
+			{Ordinal: 3, GlobalInputIndex: 10, SourceAccountBlockHash: types.Hash{0x01}, SendMomentumHeight: 7},
+			{Ordinal: 4, GlobalInputIndex: 12, SourceAccountBlockHash: types.Hash{0x02}, SendMomentumHeight: 8},
+		}}},
+		{"assignmentEmpty", Supervisor, Assignment{}},
+		{"capRequest", Worker, CapRequest{Height: 9, Hash: types.Hash{1}, Assets: []codec.AssetID{codec.AssetIDFromZTS(types.ZnnTokenStandard), codec.AssetIDFromZTS(types.QsrTokenStandard)}}},
+		{"cap", Supervisor, Cap{Amounts: []codec.U256{{31: 7}, {31: 8}}}},
 	}
 }
 
@@ -270,8 +280,8 @@ func handEncodeSourceError(t *testing.T, s SourceError) []byte {
 
 func TestUnknownTypes(t *testing.T) {
 	known := map[byte]bool{
-		0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x05: true, 0x06: true,
-		0x81: true, 0x82: true, 0x83: true, 0x84: true,
+		0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x05: true, 0x06: true, 0x07: true, 0x08: true,
+		0x81: true, 0x82: true, 0x83: true, 0x84: true, 0x85: true, 0x86: true,
 	}
 	for b := 0; b <= 0xff; b++ {
 		if known[byte(b)] {
@@ -337,6 +347,88 @@ func TestOutOfRange(t *testing.T) {
 		}
 		frame := handEncodeMomentaRequest(t, 0, 1)
 		if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("err = %v, want ErrMalformed", err)
+		}
+	})
+	t.Run("assignmentRequest height 0", func(t *testing.T) {
+		if _, err := Encode(AssignmentRequest{Height: 0}); err == nil {
+			t.Fatalf("Encode: want error")
+		}
+		w := &pwriter{}
+		w.u64(0)
+		w.raw(make([]byte, 32))
+		w.u64(0)
+		frame, err := assembleFrame(TypeAssignmentRequest, w.buf, MaxWorkerFrame)
+		if err != nil {
+			t.Fatalf("assembleFrame: %v", err)
+		}
+		if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("err = %v, want ErrMalformed", err)
+		}
+	})
+	t.Run("capRequest height 0", func(t *testing.T) {
+		if _, err := Encode(CapRequest{Height: 0}); err == nil {
+			t.Fatalf("Encode: want error")
+		}
+		w := &pwriter{}
+		w.u64(0)
+		w.raw(make([]byte, 32))
+		w.u8(1)
+		w.raw(make([]byte, 32))
+		frame, err := assembleFrame(TypeCapRequest, w.buf, MaxWorkerFrame)
+		if err != nil {
+			t.Fatalf("assembleFrame: %v", err)
+		}
+		if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("err = %v, want ErrMalformed", err)
+		}
+	})
+	for _, n := range []int{0, codec.MaxAssetsPerBatch + 1} {
+		t.Run(fmt.Sprintf("capRequest %d assets", n), func(t *testing.T) {
+			if _, err := Encode(CapRequest{Height: 1, Assets: make([]codec.AssetID, n)}); err == nil {
+				t.Fatalf("Encode: want error")
+			}
+			w := &pwriter{}
+			w.u64(1)
+			w.raw(make([]byte, 32))
+			w.u8(uint8(n))
+			w.raw(make([]byte, 32*n))
+			frame, err := assembleFrame(TypeCapRequest, w.buf, MaxWorkerFrame)
+			if err != nil {
+				t.Fatalf("assembleFrame: %v", err)
+			}
+			if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+				t.Fatalf("err = %v, want ErrMalformed", err)
+			}
+		})
+		t.Run(fmt.Sprintf("cap %d amounts", n), func(t *testing.T) {
+			if _, err := Encode(Cap{Amounts: make([]codec.U256, n)}); err == nil {
+				t.Fatalf("Encode: want error")
+			}
+			w := &pwriter{}
+			w.u8(uint8(n))
+			w.raw(make([]byte, 32*n))
+			frame, err := assembleFrame(TypeCap, w.buf, MaxWorkerFrame)
+			if err != nil {
+				t.Fatalf("assembleFrame: %v", err)
+			}
+			if _, err := ReadMessage(bytes.NewReader(frame), Supervisor); !errors.Is(err, ErrMalformed) {
+				t.Fatalf("err = %v, want ErrMalformed", err)
+			}
+		})
+	}
+	t.Run("assignment send height 0", func(t *testing.T) {
+		if _, err := Encode(Assignment{Entries: []ledger.AssignmentEntry{{Ordinal: 1}}}); err == nil {
+			t.Fatalf("Encode: want error")
+		}
+		frame := handEncodeAssignment(t, 1, 1)
+		if _, err := ReadMessage(bytes.NewReader(frame), Supervisor); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("err = %v, want ErrMalformed", err)
+		}
+	})
+	t.Run("assignment count 3 with two entries", func(t *testing.T) {
+		frame := handEncodeAssignment(t, 3, 2)
+		if _, err := ReadMessage(bytes.NewReader(frame), Supervisor); !errors.Is(err, ErrMalformed) {
 			t.Fatalf("err = %v, want ErrMalformed", err)
 		}
 	})
@@ -443,4 +535,27 @@ func TestDomainDir(t *testing.T) {
 	if got, want := c.DomainDir(), "/s/7"; got != want {
 		t.Fatalf("DomainDir = %q, want %q", got, want)
 	}
+}
+
+// handEncodeAssignment frames an Assignment payload that claims n entries and carries entries
+// entries, each with send momentum height 0 when n is 1 and 5 otherwise.
+func handEncodeAssignment(t *testing.T, n uint32, entries int) []byte {
+	t.Helper()
+	w := &pwriter{}
+	w.u32(n)
+	for i := 0; i < entries; i++ {
+		w.u64(uint64(i))
+		w.u64(uint64(i))
+		w.raw(make([]byte, 32))
+		if n == 1 {
+			w.u64(0)
+		} else {
+			w.u64(5)
+		}
+	}
+	frame, err := assembleFrame(TypeAssignment, w.buf, MaxFrame)
+	if err != nil {
+		t.Fatalf("assembleFrame: %v", err)
+	}
+	return frame
 }

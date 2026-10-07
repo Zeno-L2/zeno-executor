@@ -2,13 +2,17 @@ package supervisor
 
 import (
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc"
+	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 	"github.com/digitalSloth/go-executor/internal/settlement"
 	"github.com/digitalSloth/go-executor/internal/znnd"
@@ -40,7 +44,7 @@ func readPathClient(t *testing.T, fx *znndtest.Fixture, srv *znndtest.Server, de
 	}
 
 	zc := znnd.NewClient(srv.URL)
-	src := Sources{Momenta: zc, Anchors: settlement.NewAnchorSource(settlement.NewReader(zc), depth)}
+	src := Sources{Momenta: zc, Anchors: settlement.NewAnchorSource(settlement.NewReader(zc), depth), Assignments: settlement.NewReader(zc), Caps: NewCapCache(settlement.NewReader(zc))}
 	done := runServe(t, sEnd, w, executor, src, &workerState{})
 
 	client := ipc.NewClient(wEnd, nil)
@@ -119,6 +123,163 @@ func TestReadPathEndToEnd(t *testing.T) {
 	defer rdy.Store.Close()
 	if !rdy.HaveAnchor || !rdy.VerifyAnchor || rdy.Anchor != want {
 		t.Fatalf("Boot = HaveAnchor %v, VerifyAnchor %v, Anchor %+v; want true, true, %+v", rdy.HaveAnchor, rdy.VerifyAnchor, rdy.Anchor, want)
+	}
+}
+
+func TestAssignmentEndToEnd(t *testing.T) {
+	fx := znndtest.Load(t)
+	a := fx.Assignment
+	srv := znndtest.NewServer(t, fx, a.ReceiveHeight+10)
+	client := readPathClient(t, fx, srv, 10)
+	hash := fx.DetailedMomentum(t, a.ReceiveHeight).Momentum.Hash
+	c0 := fx.Expected.DomainInputCounter
+
+	got, err := client.Assignment(fx.DomainID, a.ReceiveHeight, hash, c0)
+	if err != nil {
+		t.Fatalf("Assignment: %v", err)
+	}
+	var want []ledger.AssignmentEntry
+	for _, e := range a.Entries {
+		want = append(want, ledger.AssignmentEntry(e))
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Assignment = %+v, want %+v", got, want)
+	}
+
+	_, err = client.Assignment(fx.DomainID, a.ReceiveHeight, types.Hash{0x01}, c0-1)
+	if err == nil || errors.Is(err, recovery.ErrHalted) || client.Broken() != nil || !strings.Contains(err.Error(), "not "+(types.Hash{0x01}).String()) {
+		t.Fatalf("Assignment with another hash = %v, Broken() = %v; want a plain error", err, client.Broken())
+	}
+
+	if _, err := client.Assignment(fx.DomainID, a.ReceiveHeight, hash, c0+1); !errors.Is(err, recovery.ErrHalted) {
+		t.Fatalf("Assignment with a cursor ahead = %v, want ErrHalted", err)
+	}
+}
+
+func TestAssignmentPreStateRootHaltsOverTheChannel(t *testing.T) {
+	fx := znndtest.Load(t)
+	h := fx.Assignment.PreStateRootSettlementHeight
+	srv := znndtest.NewServer(t, fx, fx.Assignment.ReceiveHeight+10)
+	client := readPathClient(t, fx, srv, 10)
+	hash := fx.DetailedMomentum(t, h).Momentum.Hash
+
+	_, err := client.Assignment(fx.DomainID, h, hash, 0)
+	if !errors.Is(err, recovery.ErrHalted) || client.Broken() != nil {
+		t.Fatalf("Assignment at a pre-state-root Settlement momentum = %v, Broken() = %v; want ErrHalted on a live channel", err, client.Broken())
+	}
+}
+
+func TestCapEndToEnd(t *testing.T) {
+	fx := znndtest.Load(t)
+	srv := znndtest.NewServer(t, fx, fx.Assignment.ReceiveHeight+10)
+	client := readPathClient(t, fx, srv, 10)
+	h := fx.ReadHeight
+	hash := fx.DetailedMomentum(t, h).Momentum.Hash
+	want, err := codec.U256FromBig(fx.Expected.AssetConfig.MaxBatchWithdrawal)
+	if err != nil {
+		t.Fatalf("U256FromBig: %v", err)
+	}
+	configured, unconfigured := codec.AssetID(fx.AssetID), codec.AssetID(fx.UnconfiguredAssetID)
+
+	check := func(label string) {
+		t.Helper()
+		got, err := client.MaxBatchWithdrawals(fx.DomainID, h, hash, []codec.AssetID{configured, unconfigured})
+		if wantAll := []codec.U256{want, {}}; err != nil || !reflect.DeepEqual(got, wantAll) {
+			t.Fatalf("%s: caps = %x, %v; want %x", label, got, err, wantAll)
+		}
+	}
+	check("live")
+
+	srv.SetDown(true)
+	check("cached while the node is down")
+	srv.SetDown(false)
+
+	_, err = client.MaxBatchWithdrawals(fx.DomainID, h, types.Hash{0x01}, []codec.AssetID{configured})
+	if err == nil || errors.Is(err, recovery.ErrHalted) || client.Broken() != nil {
+		t.Fatalf("another hash = %v, Broken() = %v; want a plain error", err, client.Broken())
+	}
+}
+
+// TestFollowerEndToEnd drives a ledger.Follower through the worker channel against the recorded
+// fixture: the follower reads the receiving momentum and fetches the momentum that holds the
+// sends. A genesis boot against this fixture halts by design at PreStateRootSettlementHeight, so
+// boot over the same path stays covered by TestReadPathEndToEnd.
+func TestFollowerEndToEnd(t *testing.T) {
+	fx := znndtest.Load(t)
+	a := fx.Assignment
+	srv := znndtest.NewServer(t, fx, a.ReceiveHeight+10)
+	client := readPathClient(t, fx, srv, 10)
+	c0 := fx.Expected.DomainInputCounter
+
+	newFollower := func(startOrdinal uint64) *ledger.Follower {
+		t.Helper()
+		f, err := ledger.New(ledger.Config{
+			DomainID: fx.DomainID, ConfirmationDepth: 10, StartHeight: a.ReceiveHeight,
+			StartOrdinal: startOrdinal, Source: client, Assignments: client,
+		})
+		if err != nil {
+			t.Fatalf("ledger.New: %v", err)
+		}
+		return f
+	}
+
+	f := newFollower(c0)
+	var got []ledger.Input
+	for {
+		in, ok, err := f.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		got = append(got, in)
+	}
+
+	if len(got) != len(a.Entries) {
+		t.Fatalf("drained %d inputs, want %d", len(got), len(a.Entries))
+	}
+	sendMomentum := fx.DetailedMomentum(t, a.SendHeight)
+	for i, e := range a.Entries {
+		want, err := ledger.DecodeAssignedInput(fx.DomainID, sendMomentum, e.GlobalInputIndex, e.SourceAccountBlockHash)
+		if err != nil {
+			t.Fatalf("DecodeAssignedInput %d: %v", i, err)
+		}
+		if !reflect.DeepEqual(got[i], want) {
+			t.Fatalf("input %d = %+v, want %+v", i, got[i], want)
+		}
+		if i > 0 && got[i].Ctx.GlobalInputIndex <= got[i-1].Ctx.GlobalInputIndex {
+			t.Fatalf("input %d: global index %d does not exceed %d", i, got[i].Ctx.GlobalInputIndex, got[i-1].Ctx.GlobalInputIndex)
+		}
+		if got[i].Ctx.MomentumHeight != a.SendHeight {
+			t.Fatalf("input %d: momentum height %d, want %d", i, got[i].Ctx.MomentumHeight, a.SendHeight)
+		}
+		decoded, err := codec.DecodeInput(got[i].Payload)
+		if err != nil {
+			t.Fatalf("DecodeInput %d: %v", i, err)
+		}
+		if decoded.SourceAccountBlockHash == a.RejectedSendHash {
+			t.Fatalf("input %d is the rejected send", i)
+		}
+	}
+
+	if _, ok, err := f.Next(); ok || err != nil {
+		t.Fatalf("Next after drain = (ok=%v, err=%v), want (false, nil)", ok, err)
+	}
+	wantCP := ledger.Checkpoint{
+		Height:      a.ReceiveHeight,
+		Hash:        fx.DetailedMomentum(t, a.ReceiveHeight).Momentum.Hash,
+		NextOrdinal: c0 + uint64(len(a.Entries)),
+	}
+	if cp, ok := f.Checkpoint(); !ok || cp != wantCP {
+		t.Fatalf("Checkpoint = (%+v, %v), want %+v", cp, ok, wantCP)
+	}
+
+	// A follower whose next ordinal disagrees with Settlement's cursor halts, and the channel
+	// stays usable.
+	_, _, err := newFollower(c0 + 1).Next()
+	if !errors.Is(err, recovery.ErrHalted) || !errors.Is(err, ledger.ErrSourceRead) || client.Broken() != nil {
+		t.Fatalf("Next with a cursor ahead = %v, Broken() = %v; want ErrHalted inside ErrSourceRead on a live channel", err, client.Broken())
 	}
 }
 

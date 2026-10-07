@@ -51,9 +51,11 @@ func run() int {
 		return waitForNode(ctx, cfg.ZnndEndpoint, check, supervisor.Policy{}.WithDefaults(), log.Printf)
 	}
 	sources := supervisor.Sources{
-		Momenta: client,
-		Anchors: settlement.NewAnchorSource(reader, cfg.ConfirmationDepth),
-		Ready:   ready,
+		Momenta:     client,
+		Anchors:     settlement.NewAnchorSource(reader, cfg.ConfirmationDepth),
+		Assignments: reader,
+		Caps:        supervisor.NewCapCache(reader),
+		Ready:       ready,
 	}
 	sup := supervisor.New(cfg, key, sources, supervisor.Policy{})
 	err = sup.Run(ctx)

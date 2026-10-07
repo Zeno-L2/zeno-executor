@@ -61,9 +61,10 @@ var (
 	ErrDAHashMismatch = errors.New("batch: DA bundle round-trip mismatch")
 	// ErrUnbatchable reports that the first input of a batch alone exceeds a per-batch cap.
 	// plugins/wasm's step 5a bounds each input's contract withdrawals per asset and its asset
-	// footprint, and the u256 invariant on codec.MaxBatchWithdrawal keeps a lone input's
-	// totals representable, so this is unreachable in practice. Kept as a structural,
-	// fail-closed guard.
+	// footprint, a lone input's capTotal is at most the cap step 5a checked it against, which
+	// its own capLimit covers, and Settlement bounds every cap by MaxBatchWithdrawalCeiling
+	// (go-zenon vm/constants/settlement.go:64), so its withdrawalDebit stays representable. This
+	// is unreachable in practice. Kept as a structural, fail-closed guard.
 	ErrUnbatchable = errors.New("batch: first input of a batch alone exceeds a per-batch cap")
 	// ErrEffectsInvariant reports that an input's Effects carried content that violates a
 	// committed invariant: on a non-SUCCESS status, §14.3/§15 forbid a non-empty StateDiff,
@@ -128,6 +129,7 @@ type applied struct {
 	inputHash     types.Hash
 	depositAsset  codec.AssetID
 	depositAmount codec.U256
+	caps          map[codec.AssetID]codec.U256 // the cap of each asset the input holds a contract L1Withdrawal in
 
 	eff domain.Effects
 
@@ -145,7 +147,7 @@ type applied struct {
 //   - ok == false with a nil error: the source yielded nothing and nothing was accumulated.
 //
 //   - A source error with nothing accumulated: returned wrapped with %w, never reclassified, so
-//     errors.As(err, **ledger.ReorgError) and errors.Is(err, ledger.ErrIndexOverflow) both
+//     errors.As(err, **ledger.ReorgError) and errors.Is(err, ledger.ErrSourceRead) both
 //     survive to the caller. ledger.Follower.Next documents three distinct classes — an
 //     unlatched MomentumSource read error the caller may retry, a one-shot *ReorgError, and a
 //     latched permanent error — and EXECUTOR.md §15 gives each a different behaviour ("retry
@@ -185,14 +187,22 @@ type applied struct {
 //     re-present on the next call. This is what keeps already-executed, already-applied inputs
 //     from being dropped between batches.
 //
-//   - Every non-source error is a halt: a Domain.DecodeInput/Domain.Apply error, an encode error,
-//     ErrDAHashMismatch, ErrEffectsInvariant, ErrUnbatchable.
+//   - An error wrapping ledger.ErrCapRead, from Domain.Apply (step 5a) or from the driver's own
+//     cap lookup after Apply: the withdrawal-cap source is unavailable. It is not a halt and not
+//     a retry. The caller ends the run on it and the supervisor restarts the worker. NextBatch
+//     discards the accumulated records, whose writes the store already carries, so the caller
+//     MUST NOT call NextBatch on this Driver again. A restart replays safely: boot reopens the
+//     snapshot at the last commit and discards the WAL, so the dropped records are re-derived
+//     and never applied twice.
 //
-// Outside a reorg discard, the store always equals the last returned batch's PostStateRoot: cap
-// evaluation (step 8) precedes Store.Apply, so the store never runs ahead of a batch NextBatch
-// has not yet returned. A reorg discard is the one case that breaks the invariant — the store is
-// then ahead of it by the discarded records' writes — and restoring it is ticket 07's rollback to
-// perform, not the Driver's.
+//   - Every other non-source error is a halt: a Domain.DecodeInput/Domain.Apply error, an encode
+//     error, ErrDAHashMismatch, ErrEffectsInvariant, ErrUnbatchable.
+//
+// Outside a reorg discard or a cap-read error, the store always equals the last returned batch's
+// PostStateRoot: cap evaluation (step 8) precedes Store.Apply, so the store never runs ahead of a
+// batch NextBatch has not yet returned. Those two cases break the invariant: the store is then
+// ahead of it by the dropped records' writes. Restoring it is the rollback's job after a reorg
+// and the restart's job after a cap-read error, never the Driver's.
 func (d *Driver) NextBatch() (Batch, bool, error) {
 	if d.reorged {
 		return Batch{}, false, ErrDriverReorged
@@ -334,6 +344,12 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 		return applied{}, err
 	}
 
+	caps, err := withdrawalCaps(in, eff)
+	if err != nil {
+		return applied{}, err
+	}
+	rec.caps = caps
+
 	keys := witnessKeys(acc.Witnesses(), eff.StateDiff)
 	witnesses := make([]codec.WitnessEntry, 0, len(keys))
 	for _, k := range keys {
@@ -351,6 +367,37 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	rec.witnesses = witnesses
 
 	return rec, nil
+}
+
+// withdrawalCaps returns the cap in.Ctx.Caps answers for each asset eff holds a contract
+// L1Withdrawal in (a non-zero SourceContract, any amount), in one lookup: the cap step 5a checked
+// the input against. A refund needs no cap. It returns nil when eff holds no contract withdrawal.
+func withdrawalCaps(in ledger.Input, eff domain.Effects) (map[codec.AssetID]codec.U256, error) {
+	var assets []codec.AssetID
+	seen := map[codec.AssetID]bool{}
+	for _, m := range eff.OutboxMessages {
+		w, ok := m.Target.(codec.L1Withdrawal)
+		if !ok || m.SourceContract == (types.Hash{}) || seen[w.Asset] {
+			continue
+		}
+		seen[w.Asset] = true
+		assets = append(assets, w.Asset)
+	}
+	if len(assets) == 0 {
+		return nil, nil
+	}
+	if in.Ctx.Caps == nil {
+		return nil, fmt.Errorf("batch: input %d withdraws asset %x with no cap lookup", in.Ctx.GlobalInputIndex, assets[0])
+	}
+	vals, err := in.Ctx.Caps.MaxBatchWithdrawals(assets)
+	if err != nil {
+		return nil, fmt.Errorf("batch: withdrawal caps of input %d: %w", in.Ctx.GlobalInputIndex, err)
+	}
+	caps := make(map[codec.AssetID]codec.U256, len(assets))
+	for i, a := range assets {
+		caps[a] = vals[i]
+	}
+	return caps, nil
 }
 
 // finishApply runs steps 9-10: on SUCCESS, Store.Apply and refresh the cached root; otherwise

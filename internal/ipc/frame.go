@@ -9,6 +9,10 @@
 //     sends any of it. RangeEnd.Count equals the number of Momentum frames sent, which is at most the
 //     requested count.
 //   - AnchorRequest is answered by Anchor or by SourceError.
+//   - AssignmentRequest is answered by Assignment or by SourceError. Assignment entry i carries
+//     ordinal NextOrdinal+i.
+//   - CapRequest is answered by Cap or by SourceError. Cap carries one amount per requested
+//     asset, in request order.
 //
 // Any other reply sequence is a channel failure, and so is a Momentum the worker cannot decode or
 // whose hashes do not verify: the worker exits 1, a counted failure. Encode does not verify

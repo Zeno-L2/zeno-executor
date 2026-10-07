@@ -14,13 +14,16 @@ import (
 
 // assetTotals is one asset's running batch contribution: depositCredit and withdrawalDebit
 // mirror the committed AssetFlowSummary fields (§27.6, edge cases 11-12); capTotal is the
-// MaxBatchWithdrawal aggregate (§27.9, edge case 13), which excludes runtime-emitted refunds.
-// All three are unbounded math/big sums; conversion to codec.U256 happens only once a
-// candidate has been admitted (breach) or the batch is assembled (assetFlowSummary).
+// MaxBatchWithdrawal aggregate (§27.9, edge case 13), which excludes runtime-emitted refunds,
+// and capLimit is the highest cap among the batch's records holding a contract withdrawal in
+// the asset (§27.9), which bounds capTotal. All four are unbounded math/big values;
+// conversion to codec.U256 happens only once a candidate has been admitted (breach) or the
+// batch is assembled (assetFlowSummary).
 type assetTotals struct {
 	depositCredit   *big.Int
 	withdrawalDebit *big.Int
 	capTotal        *big.Int
+	capLimit        *big.Int
 }
 
 // batchTotals is the in-progress batch's per-asset running totals, keyed by AssetID. An asset
@@ -30,7 +33,7 @@ type batchTotals map[codec.AssetID]*assetTotals
 func (bt batchTotals) entry(asset codec.AssetID) *assetTotals {
 	t, ok := bt[asset]
 	if !ok {
-		t = &assetTotals{depositCredit: new(big.Int), withdrawalDebit: new(big.Int), capTotal: new(big.Int)}
+		t = &assetTotals{depositCredit: new(big.Int), withdrawalDebit: new(big.Int), capTotal: new(big.Int), capLimit: new(big.Int)}
 		bt[asset] = t
 	}
 	return t
@@ -45,6 +48,7 @@ func (bt batchTotals) clone() batchTotals {
 			depositCredit:   new(big.Int).Set(v.depositCredit),
 			withdrawalDebit: new(big.Int).Set(v.withdrawalDebit),
 			capTotal:        new(big.Int).Set(v.capTotal),
+			capLimit:        new(big.Int).Set(v.capLimit),
 		}
 	}
 	return out
@@ -54,7 +58,8 @@ func (bt batchTotals) clone() batchTotals {
 // into depositCredit only — MaxBatchWithdrawal bounds withdrawals, not inbound deposits — and
 // every codec.L1Withdrawal in its committed ExecutionResult into withdrawalDebit (edge case 12,
 // including refunds) and, when its SourceContract is non-zero, into capTotal too (edge case 13,
-// refunds excluded).
+// refunds excluded). It also raises capLimit to the cap rec's Ctx.Caps answered for that
+// asset when that is higher.
 func (bt batchTotals) apply(rec *applied) {
 	if rec.depositAmount != (codec.U256{}) {
 		t := bt.entry(rec.depositAsset)
@@ -71,21 +76,24 @@ func (bt batchTotals) apply(rec *applied) {
 		t.withdrawalDebit.Add(t.withdrawalDebit, amt)
 		if m.SourceContract != (types.Hash{}) {
 			t.capTotal.Add(t.capTotal, amt)
+			c := rec.caps[w.Asset]
+			if limit := new(big.Int).SetBytes(c[:]); limit.Cmp(t.capLimit) > 0 {
+				t.capLimit = limit
+			}
 		}
 	}
 }
 
 // breach reports whether bt exceeds MaxAssetsPerBatch's distinct-asset footprint, any asset's
-// capTotal exceeds codec.MaxBatchWithdrawal, or any asset's depositCredit or withdrawalDebit no
+// capTotal exceeds its capLimit, or any asset's depositCredit or withdrawalDebit no
 // longer fits a codec.U256 (edge case 15: a 256-bit overflow is treated exactly as a cap
 // breach).
 func (bt batchTotals) breach() bool {
 	if len(bt) > codec.MaxAssetsPerBatch {
 		return true
 	}
-	cap := new(big.Int).SetBytes(codec.MaxBatchWithdrawal[:])
 	for _, t := range bt {
-		if t.capTotal.Cmp(cap) > 0 {
+		if t.capTotal.Cmp(t.capLimit) > 0 {
 			return true
 		}
 		if _, err := codec.U256FromBig(t.depositCredit); err != nil {

@@ -3,6 +3,7 @@ package ipc
 import (
 	"errors"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
+	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 )
 
@@ -159,6 +161,116 @@ func TestClientAnchor(t *testing.T) {
 	})
 }
 
+func TestClientAssignment(t *testing.T) {
+	c, b := readyClient(t)
+	defer b.Close()
+	want := []ledger.AssignmentEntry{
+		{Ordinal: 3, GlobalInputIndex: 10, SourceAccountBlockHash: types.Hash{0x01}, SendMomentumHeight: 7},
+		{Ordinal: 4, GlobalInputIndex: 12, SourceAccountBlockHash: types.Hash{0x02}, SendMomentumHeight: 8},
+	}
+	got := make(chan Message, 1)
+	go func() {
+		got <- recvFrom(t, b, Worker)
+		sendFrom(t, b, Assignment{Entries: want})
+	}()
+	entries, err := c.Assignment(1, 9, types.Hash{0x0A}, 3)
+	if err != nil {
+		t.Fatalf("Assignment: %v", err)
+	}
+	if req, ok := (<-got).(AssignmentRequest); !ok || req != (AssignmentRequest{Height: 9, Hash: types.Hash{0x0A}, NextOrdinal: 3}) {
+		t.Fatalf("supervisor received %+v", req)
+	}
+	if len(entries) != 2 || entries[0] != want[0] || entries[1] != want[1] {
+		t.Fatalf("entries = %+v, want %+v", entries, want)
+	}
+
+	if _, err := c.Assignment(2, 9, types.Hash{}, 0); err == nil || c.Broken() != nil {
+		t.Fatalf("domain 2: err = %v, Broken() = %v; want a plain error", err, c.Broken())
+	}
+	if _, err := c.Assignment(1, 0, types.Hash{}, 0); err == nil || c.Broken() != nil {
+		t.Fatalf("height 0: err = %v, Broken() = %v; want a plain error", err, c.Broken())
+	}
+
+	for _, kind := range []SourceErrorKind{SourceHalted, SourceUnavailable} {
+		go func() {
+			recvFrom(t, b, Worker)
+			sendFrom(t, b, SourceError{Kind: kind, Message: "x"})
+		}()
+		_, err := c.Assignment(1, 9, types.Hash{}, 0)
+		if halted := errors.Is(err, recovery.ErrHalted); err == nil || halted != (kind == SourceHalted) || errors.Is(err, ErrChannel) {
+			t.Fatalf("kind %d: err = %v", kind, err)
+		}
+		if c.Broken() != nil {
+			t.Fatalf("Broken() = %v, want nil", c.Broken())
+		}
+	}
+}
+
+func TestClientCap(t *testing.T) {
+	c, b := readyClient(t)
+	defer b.Close()
+	zrc, qsr := codec.AssetIDFromZTS(types.ZnnTokenStandard), codec.AssetIDFromZTS(types.QsrTokenStandard)
+	assets := []codec.AssetID{zrc, qsr}
+	got := make(chan Message, 1)
+	go func() {
+		got <- recvFrom(t, b, Worker)
+		sendFrom(t, b, Cap{Amounts: []codec.U256{{31: 9}, {31: 10}}})
+	}()
+	amounts, err := c.MaxBatchWithdrawals(1, 9, types.Hash{0x0A}, assets)
+	if want := []codec.U256{{31: 9}, {31: 10}}; err != nil || !reflect.DeepEqual(amounts, want) {
+		t.Fatalf("MaxBatchWithdrawals = %x, %v; want %x", amounts, err, want)
+	}
+	if req, ok := (<-got).(CapRequest); !ok || !reflect.DeepEqual(req, CapRequest{Height: 9, Hash: types.Hash{0x0A}, Assets: assets}) {
+		t.Fatalf("supervisor received %+v", req)
+	}
+
+	plain := map[string]func() error{
+		"domain 2":  func() error { _, err := c.MaxBatchWithdrawals(2, 9, types.Hash{}, assets); return err },
+		"height 0":  func() error { _, err := c.MaxBatchWithdrawals(1, 0, types.Hash{}, assets); return err },
+		"no assets": func() error { _, err := c.MaxBatchWithdrawals(1, 9, types.Hash{}, nil); return err },
+		"17 assets": func() error {
+			_, err := c.MaxBatchWithdrawals(1, 9, types.Hash{}, make([]codec.AssetID, codec.MaxAssetsPerBatch+1))
+			return err
+		},
+	}
+	for name, call := range plain {
+		if err := call(); err == nil || c.Broken() != nil {
+			t.Fatalf("%s: err = %v, Broken() = %v; want a plain error", name, err, c.Broken())
+		}
+	}
+
+	for _, kind := range []SourceErrorKind{SourceHalted, SourceUnavailable} {
+		go func() {
+			recvFrom(t, b, Worker)
+			sendFrom(t, b, SourceError{Kind: kind, Message: "x"})
+		}()
+		_, err := c.MaxBatchWithdrawals(1, 9, types.Hash{}, []codec.AssetID{zrc})
+		if halted := errors.Is(err, recovery.ErrHalted); err == nil || halted != (kind == SourceHalted) || errors.Is(err, ErrChannel) {
+			t.Fatalf("kind %d: err = %v", kind, err)
+		}
+		if c.Broken() != nil {
+			t.Fatalf("Broken() = %v, want nil", c.Broken())
+		}
+	}
+}
+
+func TestClientAssignmentFirstOrdinalPassesThrough(t *testing.T) {
+	c, b := readyClient(t)
+	defer b.Close()
+	want := []ledger.AssignmentEntry{{Ordinal: 4, SendMomentumHeight: 1}, {Ordinal: 5, SendMomentumHeight: 1}}
+	go func() {
+		recvFrom(t, b, Worker)
+		sendFrom(t, b, Assignment{Entries: want})
+	}()
+	entries, err := c.Assignment(1, 9, types.Hash{}, 3)
+	if err != nil || len(entries) != 2 || entries[0] != want[0] || entries[1] != want[1] {
+		t.Fatalf("entries = %+v, err = %v; want %+v", entries, err, want)
+	}
+	if c.Broken() != nil {
+		t.Fatalf("Broken() = %v, want nil", c.Broken())
+	}
+}
+
 func readyClient(t *testing.T) (*Client, net.Conn) {
 	t.Helper()
 	a, b := net.Pipe()
@@ -266,6 +378,45 @@ func TestChannelFailures(t *testing.T) {
 				sendFrom(t, b, Frontier{Height: 1})
 			}()
 			if _, _, err := c.FinalizedAnchor(1); !errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want ErrChannel", err)
+			}
+		}},
+		{"assignment ordinal gap", func(t *testing.T, c *Client, b net.Conn) {
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, Assignment{Entries: []ledger.AssignmentEntry{
+					{Ordinal: 3, SendMomentumHeight: 1},
+					{Ordinal: 5, SendMomentumHeight: 1},
+				}})
+			}()
+			if _, err := c.Assignment(1, 9, types.Hash{}, 3); !errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want ErrChannel", err)
+			}
+		}},
+		{"assignment answered by a frontier", func(t *testing.T, c *Client, b net.Conn) {
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, Frontier{Height: 1})
+			}()
+			if _, err := c.Assignment(1, 9, types.Hash{}, 3); !errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want ErrChannel", err)
+			}
+		}},
+		{"cap answered by a frontier", func(t *testing.T, c *Client, b net.Conn) {
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, Frontier{Height: 1})
+			}()
+			if _, err := c.MaxBatchWithdrawals(1, 9, types.Hash{}, []codec.AssetID{{}}); !errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want ErrChannel", err)
+			}
+		}},
+		{"cap with the wrong amount count", func(t *testing.T, c *Client, b net.Conn) {
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, Cap{Amounts: []codec.U256{{31: 1}, {31: 2}}})
+			}()
+			if _, err := c.MaxBatchWithdrawals(1, 9, types.Hash{}, []codec.AssetID{{}}); !errors.Is(err, ErrChannel) {
 				t.Fatalf("err = %v, want ErrChannel", err)
 			}
 		}},

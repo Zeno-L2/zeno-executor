@@ -22,7 +22,7 @@ conflict.
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
 | `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) and the witnessing `Accessor` a domain's `Apply` reads through. |
 | `internal/codec` | The canonical binary encoding for every consensus-visible structure. |
-| `internal/ledger` | The input pipeline: a `Follower` that reads confirmed momenta from a `MomentumSource`, reconstructs the canonical per-block order, assigns the global input index, and filters to a configured domain via a `SettlementFilter`. |
+| `internal/ledger` | The input pipeline: a `Follower` that reads confirmed momenta from a `MomentumSource`, reconstructs the canonical per-block order, and takes each settlement momentum's inputs for the configured domain from an `AssignmentSource`, which supplies the global input index. |
 | `internal/batch` | The `Driver`: the per-input execution pipeline against a `domain.Domain` and `internal/state.Store`, batch slicing under the §25.1/§27.9 caps, and the self-verified batch commitment and DA bundle. |
 | `internal/recovery` | The on-disk storage layout, atomic cursor persistence, snapshot retention, and the boot-to-ready recovery state machine with reorg rollback and fail-closed halts. |
 | `internal/workerproc` | Starts and supervises one isolated worker process: an explicit environment, descriptors 0 to 3 only, its own session, and, where the host allows it, a dedicated uid and cgroup v2 memory and CPU limits. |

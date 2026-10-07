@@ -89,6 +89,20 @@ type InputContext struct {
 	// SourceData is domain-defined bytes from the source account-block that the domain's
 	// canonical input encoding does not carry (e.g. chunk bytes for a chunked deployment).
 	SourceData []byte
+	// Caps answers this input's withdrawal caps. A domain that emits no L1 withdrawal never calls it.
+	Caps CapLookup
+}
+
+// CapLookup answers the per-asset withdrawal caps step 5a applies to one input (SPEC §27.9):
+// for each asset, the MaxBatchWithdrawal in Settlement state at the end of the momentum
+// confirming the input's receive, for the input's domain. An asset with no AssetConfig has cap
+// 0. The answers are L1 state proven at that fixed momentum, so Apply stays a function of state
+// and its input. An error means the caps could not be read; Apply returns it wrapped with %w and
+// never turns it into a status.
+type CapLookup interface {
+	// MaxBatchWithdrawals returns one cap per asset, in assets order. Step 5a asks once per
+	// input, with every asset the input withdraws.
+	MaxBatchWithdrawals(assets []codec.AssetID) ([]codec.U256, error)
 }
 
 // Domain is the state-transition-function contract every execution domain implements. It is
@@ -109,11 +123,13 @@ type Domain interface {
 	// function only of state and in. No clock, no RNG, no network, no wall clock, no other
 	// process environment.
 	//
-	// Apply's error return means halt the binary, never a consensus outcome: every
-	// deterministic execution outcome, including every failure status, MUST be returned as
-	// Effects with a nil error, since the runtime discards Effects entirely on a non-nil error
-	// and a domain's own failure-path effects (e.g. a refund owed independently of the failure)
-	// would be lost with it.
+	// Apply's error return is never a consensus outcome. An error from in's InputContext.Caps is
+	// returned wrapped with %w, so the runtime can tell a cap-source outage, which restarts the
+	// worker, from a halt; every other error halts the binary. Every deterministic execution
+	// outcome, including every failure status, MUST be returned as Effects with a nil error,
+	// since the runtime discards Effects entirely on a non-nil error and a domain's own
+	// failure-path effects (e.g. a refund owed independently of the failure) would be lost with
+	// it.
 	//
 	// Read-and-write local-store carve-out: Apply MAY read a local content-addressed store,
 	// provided every entry it reads is verified against a hash obtained from state or from the

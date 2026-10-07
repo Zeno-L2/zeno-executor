@@ -2,7 +2,6 @@ package supervisor
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -21,9 +20,10 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
 	"github.com/digitalSloth/go-executor/internal/lease"
+	"github.com/digitalSloth/go-executor/internal/ledger"
+	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 	"github.com/digitalSloth/go-executor/internal/workerproc"
 )
@@ -91,26 +91,6 @@ func addr(b byte) types.Address {
 	return a
 }
 
-func blockHash(h uint64, domainID byte, salt byte) types.Hash {
-	var out types.Hash
-	binary.BigEndian.PutUint64(out[:8], h)
-	out[8], out[9] = domainID, salt
-	return out
-}
-
-func inputData(t *testing.T, h uint64, domainID byte, cmd string) []byte {
-	t.Helper()
-	in := codec.Input{
-		SourceAccountBlockHash: blockHash(h, domainID, 0),
-		Args:                   codec.CallL2Args{TargetContract: types.Hash{domainID}, Payload: []byte(cmd)},
-	}
-	data, err := in.Encode()
-	if err != nil {
-		t.Fatalf("encode input: %v", err)
-	}
-	return data
-}
-
 // buildChain builds n momenta, one domain-1 and one domain-2 block per height, whose payload
 // commands cmd(height, domainID) instructs the test worker.
 func buildChain(t *testing.T, n uint64, cmd func(h uint64, domainID byte) string) []*nom.DetailedMomentum {
@@ -119,8 +99,9 @@ func buildChain(t *testing.T, n uint64, cmd func(h uint64, domainID byte) string
 	for i := uint64(0); i < n; i++ {
 		h := i + 1
 		perHeight[i] = []ipctest.Block{
-			{Address: addr(1), Data: inputData(t, h, 1, cmd(h, 1))},
-			{Address: addr(2), Data: inputData(t, h, 2, cmd(h, 2))},
+			{Address: addr(1), Data: ledgertest.SendData(1, []byte(cmd(h, 1)))},
+			{Address: addr(2), Data: ledgertest.SendData(2, []byte(cmd(h, 2)))},
+			{Address: types.SettlementContract},
 		}
 	}
 	return ipctest.Chain(perHeight)
@@ -151,6 +132,9 @@ func chainSources(chain []*nom.DetailedMomentum, frontier *atomic.Uint64) Source
 			},
 		},
 		Anchors: fakeAnchors{anchor: func(uint32) (recovery.Anchor, bool, error) { return recovery.Anchor{}, false, nil }},
+		Assignments: fakeAssignments{assignment: func(d uint32, h uint64, hash types.Hash, n uint64) ([]ledger.AssignmentEntry, error) {
+			return ledgertest.Assign(chain, d, h, hash, n)
+		}},
 	}
 }
 
@@ -459,27 +443,13 @@ func TestHaltedWorkerIsNotRestarted(t *testing.T) {
 	storage := openTempDir(t)
 	chain := buildChain(t, 4, func(uint64, byte) string { return "" })
 	frontier := newFrontier(4)
-	src := Sources{
-		Momenta: fakeMomenta{
-			frontier: func() (uint64, error) { return frontier.Load(), nil },
-			byHeight: func(h, count uint64) ([]*nom.DetailedMomentum, error) {
-				if h == 0 || h > uint64(len(chain)) {
-					return nil, nil
-				}
-				end := h - 1 + count
-				if end > uint64(len(chain)) {
-					end = uint64(len(chain))
-				}
-				return chain[h-1 : end], nil
-			},
-		},
-		Anchors: fakeAnchors{anchor: func(domainID uint32) (recovery.Anchor, bool, error) {
-			if domainID == 1 {
-				return recovery.Anchor{}, false, fmt.Errorf("%w: test", recovery.ErrHalted)
-			}
-			return recovery.Anchor{}, false, nil
-		}},
-	}
+	src := chainSources(chain, frontier)
+	src.Anchors = fakeAnchors{anchor: func(domainID uint32) (recovery.Anchor, bool, error) {
+		if domainID == 1 {
+			return recovery.Anchor{}, false, fmt.Errorf("%w: test", recovery.ErrHalted)
+		}
+		return recovery.Anchor{}, false, nil
+	}}
 	watcher := workerConfig(3, workerBinary, 1<<30, 1)
 	watcher.Role = "WATCHER"
 	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1), watcher)

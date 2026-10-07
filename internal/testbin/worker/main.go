@@ -8,20 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zenon-network/go-zenon/chain/nom"
-
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/worker"
 )
-
-// byAddress routes a block to the domain named by its address's first byte.
-type byAddress struct{}
-
-func (byAddress) Accept(_ *nom.Momentum, block *nom.AccountBlock) (*ledger.Envelope, error) {
-	return &ledger.Envelope{DomainID: uint32(block.Address[0]), Payload: block.Data}, nil
-}
 
 // testDomain is a minimal, deterministic domain.Domain whose Apply can be told, through its
 // input payload, to allocate memory or sleep. Both are deliberate test side effects: the leaf
@@ -93,5 +83,5 @@ func applyCmd(cmd string) error {
 }
 
 func main() {
-	worker.Main(func(worker.Config) (domain.Domain, error) { return testDomain{}, nil }, byAddress{})
+	worker.Main(func(worker.Config) (domain.Domain, error) { return testDomain{}, nil })
 }

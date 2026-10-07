@@ -25,6 +25,7 @@ type settlement struct {
 	DepositAmount    codec.U256
 	GasBudget        uint64 // the input's plasma_limit, one budget unit per unit
 	State            domain.StateAccess
+	Caps             domain.CapLookup // the input's withdrawal-cap lookup, read by step 5a
 }
 
 // settle maps a completed Outcome onto the §15 status, the gas_used that status defines, the
@@ -122,9 +123,11 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	}
 
 	// Step 5a (§27.9, §10.6): the per-asset withdrawal cap applies to this input's contract
-	// withdrawals, summed per asset. The deposit amount is not counted, so step 5a never limits
-	// a deposit's size; the deposit asset counts toward the asset footprint because every
-	// deposit adds a depositCredit to the batch's AssetFlowSummary.
+	// withdrawals, summed per asset. The caps are the input's Caps answers, read in one call
+	// after the footprint check (Settlement's MaxBatchWithdrawal at the momentum confirming the
+	// receive, 0 for an asset with no AssetConfig). The deposit amount is not counted, so step
+	// 5a never limits a deposit's size; the deposit asset counts toward the asset footprint
+	// because every deposit adds a depositCredit to the batch's AssetFlowSummary.
 	totals := map[codec.AssetID]*big.Int{}
 	for _, m := range eff.Outbox {
 		w, ok := m.Target.(codec.L1Withdrawal)
@@ -145,10 +148,23 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	if footprint > codec.MaxAssetsPerBatch {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
-	cap := new(big.Int).SetBytes(codec.MaxBatchWithdrawal[:])
-	for _, total := range totals {
-		if total.Cmp(cap) > 0 {
-			return s.fail(codec.StatusRuntimeFault, metered), nil
+	assets := make([]codec.AssetID, 0, len(totals))
+	for a := range totals {
+		assets = append(assets, a)
+	}
+	sort.Slice(assets, func(i, j int) bool { return bytes.Compare(assets[i][:], assets[j][:]) < 0 })
+	if len(assets) > 0 {
+		if s.Caps == nil {
+			return domain.Effects{}, fmt.Errorf("wasm: step 5a: input %d withdraws with no cap lookup", s.GlobalInputIndex)
+		}
+		caps, err := s.Caps.MaxBatchWithdrawals(assets)
+		if err != nil {
+			return domain.Effects{}, fmt.Errorf("wasm: step 5a: withdrawal caps: %w", err)
+		}
+		for i, a := range assets {
+			if totals[a].Cmp(new(big.Int).SetBytes(caps[i][:])) > 0 {
+				return s.fail(codec.StatusRuntimeFault, metered), nil
+			}
 		}
 	}
 

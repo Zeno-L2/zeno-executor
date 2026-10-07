@@ -190,8 +190,29 @@ func unsupportedPayload(kind byte, src types.Hash) []byte {
 	return b
 }
 
+// capFunc is a domain.CapLookup backed by a function.
+type capFunc func(codec.AssetID) (codec.U256, error)
+
+func (f capFunc) MaxBatchWithdrawals(assets []codec.AssetID) ([]codec.U256, error) {
+	out := make([]codec.U256, len(assets))
+	for i, a := range assets {
+		v, err := f(a)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
+// allCaps answers v for every asset.
+func allCaps(v codec.U256) capFunc {
+	return func(codec.AssetID) (codec.U256, error) { return v, nil }
+}
+
+// ledgerInput's cap is 2^255 for every asset, the cap the driver tests were written against.
 func ledgerInput(idx uint64, payload []byte) ledger.Input {
-	return ledger.Input{Ctx: domain.InputContext{GlobalInputIndex: idx}, Payload: payload}
+	return ledger.Input{Ctx: domain.InputContext{GlobalInputIndex: idx, Caps: allCaps(codec.U256{0x80})}, Payload: payload}
 }
 
 // withdrawalEffects is a SUCCESS Effects carrying one contract-emitted L1Withdrawal.
@@ -588,9 +609,8 @@ func TestDriverCapCloseAndCarry(t *testing.T) {
 	})
 
 	t.Run("LoneInputDepositNearCapU256Invariant", func(t *testing.T) {
-		// A lone input's withdrawalDebit is at most MaxBatchWithdrawal + deposit <= 2^255 +
-		// (2^255 - 1) = 2^256 - 1 (codec/constants.go's u256 invariant): breach() must never
-		// reject this input for overflow.
+		// A lone input's withdrawalDebit is at most its cap plus its deposit, here 2^255 +
+		// (2^255 - 1) = 2^256 - 1: breach() must never reject this input for overflow.
 		contractID := hashN(2)
 		src := hashN(1)
 		asset := assetN(1)
@@ -1002,6 +1022,147 @@ func TestDriverReleasesAccessor(t *testing.T) {
 		}
 		if _, _, err := dom.accs[0].Read(pathN(1)); !errors.Is(err, state.ErrAccessorReleased) {
 			t.Fatalf("accs[0].Read after NextBatch: err = %v, want ErrAccessorReleased", err)
+		}
+	})
+}
+
+// --- withdrawal caps ---
+
+func TestDriverHighestPerInputCap(t *testing.T) {
+	contractID := hashN(2)
+	src := hashN(1)
+	asset := assetN(1)
+
+	// run feeds one withdrawal per input, each input carrying its own cap for asset.
+	run := func(t *testing.T, caps, amounts []uint64) *Driver {
+		t.Helper()
+		inputs := make([]ledger.Input, len(caps))
+		steps := make([]fakeStep, len(caps))
+		for i := range caps {
+			inputs[i] = ledgerInput(uint64(i), callPayload(t, src, contractID, codec.AssetID{}, codec.U256{}))
+			inputs[i].Ctx.Caps = allCaps(u256N(caps[i]))
+			steps[i] = fakeStep{effects: withdrawalEffects(contractID, uint64(i), asset, u256N(amounts[i]))}
+		}
+		cfg := testConfig(t, &fakeDomain{steps: steps}, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return d
+	}
+
+	t.Run("HigherCapFirst", func(t *testing.T) {
+		d := run(t, []uint64{150, 100}, []uint64{60, 60})
+		b, ok, err := d.NextBatch()
+		if err != nil || !ok || len(b.Receipts) != 2 {
+			t.Fatalf("NextBatch: ok=%v err=%v receipts=%d, want one batch of 2", ok, err, len(b.Receipts))
+		}
+	})
+
+	t.Run("HigherCapSecond", func(t *testing.T) {
+		d := run(t, []uint64{100, 150}, []uint64{60, 60})
+		b, ok, err := d.NextBatch()
+		if err != nil || !ok || len(b.Receipts) != 2 {
+			t.Fatalf("NextBatch: ok=%v err=%v receipts=%d, want one batch of 2", ok, err, len(b.Receipts))
+		}
+	})
+
+	t.Run("AboveHighestCloses", func(t *testing.T) {
+		d := run(t, []uint64{100, 150}, []uint64{60, 100})
+		b1, ok, err := d.NextBatch()
+		if err != nil || !ok || len(b1.Receipts) != 1 {
+			t.Fatalf("batch1: ok=%v err=%v receipts=%d, want 1", ok, err, len(b1.Receipts))
+		}
+		b2, ok, err := d.NextBatch()
+		if err != nil || !ok || b2.Commitment.FirstInputSeq != 1 {
+			t.Fatalf("batch2: ok=%v err=%v FirstInputSeq=%d, want 1", ok, err, b2.Commitment.FirstInputSeq)
+		}
+	})
+
+	t.Run("UnconfiguredZeroAmount", func(t *testing.T) {
+		d := run(t, []uint64{0}, []uint64{0})
+		b, ok, err := d.NextBatch()
+		if err != nil || !ok || len(b.Receipts) != 1 {
+			t.Fatalf("NextBatch: ok=%v err=%v receipts=%d, want 1", ok, err, len(b.Receipts))
+		}
+		for _, e := range b.Commitment.AssetFlowSummary {
+			if e.Asset == asset {
+				t.Fatalf("AssetFlowSummary has an entry for asset %x, want none", asset)
+			}
+		}
+	})
+}
+
+func TestDriverCapsPerAsset(t *testing.T) {
+	contractID := hashN(2)
+	src := hashN(1)
+	caps := capFunc(func(a codec.AssetID) (codec.U256, error) {
+		if a == assetN(2) {
+			return u256N(50), nil
+		}
+		return u256N(100), nil
+	})
+
+	inputs := make([]ledger.Input, 2)
+	for i := range inputs {
+		inputs[i] = ledgerInput(uint64(i), callPayload(t, src, contractID, codec.AssetID{}, codec.U256{}))
+		inputs[i].Ctx.Caps = caps
+	}
+	steps := []fakeStep{
+		{effects: manyWithdrawalsEffects(contractID, 0, []codec.AssetID{assetN(1), assetN(2)}, u256N(40))},
+		{effects: withdrawalEffects(contractID, 1, assetN(2), u256N(20))},
+	}
+	d, err := New(testConfig(t, &fakeDomain{steps: steps}, &fakeInputSource{inputs: inputs}, newFakeBundleStore()))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	b1, ok, err := d.NextBatch()
+	if err != nil || !ok || len(b1.Receipts) != 1 {
+		t.Fatalf("batch1: ok=%v err=%v receipts=%d, want 1", ok, err, len(b1.Receipts))
+	}
+	b2, ok, err := d.NextBatch()
+	if err != nil || !ok || b2.Commitment.FirstInputSeq != 1 {
+		t.Fatalf("batch2: ok=%v err=%v FirstInputSeq=%d, want 1", ok, err, b2.Commitment.FirstInputSeq)
+	}
+}
+
+func TestDriverCapLookup(t *testing.T) {
+	contractID := hashN(2)
+	src := hashN(1)
+	errCap := errors.New("cap source down")
+
+	next := func(t *testing.T, caps domain.CapLookup, eff domain.Effects) (Batch, bool, error) {
+		t.Helper()
+		in := ledgerInput(0, callPayload(t, src, contractID, codec.AssetID{}, codec.U256{}))
+		in.Ctx.Caps = caps
+		cfg := testConfig(t, &fakeDomain{steps: []fakeStep{{effects: eff}}}, &fakeInputSource{inputs: []ledger.Input{in}}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return d.NextBatch()
+	}
+
+	t.Run("LookupError", func(t *testing.T) {
+		_, ok, err := next(t, capFunc(func(codec.AssetID) (codec.U256, error) { return codec.U256{}, errCap }),
+			withdrawalEffects(contractID, 0, assetN(1), u256N(1)))
+		if ok || !errors.Is(err, errCap) {
+			t.Fatalf("ok=%v err=%v, want false and errCap", ok, err)
+		}
+	})
+
+	t.Run("NilCapsWithContractWithdrawal", func(t *testing.T) {
+		_, ok, err := next(t, nil, withdrawalEffects(contractID, 0, assetN(1), u256N(1)))
+		if ok || err == nil {
+			t.Fatalf("ok=%v err=%v, want false and an error", ok, err)
+		}
+	})
+
+	t.Run("RefundNeedsNoCap", func(t *testing.T) {
+		b, ok, err := next(t, nil, refundEffects(0, assetN(1), u256N(1)))
+		if err != nil || !ok || len(b.Receipts) != 1 {
+			t.Fatalf("ok=%v err=%v receipts=%d, want a batch of 1", ok, err, len(b.Receipts))
 		}
 	})
 }

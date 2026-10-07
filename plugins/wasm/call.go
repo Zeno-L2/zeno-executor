@@ -81,6 +81,7 @@ func (p *Plugin) applyCall(state domain.StateAccess, ctx domain.InputContext, ar
 		DepositAmount:    args.DepositAmount,
 		GasBudget:        gasBudget,
 		State:            state,
+		Caps:             ctx.Caps,
 	}
 
 	// §18.2: no code hash ⇒ no deployed target, full refund, gas_used = 0.

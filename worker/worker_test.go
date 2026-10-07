@@ -19,6 +19,7 @@ import (
 	"github.com/digitalSloth/go-executor/internal/ipc"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
 	"github.com/digitalSloth/go-executor/internal/ledger"
+	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 	"github.com/digitalSloth/go-executor/runtime"
 )
@@ -56,39 +57,10 @@ func (payloadDomain) Apply(_ domain.StateAccess, in domain.Input) (domain.Effect
 
 func testNewPlugin(ipc.WorkerConfig) (domain.Domain, error) { return payloadDomain{}, nil }
 
-// byAddress routes a block to the domain named by its address's first byte (runtime/runtime_test.go:181-185).
-type byAddress struct{}
-
-func (byAddress) Accept(_ *nom.Momentum, block *nom.AccountBlock) (*ledger.Envelope, error) {
-	return &ledger.Envelope{DomainID: uint32(block.Address[0]), Payload: block.Data}, nil
-}
-
 func addr(b byte) types.Address {
 	var a types.Address
 	a[0] = b
 	return a
-}
-
-func blockHash(h uint64, domainID byte, idx int) types.Hash {
-	var out types.Hash
-	binary.BigEndian.PutUint64(out[:8], h)
-	out[8], out[9] = domainID, byte(idx)
-	return out
-}
-
-// inputData builds a distinct, valid codec.Input encoding, as buildShape does
-// (runtime/runtime_test.go:146-154).
-func inputData(t *testing.T, h uint64, domainID byte, idx int) []byte {
-	t.Helper()
-	in := codec.Input{
-		SourceAccountBlockHash: blockHash(h, domainID, idx),
-		Args:                   codec.CallL2Args{TargetContract: types.Hash{domainID}},
-	}
-	data, err := in.Encode()
-	if err != nil {
-		t.Fatalf("encode input: %v", err)
-	}
-	return data
 }
 
 // buildChain builds n momenta; d1At(h) domain-1 blocks and one domain-2 block per height.
@@ -99,9 +71,10 @@ func buildChain(t *testing.T, n uint64, d1At func(h uint64) int) []*nom.Detailed
 		h := i + 1
 		var blocks []ipctest.Block
 		for j := 0; j < d1At(h); j++ {
-			blocks = append(blocks, ipctest.Block{Address: addr(1), Data: inputData(t, h, 1, j)})
+			blocks = append(blocks, ipctest.Block{Address: addr(1), Data: ledgertest.SendData(1, nil)})
 		}
-		blocks = append(blocks, ipctest.Block{Address: addr(2), Data: inputData(t, h, 2, 0)})
+		blocks = append(blocks, ipctest.Block{Address: addr(2), Data: ledgertest.SendData(2, nil)})
+		blocks = append(blocks, ipctest.Block{Address: types.SettlementContract})
 		perHeight[i] = blocks
 	}
 	return ipctest.Chain(perHeight)
@@ -150,6 +123,8 @@ type fakeSupervisor struct {
 	chain    []*nom.DetailedMomentum
 	frontier func(recovery.Position, bool) uint64
 	anchor   func() ipc.Message
+	// assign, when set, rewrites each assignment reply's entries before it is sent.
+	assign func(req ipc.AssignmentRequest, entries []ledger.AssignmentEntry) []ledger.AssignmentEntry
 
 	mu        sync.Mutex
 	requests  []ipc.MomentaRequest
@@ -207,6 +182,22 @@ func (f *fakeSupervisor) run() {
 				n++
 			}
 			if err := ipc.WriteMessage(f.conn, ipc.RangeEnd{Count: n}); err != nil {
+				return
+			}
+		case ipc.AssignmentRequest:
+			entries, err := ledgertest.Assign(f.chain, f.cfg.DomainID, v.Height, v.Hash, v.NextOrdinal)
+			if f.assign != nil {
+				entries = f.assign(v, entries)
+			}
+			var reply ipc.Message = ipc.Assignment{Entries: entries}
+			if err != nil {
+				kind := ipc.SourceUnavailable
+				if errors.Is(err, recovery.ErrHalted) {
+					kind = ipc.SourceHalted
+				}
+				reply = ipc.SourceError{Kind: kind, Message: err.Error()}
+			}
+			if err := ipc.WriteMessage(f.conn, reply); err != nil {
 				return
 			}
 		case ipc.AnchorRequest:
@@ -268,6 +259,10 @@ func (s memSource) DetailedMomentumsByHeight(height, count uint64) ([]*nom.Detai
 	return s.chain[start:end], nil
 }
 
+func (s memSource) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	return ledgertest.Assign(s.chain, domainID, height, hash, nextOrdinal)
+}
+
 type noAnchor struct{}
 
 func (noAnchor) FinalizedAnchor(uint32) (recovery.Anchor, bool, error) {
@@ -301,7 +296,7 @@ func TestStatuses(t *testing.T) {
 		fake.anchor = func() ipc.Message { return ipc.SourceError{Kind: ipc.SourceHalted, Message: "down"} }
 		go fake.run()
 
-		status := run(context.Background(), a, testNewPlugin, byAddress{})
+		status := run(context.Background(), a, testNewPlugin)
 		if status != ipc.ExitHalted {
 			t.Fatalf("status = %d, want %d", status, ipc.ExitHalted)
 		}
@@ -316,7 +311,7 @@ func TestStatuses(t *testing.T) {
 		fake.anchor = func() ipc.Message { return ipc.SourceError{Kind: ipc.SourceUnavailable, Message: "down"} }
 		go fake.run()
 
-		status := run(context.Background(), a, testNewPlugin, byAddress{})
+		status := run(context.Background(), a, testNewPlugin)
 		if status != ipc.ExitTempFail {
 			t.Fatalf("status = %d, want %d", status, ipc.ExitTempFail)
 		}
@@ -331,7 +326,7 @@ func TestStatuses(t *testing.T) {
 			b.Write([]byte{0, 0, 0, 5, 0x01, 0, 0, 0, 0})
 			b.Close()
 		}()
-		status := run(context.Background(), a, testNewPlugin, byAddress{})
+		status := run(context.Background(), a, testNewPlugin)
 		if status != ipc.ExitConfig {
 			t.Fatalf("status = %d, want %d", status, ipc.ExitConfig)
 		}
@@ -344,7 +339,7 @@ func TestStatuses(t *testing.T) {
 			ipc.WriteMessage(b, ipc.Frontier{Height: 1})
 			b.Close()
 		}()
-		status := run(context.Background(), a, testNewPlugin, byAddress{})
+		status := run(context.Background(), a, testNewPlugin)
 		if status != ipc.ExitConfig {
 			t.Fatalf("status = %d, want %d", status, ipc.ExitConfig)
 		}
@@ -360,7 +355,7 @@ func TestStatuses(t *testing.T) {
 			ipc.WriteMessage(b, cfg)
 			b.Close()
 		}()
-		status := run(context.Background(), a, testNewPlugin, byAddress{})
+		status := run(context.Background(), a, testNewPlugin)
 		if status != ipc.ExitConfig {
 			t.Fatalf("status = %d, want %d", status, ipc.ExitConfig)
 		}
@@ -376,7 +371,7 @@ func TestStatuses(t *testing.T) {
 			b.Close()
 		}()
 		failingPlugin := func(ipc.WorkerConfig) (domain.Domain, error) { return nil, errors.New("boom") }
-		status := run(context.Background(), a, failingPlugin, byAddress{})
+		status := run(context.Background(), a, failingPlugin)
 		if status != ipc.ExitConfig {
 			t.Fatalf("status = %d, want %d", status, ipc.ExitConfig)
 		}
@@ -392,11 +387,65 @@ func TestStatuses(t *testing.T) {
 			ipc.ReadMessage(b, ipc.Worker) // the first request (AnchorRequest, at FIND_RECOVERY_ANCHOR)
 			b.Close()
 		}()
-		status := run(context.Background(), a, testNewPlugin, byAddress{})
+		status := run(context.Background(), a, testNewPlugin)
 		if status != 1 {
 			t.Fatalf("status = %d, want 1", status)
 		}
 	})
+}
+
+// A first assignment entry off the worker's next ordinal is a consistency fault: the worker
+// halts and the channel stays healthy.
+func TestAssignmentFirstOrdinalMismatchHalts(t *testing.T) {
+	shift := func(entries []ledger.AssignmentEntry, delta int) []ledger.AssignmentEntry {
+		out := append([]ledger.AssignmentEntry(nil), entries...)
+		for i := range out {
+			out[i].Ordinal = uint64(int64(out[i].Ordinal) + int64(delta))
+		}
+		return out
+	}
+	cases := []struct {
+		name   string
+		assign func(ipc.AssignmentRequest, []ledger.AssignmentEntry) []ledger.AssignmentEntry
+	}{
+		{"ahead", func(_ ipc.AssignmentRequest, e []ledger.AssignmentEntry) []ledger.AssignmentEntry {
+			return shift(e, 1)
+		}},
+		{"behind", func(r ipc.AssignmentRequest, e []ledger.AssignmentEntry) []ledger.AssignmentEntry {
+			if r.NextOrdinal == 0 {
+				return e
+			}
+			return shift(e, -1)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validWorkerConfig(t.TempDir())
+			a, b := net.Pipe()
+			defer a.Close()
+			fake := newFake(t, b, cfg, buildChain(t, 12, dense), fixedFrontier(12))
+			fake.assign = tc.assign
+			go fake.run()
+
+			statusCh := make(chan int, 1)
+			go func() { statusCh <- run(context.Background(), a, testNewPlugin) }()
+			select {
+			case status := <-statusCh:
+				if status != ipc.ExitHalted {
+					t.Fatalf("status = %d, want %d", status, ipc.ExitHalted)
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatalf("run did not return")
+			}
+			select {
+			case <-fake.done:
+				t.Fatalf("the channel closed: the fault was reported as a channel failure")
+			default:
+			}
+			a.Close()
+			<-fake.done
+		})
+	}
 }
 
 // --- exitStatus table ---
@@ -441,7 +490,7 @@ func TestStagedFrontierCommitsThreeBatches(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	statusCh := make(chan int, 1)
-	go func() { statusCh <- run(ctx, a, testNewPlugin, byAddress{}) }()
+	go func() { statusCh <- run(ctx, a, testNewPlugin) }()
 
 	layout, err := recovery.NewLayout(storagePath, cfg.DomainID)
 	if err != nil {
@@ -496,7 +545,7 @@ func TestEquivalence(t *testing.T) {
 	go fakeA.run()
 	ctxA, cancelA := context.WithCancel(context.Background())
 	statusA := make(chan int, 1)
-	go func() { statusA <- run(ctxA, aConn, testNewPlugin, byAddress{}) }()
+	go func() { statusA <- run(ctxA, aConn, testNewPlugin) }()
 	waitForHeight(t, layout, 4, 15*time.Second)
 	cancelA()
 	if got := <-statusA; got != 0 {
@@ -512,7 +561,7 @@ func TestEquivalence(t *testing.T) {
 	go fakeB.run()
 	ctxB, cancelB := context.WithCancel(context.Background())
 	statusB := make(chan int, 1)
-	go func() { statusB <- run(ctxB, bConn, testNewPlugin, byAddress{}) }()
+	go func() { statusB <- run(ctxB, bConn, testNewPlugin) }()
 	waitForHeight(t, layout, 10, 15*time.Second)
 	cancelB()
 	if got := <-statusB; got != 0 {
@@ -556,7 +605,8 @@ func TestEquivalence(t *testing.T) {
 		STFSpecHash:       cfg.STFSpecHash,
 		ConfirmationDepth: cfg.ConfirmationDepth,
 		Momenta:           refSrc,
-		Filter:            byAddress{},
+		Assignments:       refSrc,
+		Caps:              ledgertest.Caps{},
 		Anchors:           noAnchor{},
 		Retry:             retry,
 	}

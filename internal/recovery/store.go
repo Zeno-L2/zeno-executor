@@ -121,11 +121,11 @@ type Position struct {
 	// is empty under a live cursor, or which a crash left unanchored, still has an exact entry to
 	// check against, and a Rollback can write a one-entry window without reading the source.
 	MomentumHash types.Hash `json:"momentumHash"`
-	// NextGlobalIndex is the globalInputIndex the first accepted block above MomentumHeight
-	// takes. It is not derivable from LastInputSeq: accepted blocks of other domains consume
-	// indices this domain never sees.
-	NextGlobalIndex uint64 `json:"nextGlobalIndex"`
-	NextBatchID     uint64 `json:"nextBatchId"`
+	// NextOrdinal is the domain ordinal Settlement assigns to this domain's first input above
+	// MomentumHeight: the ordinal the next assignment must start at. It is not derivable from
+	// LastInputSeq: inputs of other domains consume global indices this domain never sees.
+	NextOrdinal uint64 `json:"nextOrdinal"`
+	NextBatchID uint64 `json:"nextBatchId"`
 }
 
 // ReadCursor returns the committed position. ok is false when no position has been committed.

@@ -21,6 +21,14 @@ import (
 // blocking a worker request forever.
 const requestTimeout = 30 * time.Second
 
+// maxResponseBody bounds one JSON-RPC response body, so a node cannot make the client buffer an
+// unbounded response.
+const maxResponseBody = 32 << 20
+
+// ErrResponseTooLarge reports a response body over 32 MiB. Like every client error it is plain:
+// the caller retries, or asks for fewer momenta.
+var ErrResponseTooLarge = errors.New("znnd: response body exceeds 32 MiB")
+
 // Client talks to one znnd node. It is safe for concurrent use.
 type Client struct {
 	endpoint string
@@ -74,9 +82,12 @@ func (c *Client) call(method string, params ...any) (json.RawMessage, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("znnd: %s: HTTP status %d", method, resp.StatusCode)
 	}
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("znnd: %s: read response: %w", method, err)
+	}
+	if len(raw) > maxResponseBody {
+		return nil, fmt.Errorf("znnd: %s: %w", method, ErrResponseTooLarge)
 	}
 	var r rpcResponse
 	if err := json.Unmarshal(raw, &r); err != nil {
@@ -86,7 +97,7 @@ func (c *Client) call(method string, params ...any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("znnd: %s: response id %d does not match request id %d", method, r.ID, id)
 	}
 	if r.Error != nil {
-		return nil, fmt.Errorf("znnd: %s: rpc error %d: %s", method, r.Error.Code, r.Error.Message)
+		return nil, fmt.Errorf("znnd: %s: rpc error %d: %q", method, r.Error.Code, r.Error.Message)
 	}
 	if string(r.Result) == "null" {
 		return nil, nil
@@ -183,4 +194,30 @@ func (c *Client) FrontierAccountBlock(addr types.Address) (*nom.AccountBlock, er
 		return nil, fmt.Errorf("znnd: ledger.getFrontierAccountBlock: decode result: %w", err)
 	}
 	return b, nil
+}
+
+// ConfirmationHeight returns the height of the momentum that confirms the account block
+// hashed hash (ledger.getAccountBlockByHash). ok is false when the node has no such block or
+// reports it unconfirmed.
+func (c *Client) ConfirmationHeight(hash types.Hash) (height uint64, ok bool, err error) {
+	raw, err := c.call("ledger.getAccountBlockByHash", hash)
+	if err != nil || raw == nil {
+		return 0, false, err
+	}
+	var b struct {
+		Hash               types.Hash `json:"hash"`
+		ConfirmationDetail *struct {
+			MomentumHeight uint64 `json:"momentumHeight"`
+		} `json:"confirmationDetail"`
+	}
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return 0, false, fmt.Errorf("znnd: ledger.getAccountBlockByHash: decode result: %w", err)
+	}
+	if b.Hash != hash {
+		return 0, false, fmt.Errorf("znnd: ledger.getAccountBlockByHash: node returned block %s for %s", b.Hash, hash)
+	}
+	if b.ConfirmationDetail == nil {
+		return 0, false, nil
+	}
+	return b.ConfirmationDetail.MomentumHeight, true, nil
 }

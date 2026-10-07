@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 
 	"github.com/zenon-network/go-zenon/chain/nom"
@@ -44,19 +43,16 @@ type Config struct {
 	// StartHeight is the first momentum height to read. Momentum heights are 1-based, so it
 	// MUST be at least 1.
 	StartHeight uint64
-	// StartGlobalIndex is the globalInputIndex the Follower assigns to the first block it
-	// accepts at StartHeight. It is 0 for a fresh stream.
+	// StartOrdinal is the domain ordinal of the first input Settlement admits for DomainID
+	// at or above StartHeight: the next expected ordinal (SPEC §4.6). It is 0 for a fresh
+	// stream.
 	//
-	// Resume is expressed at momentum granularity only: the caller sets StartHeight to the
-	// height of the momentum containing the resume point and StartGlobalIndex to the index of
-	// that momentum's first accepted block — not to the index it wants emitted first. A batch
-	// boundary MAY fall between two inputs of one momentum (SPEC §4.6), so a resumed follower
-	// can re-emit inputs the caller has already committed, and re-walks every account-block of
-	// the momentum at StartHeight. The Follower does not detect or reconcile that, and does not
-	// validate the two fields against each other: dropping inputs at or below the committed
-	// cursor belongs to the caller's checkpoint/resume logic, which this package does not
-	// implement.
-	StartGlobalIndex uint64
+	// Resume is momentum-granular: StartHeight is the momentum after the resume point and
+	// StartOrdinal is that Checkpoint's NextOrdinal. A batch boundary MAY fall inside a
+	// momentum (SPEC §4.6), so a resumed follower can re-emit inputs the caller has already
+	// committed. The Follower does not detect or reconcile that: dropping them belongs to the
+	// caller's checkpoint/resume logic.
+	StartOrdinal uint64
 	// MaxBufferedInputs bounds how many inputs one refill buffers. Once the buffer holds at
 	// least this many, refill stops processing the current ranged read at that momentum
 	// boundary and discards the rest of the read; the next refill reads those momenta again.
@@ -65,7 +61,13 @@ type Config struct {
 	// means unbounded: a refill buffers a whole ranged read.
 	MaxBufferedInputs int
 	Source            MomentumSource
-	Filter            SettlementFilter
+	// Assignments answers Settlement's assignment for every momentum whose content lists a
+	// SettlementContract block.
+	Assignments AssignmentSource
+	// Caps answers Settlement's withdrawal caps. When set, every emitted input's Ctx.Caps is a
+	// lookup bound to DomainID and the momentum whose assignment emitted it, shared and memoised
+	// across that momentum's inputs. Nil leaves Ctx.Caps nil.
+	Caps CapSource
 }
 
 // Input is one canonical input for the configured domain: the opaque payload plus the L1
@@ -75,8 +77,8 @@ type Input struct {
 	Payload []byte
 }
 
-// Follower reconstructs the canonical global input stream from confirmed momenta and emits
-// the configured domain's subsequence.
+// Follower reads confirmed momenta and emits the configured domain's inputs as Settlement
+// assigned them.
 type Follower struct {
 	cfg Config
 
@@ -90,7 +92,7 @@ type Follower struct {
 
 	buf []Input
 
-	counter indexCounter
+	nextOrdinal uint64
 
 	cursor    uint64
 	cursorSet bool
@@ -100,13 +102,13 @@ type Follower struct {
 }
 
 // New validates cfg and returns a Follower seeded to start at cfg.StartHeight /
-// cfg.StartGlobalIndex.
+// cfg.StartOrdinal.
 func New(cfg Config) (*Follower, error) {
 	if cfg.Source == nil {
 		return nil, errors.New("ledger: Config.Source is nil")
 	}
-	if cfg.Filter == nil {
-		return nil, errors.New("ledger: Config.Filter is nil")
+	if cfg.Assignments == nil {
+		return nil, errors.New("ledger: Config.Assignments is nil")
 	}
 	if cfg.ConfirmationDepth == 0 {
 		return nil, errors.New("ledger: Config.ConfirmationDepth must be at least 1")
@@ -116,9 +118,9 @@ func New(cfg Config) (*Follower, error) {
 	}
 
 	return &Follower{
-		cfg:        cfg,
-		nextHeight: cfg.StartHeight,
-		counter:    indexCounter{next: cfg.StartGlobalIndex},
+		cfg:         cfg,
+		nextHeight:  cfg.StartHeight,
+		nextOrdinal: cfg.StartOrdinal,
 	}, nil
 }
 
@@ -130,11 +132,17 @@ func New(cfg Config) (*Follower, error) {
 // nil error the caller waits and calls again.
 //
 // Errors fall into three classes. A *ReorgError is returned once and then re-derived from a
-// fresh read on the following call. An error from a momentum-processing failure — validation,
-// the link check, Accept, or index overflow — is permanent: the Follower latches it and every
-// later Next returns that same error without reading further. An error from a MomentumSource
-// read call itself is wrapped and returned as-is, matching ErrSourceRead: it is not latched and
-// nothing is advanced, so the caller may retry by calling Next again.
+// fresh read on the following call. A fault is permanent: validation, the link check, or an
+// assignment fault (matching ErrAssignmentFault) is latched, and every later Next returns that
+// same error without reading further. A read failure matches ErrSourceRead: it is not latched
+// and nothing is advanced, so the caller may retry by calling Next again. A read failure is
+// returned only with nothing buffered.
+//
+// An AssignmentSource error is a read failure that keeps its cause wrapped, so a cause wrapping
+// recovery.ErrHalted is a fault the caller halts on. A send below the RecentMomenta window is
+// reached through a hash-linked walk up to the oldest momentum this Follower holds, and one walk
+// serves every send of the same ranged read: a walk that does not link is a read failure, and a
+// send missing from the momentum its entry names is a fault.
 func (f *Follower) Next() (Input, bool, error) {
 	if in, ok := f.pop(); ok {
 		return in, true, nil
@@ -168,14 +176,11 @@ func (f *Follower) pop() (Input, bool) {
 	return in, true
 }
 
-// drainTerminal implements steps 2-3 of Next against an empty buffer: the two permanent
-// latches, checked in fixed order, then the one-shot pending reorg.
+// drainTerminal implements steps 2-3 of Next against an empty buffer: the permanent latch,
+// then the one-shot pending reorg.
 func (f *Follower) drainTerminal() (Input, bool, error, bool) {
 	if f.halted != nil {
 		return Input{}, false, f.halted, true
-	}
-	if f.counter.exhausted {
-		return Input{}, false, ErrIndexOverflow, true
 	}
 	if f.pendingReorg != nil {
 		re := f.pendingReorg
@@ -210,12 +215,12 @@ func (f *Follower) RecentMomenta() []ConsumedMomentum {
 }
 
 // Checkpoint is a resume point: a Follower built with StartHeight = Height+1 and
-// StartGlobalIndex = NextGlobalIndex continues this Follower's stream exactly, re-emitting
-// nothing and skipping nothing.
+// StartOrdinal = NextOrdinal continues this Follower's stream exactly, re-emitting nothing and
+// skipping nothing.
 type Checkpoint struct {
-	Height          uint64
-	Hash            types.Hash
-	NextGlobalIndex uint64
+	Height      uint64
+	Hash        types.Hash
+	NextOrdinal uint64
 }
 
 // Checkpoint reports the last momentum boundary this Follower has fully delivered. ok is false
@@ -225,12 +230,13 @@ func (f *Follower) Checkpoint() (Checkpoint, bool) {
 	if !f.haveLast || len(f.buf) != 0 {
 		return Checkpoint{}, false
 	}
-	return Checkpoint{Height: f.lastHeight, Hash: f.lastHash, NextGlobalIndex: f.counter.next}, true
+	return Checkpoint{Height: f.lastHeight, Hash: f.lastHash, NextOrdinal: f.nextOrdinal}, true
 }
 
-// ErrSourceRead reports that a MomentumSource read call failed. It is the machine-readable form
-// of the unlatched error class Next documents: nothing advanced and nothing latched, so the
-// caller may retry, which EXECUTOR §15 requires for an unavailable znnd.
+// ErrSourceRead reports that a MomentumSource or AssignmentSource read failed, or that the
+// source could not back an entry's send momentum. It is the machine-readable form of the
+// unlatched error class Next documents: nothing advanced and nothing latched, so the caller
+// may retry, which EXECUTOR §15 requires for an unavailable znnd.
 var ErrSourceRead = errors.New("ledger: momentum source read")
 
 // ReorgError reports that the ledger no longer extends the last momentum this follower
@@ -249,35 +255,10 @@ func (e *ReorgError) Error() string {
 	return fmt.Sprintf("ledger: reorg at height %d: want %s, got %s", e.Height, e.Want, e.Got)
 }
 
-// ErrIndexOverflow reports that globalInputIndex has reached 2^64-1; admission halts rather
-// than wrapping (SPEC §4.5). It is permanent: once returned, every later Next returns it.
-var ErrIndexOverflow = errors.New("ledger: globalInputIndex exhausted")
-
-// indexCounter keeps assignment testable alone and makes per-momentum atomicity a struct copy.
-type indexCounter struct {
-	next      uint64
-	exhausted bool
-}
-
-// assign returns the next globalInputIndex and advances, or fails permanently once 2^64-1 has
-// been assigned.
-func (c *indexCounter) assign() (uint64, error) {
-	if c.exhausted {
-		return 0, ErrIndexOverflow
-	}
-	v := c.next
-	if v == math.MaxUint64 {
-		c.exhausted = true
-	} else {
-		c.next++
-	}
-	return v, nil
-}
-
 // refill reads further confirmed momenta into buf until it has an input, hits the confirmed
-// ceiling, or stops on a reorg or a momentum-processing failure. A MomentumSource read error is
-// returned directly, wrapped, with nothing advanced or latched; every other outcome is recorded
-// into pendingReorg/halted/counter and refill returns nil.
+// ceiling, or stops on a reorg or a momentum-processing failure. A read failure is returned
+// directly, wrapped, with nothing advanced or latched; every other outcome is recorded into
+// pendingReorg/halted and refill returns nil.
 func (f *Follower) refill() error {
 	frontier, err := f.cfg.Source.FrontierHeight()
 	if err != nil {
@@ -311,8 +292,23 @@ func (f *Follower) refill() error {
 			return nil
 		}
 
-		for _, dm := range moms {
-			stop, ceilingExceeded := f.processMomentum(dm, ceiling)
+		lk := &linked{}
+		if len(f.recent) > 0 {
+			lk.low = f.recent[0].Height
+			for _, c := range f.recent {
+				lk.hashes = append(lk.hashes, c.Hash)
+			}
+		}
+		for i, dm := range moms {
+			stop, ceilingExceeded, err := f.processMomentum(dm, ceiling, moms[:i], lk)
+			if err != nil {
+				// A read failure surfaces only with nothing buffered; otherwise the next
+				// refill re-reads this momentum.
+				if len(f.buf) > 0 {
+					return nil
+				}
+				return err
+			}
 			if ceilingExceeded {
 				// Not malformed content: the source returned a momentum beyond what count
 				// asked for. Stop this call without an error, the same as reaching the
@@ -327,39 +323,42 @@ func (f *Follower) refill() error {
 	return nil
 }
 
-// processMomentum validates dm, checks the link, orders and walks its account-blocks, and
-// commits the result atomically against a scratch copy of counter. It reports stop == true when
+// processMomentum validates dm, checks the link, cross-checks its account-blocks against its
+// content, reads Settlement's assignment for it and commits the resulting inputs atomically.
+// read holds the momenta of the same ranged read that precede dm, and lk is the read's linked
+// record (see linked). It reports stop == true when
 // the refill loop must not process any further momentum this call: either a *ReorgError landed
-// in pendingReorg, or a momentum-processing failure landed in halted. ceilingExceeded == true is
+// in pendingReorg, or a fault landed in halted. A non-nil err is a read failure matching
+// ErrSourceRead: nothing changed, and the caller retries. ceilingExceeded == true is
 // a distinct, non-error outcome (see Edge cases): the momentum's height is beyond what the
 // requested window's count should ever have returned, so nothing here failed validation — the
 // refill simply stops, exactly as if the ceiling had been reached before this entry was read.
-func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64) (stop, ceilingExceeded bool) {
+func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64, read []*nom.DetailedMomentum, lk *linked) (stop, ceilingExceeded bool, err error) {
 	if dm == nil {
 		f.halted = errors.New("ledger: momentum entry is nil")
-		return true, false
+		return true, false, nil
 	}
 	m := dm.Momentum
 	if m == nil {
 		f.halted = errors.New("ledger: momentum entry has a nil Momentum")
-		return true, false
+		return true, false, nil
 	}
 	for _, b := range dm.AccountBlocks {
 		if b == nil {
 			f.halted = fmt.Errorf("ledger: momentum at height %d has a nil account-block entry", m.Height)
-			return true, false
+			return true, false, nil
 		}
 	}
 	if m.Height != f.nextHeight {
 		f.halted = fmt.Errorf("ledger: momentum height %d does not match expected height %d", m.Height, f.nextHeight)
-		return true, false
+		return true, false, nil
 	}
 	if m.Height > ceiling {
-		return true, true
+		return true, true, nil
 	}
 	if f.haveLast && m.PreviousHash != f.lastHash {
 		f.pendingReorg = &ReorgError{Height: m.Height, Want: f.lastHash, Got: m.PreviousHash}
-		return true, false
+		return true, false, nil
 	}
 
 	type headeredBlock struct {
@@ -377,7 +376,7 @@ func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64) (st
 	for i := 1; i < len(items); i++ {
 		if bytes.Equal(items[i-1].header, items[i].header) {
 			f.halted = fmt.Errorf("ledger: momentum at height %d has duplicate account-block header %x", m.Height, items[i].header)
-			return true, false
+			return true, false, nil
 		}
 	}
 
@@ -389,7 +388,7 @@ func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64) (st
 	for _, h := range m.Content {
 		if h == nil {
 			f.halted = fmt.Errorf("ledger: momentum at height %d has a nil content entry", m.Height)
-			return true, false
+			return true, false, nil
 		}
 	}
 	content := append(nom.MomentumContent(nil), m.Content...)
@@ -405,50 +404,20 @@ func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64) (st
 	}
 	if !bytes.Equal(walkedBytes, contentBytes) {
 		f.halted = fmt.Errorf("ledger: momentum at height %d account-blocks do not match the committed content", m.Height)
-		return true, false
+		return true, false, nil
 	}
 
-	blocks := make([]*nom.AccountBlock, len(items))
-	for i, it := range items {
-		blocks[i] = it.block
+	inputs, err := f.assigned(dm, read, lk)
+	if err != nil {
+		if errors.Is(err, ErrSourceRead) {
+			return true, false, err
+		}
+		f.halted = err
+		return true, false, nil
 	}
 
-	scratch := make([]Input, 0, len(blocks))
-	counter := f.counter
-	for _, block := range blocks {
-		env, err := f.cfg.Filter.Accept(m, block)
-		if err != nil {
-			f.halted = fmt.Errorf("ledger: filter accept at height %d: %w", m.Height, err)
-			return true, false
-		}
-		if env == nil {
-			continue
-		}
-
-		idx, err := counter.assign()
-		if err != nil {
-			f.halted = err
-			return true, false
-		}
-		f.counter.exhausted = counter.exhausted
-
-		if env.DomainID != f.cfg.DomainID {
-			continue
-		}
-		scratch = append(scratch, Input{
-			Ctx: domain.InputContext{
-				GlobalInputIndex: idx,
-				MomentumHeight:   m.Height,
-				MomentumTime:     m.TimestampUnix,
-				L1Sender:         block.Address,
-				SourceData:       env.SourceData,
-			},
-			Payload: env.Payload,
-		})
-	}
-
-	f.buf = append(f.buf, scratch...)
-	f.counter = counter
+	f.buf = append(f.buf, inputs...)
+	f.nextOrdinal += uint64(len(inputs))
 	f.lastHeight = m.Height
 	f.lastHash = m.Hash
 	f.haveLast = true
@@ -457,5 +426,196 @@ func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64) (st
 	if max := f.cfg.ConfirmationDepth + 1; uint64(len(f.recent)) > max {
 		f.recent = append([]ConsumedMomentum(nil), f.recent[uint64(len(f.recent))-max:]...)
 	}
-	return false, false
+	return false, false, nil
+}
+
+// assigned returns dm's inputs for the configured domain, in entry order. An error wrapping
+// ErrSourceRead is a read failure; any other error is an assignment fault.
+func (f *Follower) assigned(dm *nom.DetailedMomentum, read []*nom.DetailedMomentum, lk *linked) ([]Input, error) {
+	m := dm.Momentum
+	settles := false
+	for _, h := range m.Content {
+		if h.Address == types.SettlementContract {
+			settles = true
+			break
+		}
+	}
+	if !settles {
+		return nil, nil
+	}
+
+	entries, err := f.cfg.Assignments.Assignment(f.cfg.DomainID, m.Height, m.Hash, f.nextOrdinal)
+	if err != nil {
+		return nil, fmt.Errorf("%w: assignment at height %d: %w", ErrSourceRead, m.Height, err)
+	}
+	if len(entries) > 0 && entries[0].Ordinal != f.nextOrdinal {
+		return nil, fmt.Errorf("%w: assignment at height %d starts at ordinal %d, want %d", ErrAssignmentFault, m.Height, entries[0].Ordinal, f.nextOrdinal)
+	}
+
+	for _, e := range entries {
+		if e.SendMomentumHeight == 0 || e.SendMomentumHeight > m.Height {
+			return nil, fmt.Errorf("%w: send momentum height %d is outside [1, %d]", ErrSourceRead, e.SendMomentumHeight, m.Height)
+		}
+	}
+
+	top, topHash := m.Height, m.Hash
+	if len(read) > 0 {
+		top, topHash = read[0].Momentum.Height, read[0].Momentum.Hash
+	}
+	if len(lk.hashes) > 0 {
+		top, topHash = lk.low, lk.hashes[0]
+	}
+	need := map[uint64]bool{}
+	var lowest uint64
+	for _, e := range entries {
+		if h := e.SendMomentumHeight; h < top {
+			need[h] = true
+			if lowest == 0 || h < lowest {
+				lowest = h
+			}
+		}
+	}
+	fetched := map[uint64]*nom.DetailedMomentum{}
+	if len(need) > 0 {
+		fetched, lk.hashes, err = f.walk(lowest, top, topHash, need, lk.hashes)
+		if err != nil {
+			return nil, err
+		}
+		lk.low = lowest
+	}
+
+	inputs := make([]Input, 0, len(entries))
+	for _, e := range entries {
+		sdm, err := f.sendMomentum(e.SendMomentumHeight, dm, read, lk, fetched)
+		if err != nil {
+			return nil, err
+		}
+		in, err := DecodeAssignedInput(f.cfg.DomainID, sdm, e.GlobalInputIndex, e.SourceAccountBlockHash)
+		if err != nil {
+			return nil, err
+		}
+		inputs = append(inputs, in)
+	}
+	if f.cfg.Caps != nil && len(inputs) > 0 {
+		caps := &boundCaps{src: f.cfg.Caps, domainID: f.cfg.DomainID, height: m.Height, hash: m.Hash}
+		for i := range inputs {
+			inputs[i].Ctx.Caps = caps
+		}
+	}
+	return inputs, nil
+}
+
+// linked holds the hashes of the momenta just below one ranged read that this Follower has
+// hash-linked to the read's first momentum: hashes[i] is the hash at height low+i, and the
+// last entry is the parent of the read's first momentum. refill seeds it from the
+// RecentMomenta window when the read starts and drops it when the read ends; each walk
+// extends it downward.
+type linked struct {
+	low    uint64
+	hashes []types.Hash
+}
+
+// walk reads heights [lowest, top] from the source and checks that they form one hash chain
+// whose momentum at top hashes to topHash, the held hash. It returns the walked momenta at the
+// heights in need, and the hashes of heights [lowest, top-1] in height order followed by tail,
+// in one slice allocated once. Every error wraps ErrSourceRead. The link proof rests on the
+// source's hash verification, as processMomentum's link check does (see MomentumSource).
+func (f *Follower) walk(lowest, top uint64, topHash types.Hash, need map[uint64]bool, tail []types.Hash) (fetched map[uint64]*nom.DetailedMomentum, below []types.Hash, err error) {
+	fail := func(format string, args ...any) (map[uint64]*nom.DetailedMomentum, []types.Hash, error) {
+		return nil, nil, fmt.Errorf("%w: "+format, append([]any{ErrSourceRead}, args...)...)
+	}
+	fetched = map[uint64]*nom.DetailedMomentum{}
+	below = make([]types.Hash, 0, int(top-lowest)+len(tail))
+	var prev types.Hash
+	h := lowest
+	for h <= top {
+		count := min(top-h+1, uint64(rpcMaxCountSize))
+		ms, err := f.cfg.Source.DetailedMomentumsByHeight(h, count)
+		if err != nil {
+			return fail("read momenta from height %d: %w", h, err)
+		}
+		if len(ms) == 0 {
+			return fail("source returned no momentum at height %d", h)
+		}
+		for _, sdm := range ms {
+			if h > top {
+				break
+			}
+			if sdm == nil || sdm.Momentum == nil || sdm.Momentum.Height != h {
+				return fail("source returned no momentum at height %d", h)
+			}
+			if h > lowest && sdm.Momentum.PreviousHash != prev {
+				return fail("momentum at height %d does not link to the momentum below it", h)
+			}
+			if need[h] {
+				if hasNilEntry(sdm) {
+					return fail("momentum at height %d has a nil entry", h)
+				}
+				fetched[h] = sdm
+			}
+			if h < top {
+				below = append(below, sdm.Momentum.Hash)
+			}
+			prev = sdm.Momentum.Hash
+			h++
+		}
+	}
+	if prev != topHash {
+		return fail("momentum at height %d is %s, not the held %s", top, prev, topHash)
+	}
+	return fetched, append(below, tail...), nil
+}
+
+// sendMomentum returns the momentum at height sh, which assigned has checked is in [1, dm's
+// height]: dm itself, a momentum of the same read, a momentum in fetched, or a momentum fetched
+// from the source and matched against its hash in lk. Every momentum it returns is hash-linked
+// to dm. Every error wraps ErrSourceRead.
+func (f *Follower) sendMomentum(sh uint64, dm *nom.DetailedMomentum, read []*nom.DetailedMomentum, lk *linked, fetched map[uint64]*nom.DetailedMomentum) (*nom.DetailedMomentum, error) {
+	fail := func(format string, args ...any) (*nom.DetailedMomentum, error) {
+		return nil, fmt.Errorf("%w: "+format, append([]any{ErrSourceRead}, args...)...)
+	}
+	if sh == dm.Momentum.Height {
+		return dm, nil
+	}
+	if len(read) > 0 && sh >= read[0].Momentum.Height {
+		return read[sh-read[0].Momentum.Height], nil
+	}
+	if got, ok := fetched[sh]; ok {
+		return got, nil
+	}
+	if sh < lk.low || sh-lk.low >= uint64(len(lk.hashes)) {
+		return fail("no linked hash at height %d", sh)
+	}
+	want := lk.hashes[sh-lk.low]
+
+	ms, err := f.cfg.Source.DetailedMomentumsByHeight(sh, 1)
+	if err != nil {
+		return fail("read momentum at height %d: %w", sh, err)
+	}
+	if len(ms) == 0 || ms[0] == nil || ms[0].Momentum == nil || ms[0].Momentum.Height != sh {
+		return fail("source returned no momentum at height %d", sh)
+	}
+	if hasNilEntry(ms[0]) {
+		return fail("momentum at height %d has a nil entry", sh)
+	}
+	if ms[0].Momentum.Hash != want {
+		return fail("momentum at height %d is %s, not the linked %s", sh, ms[0].Momentum.Hash, want)
+	}
+	fetched[sh] = ms[0]
+	return ms[0], nil
+}
+
+// hasNilEntry reports a nil Content or AccountBlocks entry, on which findSend would panic.
+func hasNilEntry(dm *nom.DetailedMomentum) bool {
+	for _, h := range dm.Momentum.Content {
+		if h == nil {
+			return true
+		}
+	}
+	for _, b := range dm.AccountBlocks {
+		if b == nil {
+			return true
+		}
+	}
+	return false
 }

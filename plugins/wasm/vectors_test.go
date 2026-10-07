@@ -55,6 +55,7 @@ type vectorJSON struct {
 	CodeHash               string            `json:"code_hash,omitempty"`              // SPEC's code_hash (pre-instrumentation)
 	InstrumentedCodeHash   string            `json:"instrumented_code_hash,omitempty"` // SPEC's CodeHash (§11.4)
 	InputFrameHex          string            `json:"input_frame_hex,omitempty"`        // call shape only
+	WithdrawalCaps         map[string]string `json:"withdrawal_caps"`                  // AssetID hex -> big-endian u256 hex; an absent asset has cap 0
 	PreState               map[string]string `json:"pre_state"`                        // derived path hex -> value hex ("" is present-empty)
 	PendingMetadataHex     *string           `json:"pending_metadata_hex,omitempty"`   // kinds 4,5 only
 	PreStateRoot           string            `json:"pre_state_root"`
@@ -133,6 +134,51 @@ type vectorSpec struct {
 	ExtraPreState          map[domain.Path][]byte // seeded beyond the two reserved leaves
 	WantStatus             codec.Status           // the §15 status this vector exists to freeze
 	PendingMetadata        []byte                 // seeded into a kind-4/5 vector's pending record
+	WithdrawalCaps         capTable               // step 5a's cap table; nil is empty
+}
+
+// capTable is a domain.CapLookup over a fixed table. An asset absent from it has cap 0, the
+// rule the artifact's withdrawal_caps states.
+type capTable map[codec.AssetID]codec.U256
+
+func (c capTable) MaxBatchWithdrawals(assets []codec.AssetID) ([]codec.U256, error) {
+	out := make([]codec.U256, len(assets))
+	for i, a := range assets {
+		out[i] = c[a]
+	}
+	return out, nil
+}
+
+// capsHex renders c as a withdrawal_caps object, lowercase hex, never nil.
+func capsHex(c capTable) map[string]string {
+	out := make(map[string]string, len(c))
+	for a, v := range c {
+		out[hex.EncodeToString(a[:])] = hex.EncodeToString(v[:])
+	}
+	return out
+}
+
+// capTableFromJSON parses a withdrawal_caps object, failing the test on a key or value that is
+// not 32 bytes of hex.
+func capTableFromJSON(t *testing.T, m map[string]string) capTable {
+	t.Helper()
+	out := capTable{}
+	for k, v := range m {
+		kb, err := hex.DecodeString(k)
+		if err != nil || len(kb) != 32 {
+			t.Fatalf("withdrawal_caps key %q is not 32 bytes of hex", k)
+		}
+		vb, err := hex.DecodeString(v)
+		if err != nil || len(vb) != 32 {
+			t.Fatalf("withdrawal_caps value %q is not 32 bytes of hex", v)
+		}
+		var a codec.AssetID
+		var u codec.U256
+		copy(a[:], kb)
+		copy(u[:], vb)
+		out[a] = u
+	}
+	return out
 }
 
 // repeatedHash builds a 32-byte hash whose every byte is b.
@@ -428,7 +474,9 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 	}
 	inputHash := hashOf(crypto.Hash(canonical))
 
-	in, err := p.DecodeInput(spec.Ctx, canonical)
+	ctx := spec.Ctx
+	ctx.Caps = spec.WithdrawalCaps
+	in, err := p.DecodeInput(ctx, canonical)
 	if err != nil {
 		t.Fatalf("%s: DecodeInput: %v", spec.ID, err)
 	}
@@ -522,6 +570,7 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 		CodeHash:               hex.EncodeToString(codeHash[:]),
 		InstrumentedCodeHash:   hex.EncodeToString(instrumentedCodeHash[:]),
 		InputFrameHex:          hex.EncodeToString(encodedFrame),
+		WithdrawalCaps:         capsHex(spec.WithdrawalCaps),
 		PreState:               preState,
 		PreStateRoot:           hex.EncodeToString(preStateRoot[:]),
 		WitnessKeys:            witnessKeys,
@@ -627,6 +676,7 @@ func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainI
 		InputKind:              kind,
 		Input:                  nil,
 		CanonicalInputHex:      hex.EncodeToString(canonical),
+		WithdrawalCaps:         capsHex(nil),
 		PreState:               map[string]string{},
 		PreStateRoot:           hex.EncodeToString(preStateRoot[:]),
 		WitnessKeys:            witnessKeys,
@@ -781,6 +831,7 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		Input:                  inputView(spec.Args),
 		CanonicalInputHex:      hex.EncodeToString(canonical),
 		SourceDataHex:          hex.EncodeToString(spec.Ctx.SourceData),
+		WithdrawalCaps:         capsHex(nil),
 		PreState:               preState,
 		PreStateRoot:           hex.EncodeToString(preStateRoot[:]),
 		WitnessKeys:            witnessKeys,
@@ -937,7 +988,7 @@ func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "639b677689bfe066c5ca0a4553eb4ba623671c726f63973aa9249d58259c43fb"
+const vectorFileDigest = "e5344622a57f2dfdc281b8bdbae4656fd5d041b46e0bbbde835480e4576768c2"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {
