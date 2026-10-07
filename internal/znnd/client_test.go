@@ -167,6 +167,21 @@ func TestClientBespokeServers(t *testing.T) {
 		}
 	})
 
+	t.Run("rpc error message is quoted", func(t *testing.T) {
+		c := serve(t, func(id uint64) string {
+			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32000,"message":"a\nb\u0007c\r\u001b[2Jd"}}`, id)
+		})
+		_, err := c.StateRoot(1)
+		mustPlain(t, "rpc error", err)
+		got := err.Error()
+		if strings.ContainsAny(got, "\n\r\x07\x1b") {
+			t.Fatalf("error %q holds a control character", got)
+		}
+		if !strings.Contains(got, `a\nb\ac\r\x1b[2Jd`) {
+			t.Fatalf("error %q lacks the quoted message", got)
+		}
+	})
+
 	t.Run("undecodable body", func(t *testing.T) {
 		c := serve(t, func(uint64) string { return `not json` })
 		_, err := c.StateRoot(1)
@@ -184,3 +199,147 @@ func TestClientClosedServer(t *testing.T) {
 }
 
 func jsonDecode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+
+func TestConfirmationHeight(t *testing.T) {
+	fx, _, c := setup(t)
+	a := fx.Assignment
+
+	hashes := []types.Hash{a.RejectedSendHash}
+	for _, e := range a.Entries {
+		hashes = append(hashes, e.SourceAccountBlockHash)
+	}
+	for _, hash := range hashes {
+		h, ok, err := c.ConfirmationHeight(hash)
+		if err != nil || !ok || h != a.SendHeight {
+			t.Fatalf("ConfirmationHeight(%s) = %d, %v, %v; want %d, true, nil", hash, h, ok, err, a.SendHeight)
+		}
+	}
+
+	h, ok, err := c.ConfirmationHeight(types.Hash{0x09})
+	if err != nil || ok || h != 0 {
+		t.Fatalf("ConfirmationHeight(unknown) = %d, %v, %v; want 0, false, nil", h, ok, err)
+	}
+}
+
+func TestConfirmationHeightBespoke(t *testing.T) {
+	serve := func(t *testing.T, body func(id uint64) string) *Client {
+		t.Helper()
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req rpcRequest
+			if err := jsonDecode(r, &req); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			fmt.Fprint(w, body(req.ID))
+		}))
+		t.Cleanup(s.Close)
+		return NewClient(s.URL)
+	}
+	want := types.Hash{0x01}
+	other := types.Hash{0x02}
+
+	t.Run("another hash", func(t *testing.T) {
+		c := serve(t, func(id uint64) string {
+			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"hash":%q,"confirmationDetail":{"momentumHeight":5}}}`, id, other.String())
+		})
+		_, _, err := c.ConfirmationHeight(want)
+		mustPlain(t, "block with another hash", err)
+	})
+
+	t.Run("unconfirmed", func(t *testing.T) {
+		c := serve(t, func(id uint64) string {
+			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"hash":%q,"confirmationDetail":null}}`, id, want.String())
+		})
+		h, ok, err := c.ConfirmationHeight(want)
+		if h != 0 || ok || err != nil {
+			t.Fatalf("unconfirmed block = %d, %v, %v; want 0, false, nil", h, ok, err)
+		}
+	})
+}
+
+func TestClientBodyBound(t *testing.T) {
+	fx, srv, c := setup(t)
+
+	srv.PadTo(maxResponseBody)
+	root, err := c.StateRoot(fx.ReadHeight)
+	if err != nil || root != fx.StateRoot {
+		t.Fatalf("StateRoot at the bound = %s, %v; want %s, nil", root, err, fx.StateRoot)
+	}
+
+	srv.PadTo(maxResponseBody + 1)
+	_, err = c.StateRoot(fx.ReadHeight)
+	mustPlain(t, "StateRoot over the bound", err)
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("StateRoot over the bound = %v, want ErrResponseTooLarge", err)
+	}
+
+	srv.PadTo(0)
+	if _, err := c.StateRoot(fx.ReadHeight); err != nil {
+		t.Fatalf("StateRoot after padding off: %v", err)
+	}
+}
+
+func TestClientBodyBoundPerMethod(t *testing.T) {
+	fx, srv, c := setup(t)
+	srv.PadTo(maxResponseBody + 1)
+
+	calls := map[string]func() error{
+		"FrontierMomentum": func() error { _, err := c.FrontierMomentum(); return err },
+		"FrontierHeight":   func() error { _, err := c.FrontierHeight(); return err },
+		"DetailedMomentumsByHeight": func() error {
+			_, err := c.DetailedMomentumsByHeight(fx.ReadHeight, 1)
+			return err
+		},
+		"Proof":     func() error { _, err := c.Proof(fx.ReadHeight, fx.Proofs[0].Key); return err },
+		"StateRoot": func() error { _, err := c.StateRoot(fx.ReadHeight); return err },
+		"FrontierAccountBlock": func() error {
+			_, err := c.FrontierAccountBlock(fx.ExecutorAddress)
+			return err
+		},
+		"ConfirmationHeight": func() error {
+			_, _, err := c.ConfirmationHeight(fx.Assignment.Entries[0].SourceAccountBlockHash)
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			mustPlain(t, name, err)
+			if !errors.Is(err, ErrResponseTooLarge) {
+				t.Fatalf("%s = %v, want ErrResponseTooLarge", name, err)
+			}
+		})
+	}
+}
+
+// countingBody yields an endless stream of spaces and counts the bytes read from it.
+type countingBody struct{ n int }
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = ' '
+	}
+	b.n += len(p)
+	return len(p), nil
+}
+
+func (b *countingBody) Close() error { return nil }
+
+type bodyTransport struct{ body *countingBody }
+
+func (t bodyTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: t.body, Header: http.Header{}}, nil
+}
+
+func TestClientBodyReadStopsAtBound(t *testing.T) {
+	body := &countingBody{}
+	c := NewClient("http://znnd.invalid")
+	c.hc = &http.Client{Transport: bodyTransport{body}}
+
+	_, err := c.FrontierHeight()
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("FrontierHeight = %v, want ErrResponseTooLarge", err)
+	}
+	if body.n != maxResponseBody+1 {
+		t.Fatalf("read %d bytes, want exactly the bound plus one byte (%d)", body.n, maxResponseBody+1)
+	}
+}

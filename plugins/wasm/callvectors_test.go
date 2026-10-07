@@ -210,7 +210,8 @@ func callVectors(t *testing.T) []vectorSpec {
 	// value from a prior call must never be renumbered. A vector added later must call
 	// newIdentity for the next unused pair rather than picking its own; unsupportedVector below
 	// already claims 0xD4, the next value this sequence would hand out. assertUniqueIdentities in
-	// vectors_test.go enforces this.
+	// vectors_test.go enforces this. deployVectors holds 0xE1..0xFC, which the sequence skips
+	// after CV-CAP-5. After CV-CAP-7 one value, 0xFF, is left before byte(0xB1+n) wraps.
 	n := 0
 	newIdentity := func() (idx uint64, src types.Hash) {
 		idx = uint64(100 + n)
@@ -361,6 +362,7 @@ func callVectors(t *testing.T) []vectorSpec {
 			Args:                   codec.CallL2Args{TargetContract: cid1, PlasmaLimit: callPlasmaLimit},
 			ContractID:             cid1,
 			Module:                 blobModule(blob),
+			WithdrawalCaps:         capTable{testAsset(): u256(2000)},
 			WantStatus:             codec.StatusSuccess,
 		})
 	}
@@ -1232,6 +1234,181 @@ func callVectors(t *testing.T) []vectorSpec {
 			ContractID:             cid2,
 			Module:                 blobModule(blob),
 			WantStatus:             codec.StatusUnauthorized,
+		})
+	}
+
+	// --- withdrawal caps (step 5a): CV-CAP-1..7.
+
+	capsOfOne := func() capTable { return capTable{testAsset(): u256(1000)} }
+	withdrawal := func(idx uint64, i uint32, asset codec.AssetID, amount uint64) codec.OutboxMessage {
+		return codec.OutboxMessage{SourceContract: cid2, InputIndex: idx, OutboxIndex: i, Target: codec.L1Withdrawal{RecipientL1: repeatedAddr(0xCC), Asset: asset, Amount: u256(amount)}}
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, testAsset(), 600), withdrawal(idx, 1, testAsset(), 400)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-1",
+			Purpose:                "two withdrawals in one asset summing exactly to its MaxBatchWithdrawal pass step 5a",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         capsOfOne(),
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: []byte("c"), Value: []byte{0x01}}},
+			Events:           []codec.Event{{ContractID: cid2, InputIndex: idx, EventIndex: 0, Data: []byte("evt")}},
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, testAsset(), 600), withdrawal(idx, 1, testAsset(), 401)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-2",
+			Purpose:                "two withdrawals in one asset summing to one above its MaxBatchWithdrawal: RUNTIME_FAULT at the metered gas, full rollback and the full deposit refunded",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         capsOfOne(),
+			WantStatus:             codec.StatusRuntimeFault,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: []byte("c"), Value: []byte{0x01}}},
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, assetsTestAssetDistinct(1), 1)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-3",
+			Purpose:                "a non-zero withdrawal in an asset with no AssetConfig (absent from withdrawal_caps, cap 0): RUNTIME_FAULT, full rollback and the full deposit refunded",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         capsOfOne(),
+			WantStatus:             codec.StatusRuntimeFault,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, assetsTestAssetDistinct(1), 0)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-4",
+			Purpose:                "a zero-amount withdrawal in an asset with no AssetConfig (cap 0) passes step 5a",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         capsOfOne(),
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// Ascending asset order is d1, d2, testAsset(). The caps are not monotonic in that order:
+	// the first is the largest and the middle the smallest.
+	d1, d2 := assetsTestAssetDistinct(1), assetsTestAssetDistinct(2)
+	threeCaps := capTable{d1: u256(300), d2: u256(100), testAsset(): u256(200)}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, d2, 25), withdrawal(idx, 1, d1, 100), withdrawal(idx, 2, d2, 75), withdrawal(idx, 3, testAsset(), 200), withdrawal(idx, 4, d1, 200)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-5",
+			Purpose:                "withdrawals in three assets with three different caps, each totalling exactly its own asset's MaxBatchWithdrawal, pass step 5a: each asset is checked against its own cap only",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         threeCaps,
+			WantStatus:             codec.StatusSuccess,
+		})
+	}
+
+	// --- CV-CAP-6/7. First advance n past 0xE1..0xFC, the source hashes deployVectors holds.
+	n += 28
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: []byte("c"), Value: []byte{0x01}}},
+			Events:           []codec.Event{{ContractID: cid2, InputIndex: idx, EventIndex: 0, Data: []byte("evt")}},
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, testAsset(), 25), withdrawal(idx, 1, testAsset(), 25), withdrawal(idx, 2, d2, 50), withdrawal(idx, 3, d1, 50), withdrawal(idx, 4, d2, 100), withdrawal(idx, 5, d1, 150)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-6",
+			Purpose:                "the middle of three assets in ascending and in first-appearance order over its own cap in total, each of its withdrawals alone within the cap, the other two assets within their own caps: RUNTIME_FAULT at the metered gas, full rollback and the full deposit refunded",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         threeCaps,
+			WantStatus:             codec.StatusRuntimeFault,
+		})
+	}
+
+	{
+		idx, src := newIdentity()
+		blob := encodeEffects(t, codec.ContractEffects{
+			Version:          codec.ExecutionResultVersion,
+			GlobalInputIndex: idx,
+			StateDiff:        []codec.LocalStateDiffEntry{{LocalKey: []byte("c"), Value: []byte{0x01}}},
+			Outbox:           []codec.OutboxMessage{withdrawal(idx, 0, testAsset(), 1001)},
+		})
+		specs = append(specs, vectorSpec{
+			ID:                     "CV-CAP-7",
+			Purpose:                "a withdrawal over its cap at a plasma_limit that leaves nothing for the §10.4 effect charge: RUNTIME_FAULT from step 5a, not OUT_OF_GAS from step 6",
+			Shape:                  "call",
+			BatchID:                2,
+			Ctx:                    stdCtx(idx),
+			SourceAccountBlockHash: src,
+			Args:                   codec.CallL2Args{TargetContract: cid2, PlasmaLimit: module.InitialMemoryCost(1) + costOf(t, 0x42, 0x0B)},
+			ContractID:             cid2,
+			Module:                 blobModule(blob),
+			WithdrawalCaps:         capsOfOne(),
+			WantStatus:             codec.StatusRuntimeFault,
 		})
 	}
 

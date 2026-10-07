@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"strconv"
 
@@ -12,25 +13,30 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/digitalSloth/go-executor/internal/ledger"
 )
 
 type Type uint8
 
 const (
-	TypeConfig          Type = 0x01 // S→W
-	TypeFrontier        Type = 0x02 // S→W
-	TypeMomentum        Type = 0x03 // S→W
-	TypeRangeEnd        Type = 0x04 // S→W
-	TypeAnchor          Type = 0x05 // S→W
-	TypeSourceError     Type = 0x06 // S→W
-	TypeFrontierRequest Type = 0x81 // W→S
-	TypeMomentaRequest  Type = 0x82 // W→S
-	TypeAnchorRequest   Type = 0x83 // W→S
-	TypeCommitted       Type = 0x84 // W→S
+	TypeConfig            Type = 0x01 // S→W
+	TypeFrontier          Type = 0x02 // S→W
+	TypeMomentum          Type = 0x03 // S→W
+	TypeRangeEnd          Type = 0x04 // S→W
+	TypeAnchor            Type = 0x05 // S→W
+	TypeSourceError       Type = 0x06 // S→W
+	TypeAssignment        Type = 0x07 // S→W
+	TypeCap               Type = 0x08 // S→W
+	TypeFrontierRequest   Type = 0x81 // W→S
+	TypeMomentaRequest    Type = 0x82 // W→S
+	TypeAnchorRequest     Type = 0x83 // W→S
+	TypeCommitted         Type = 0x84 // W→S
+	TypeAssignmentRequest Type = 0x85 // W→S
+	TypeCapRequest        Type = 0x86 // W→S
 )
 
-// Side names the sender of a frame. Supervisor sends 0x01-0x06 and is read with MaxFrame;
-// Worker sends 0x81-0x84 and is read with MaxWorkerFrame.
+// Side names the sender of a frame. Supervisor sends 0x01-0x08 and is read with MaxFrame;
+// Worker sends 0x81-0x86 and is read with MaxWorkerFrame.
 type Side uint8
 
 const (
@@ -46,7 +52,7 @@ const (
 	maxStoragePathLen = 4096
 )
 
-// Message is implemented by exactly the ten types below, all with value receivers.
+// Message is implemented by exactly the fourteen types below, all with value receivers.
 type Message interface{ Type() Type }
 
 type WorkerConfig struct {
@@ -74,6 +80,26 @@ type Anchor struct {
 	PostStateRoot types.Hash
 	LastInputSeq  uint64
 }
+
+type AssignmentRequest struct {
+	Height      uint64
+	Hash        types.Hash
+	NextOrdinal uint64
+}
+type Assignment struct{ Entries []ledger.AssignmentEntry }
+
+func (AssignmentRequest) Type() Type { return TypeAssignmentRequest }
+func (Assignment) Type() Type        { return TypeAssignment }
+
+type CapRequest struct {
+	Height uint64
+	Hash   types.Hash
+	Assets []codec.AssetID
+}
+type Cap struct{ Amounts []codec.U256 }
+
+func (CapRequest) Type() Type { return TypeCapRequest }
+func (Cap) Type() Type        { return TypeCap }
 
 func (Frontier) Type() Type { return TypeFrontier }
 func (Momentum) Type() Type { return TypeMomentum }
@@ -203,9 +229,9 @@ func (r *preader) end() error {
 
 func sideOfType(t Type) (Side, bool) {
 	switch t {
-	case TypeConfig, TypeFrontier, TypeMomentum, TypeRangeEnd, TypeAnchor, TypeSourceError:
+	case TypeConfig, TypeFrontier, TypeMomentum, TypeRangeEnd, TypeAnchor, TypeSourceError, TypeAssignment, TypeCap:
 		return Supervisor, true
-	case TypeFrontierRequest, TypeMomentaRequest, TypeAnchorRequest, TypeCommitted:
+	case TypeFrontierRequest, TypeMomentaRequest, TypeAnchorRequest, TypeCommitted, TypeAssignmentRequest, TypeCapRequest:
 		return Worker, true
 	default:
 		return 0, false
@@ -253,6 +279,14 @@ func Encode(m Message) ([]byte, error) {
 		payload = nil
 	case Committed:
 		payload, err = v.Commitment.Encode()
+	case AssignmentRequest:
+		payload, err = encodeAssignmentRequest(v)
+	case Assignment:
+		payload, err = encodeAssignment(v)
+	case CapRequest:
+		payload, err = encodeCapRequest(v)
+	case Cap:
+		payload, err = encodeCap(v)
 	default:
 		return nil, fmt.Errorf("ipc: encode: unhandled message type %T", m)
 	}
@@ -317,6 +351,14 @@ func decodePayload(t Type, payload []byte) (Message, error) {
 		return decodeAnchorRequest(payload)
 	case TypeCommitted:
 		return decodeCommitted(payload)
+	case TypeAssignmentRequest:
+		return decodeAssignmentRequest(payload)
+	case TypeAssignment:
+		return decodeAssignment(payload)
+	case TypeCapRequest:
+		return decodeCapRequest(payload)
+	case TypeCap:
+		return decodeCap(payload)
 	default:
 		return nil, fmt.Errorf("ipc: unknown type %#x", byte(t))
 	}
@@ -483,6 +525,186 @@ func decodeAnchor(p []byte) (Message, error) {
 		return nil, errPayload
 	}
 	return Anchor{Found: found, PostStateRoot: root, LastInputSeq: seq}, nil
+}
+
+// --- AssignmentRequest ---
+
+func encodeAssignmentRequest(m AssignmentRequest) ([]byte, error) {
+	if m.Height < 1 {
+		return nil, errors.New("height must be at least 1")
+	}
+	w := &pwriter{}
+	w.u64(m.Height)
+	w.raw(m.Hash[:])
+	w.u64(m.NextOrdinal)
+	return w.buf, nil
+}
+
+func decodeAssignmentRequest(p []byte) (Message, error) {
+	r := newPReader(p)
+	height, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	hashBytes, err := r.fixed(32)
+	if err != nil {
+		return nil, err
+	}
+	next, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.end(); err != nil {
+		return nil, err
+	}
+	if height < 1 {
+		return nil, errPayload
+	}
+	m := AssignmentRequest{Height: height, NextOrdinal: next}
+	copy(m.Hash[:], hashBytes)
+	return m, nil
+}
+
+// --- CapRequest and Cap ---
+
+func encodeCapRequest(m CapRequest) ([]byte, error) {
+	if m.Height < 1 {
+		return nil, errors.New("height must be at least 1")
+	}
+	if n := len(m.Assets); n < 1 || n > codec.MaxAssetsPerBatch {
+		return nil, fmt.Errorf("%d assets outside [1, %d]", n, codec.MaxAssetsPerBatch)
+	}
+	w := &pwriter{buf: make([]byte, 0, 8+32+1+len(m.Assets)*32)}
+	w.u64(m.Height)
+	w.raw(m.Hash[:])
+	w.u8(uint8(len(m.Assets)))
+	for _, a := range m.Assets {
+		w.raw(a[:])
+	}
+	return w.buf, nil
+}
+
+func decodeCapRequest(p []byte) (Message, error) {
+	r := newPReader(p)
+	height, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	hashBytes, err := r.fixed(32)
+	if err != nil {
+		return nil, err
+	}
+	n, err := r.u8()
+	if err != nil {
+		return nil, err
+	}
+	if n < 1 || n > codec.MaxAssetsPerBatch || int(n)*32 != r.remaining() {
+		return nil, errPayload
+	}
+	if height < 1 {
+		return nil, errPayload
+	}
+	m := CapRequest{Height: height, Assets: make([]codec.AssetID, n)}
+	copy(m.Hash[:], hashBytes)
+	for i := range m.Assets {
+		b, err := r.fixed(32)
+		if err != nil {
+			return nil, err
+		}
+		copy(m.Assets[i][:], b)
+	}
+	return m, nil
+}
+
+func encodeCap(m Cap) ([]byte, error) {
+	if n := len(m.Amounts); n < 1 || n > codec.MaxAssetsPerBatch {
+		return nil, fmt.Errorf("%d amounts outside [1, %d]", n, codec.MaxAssetsPerBatch)
+	}
+	w := &pwriter{buf: make([]byte, 0, 1+len(m.Amounts)*32)}
+	w.u8(uint8(len(m.Amounts)))
+	for _, a := range m.Amounts {
+		w.raw(a[:])
+	}
+	return w.buf, nil
+}
+
+func decodeCap(p []byte) (Message, error) {
+	r := newPReader(p)
+	n, err := r.u8()
+	if err != nil {
+		return nil, err
+	}
+	if n < 1 || n > codec.MaxAssetsPerBatch || int(n)*32 != r.remaining() {
+		return nil, errPayload
+	}
+	m := Cap{Amounts: make([]codec.U256, n)}
+	for i := range m.Amounts {
+		b, err := r.fixed(32)
+		if err != nil {
+			return nil, err
+		}
+		copy(m.Amounts[i][:], b)
+	}
+	return m, nil
+}
+
+// --- Assignment ---
+
+// assignmentEntryLen is the wire size of one entry: three u64 fields and a 32-byte hash.
+const assignmentEntryLen = 8 + 8 + 32 + 8
+
+func encodeAssignment(a Assignment) ([]byte, error) {
+	if uint64(len(a.Entries)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%d entries exceed a u32 count", len(a.Entries))
+	}
+	w := &pwriter{buf: make([]byte, 0, 4+len(a.Entries)*assignmentEntryLen)}
+	w.u32(uint32(len(a.Entries)))
+	for i, e := range a.Entries {
+		if e.SendMomentumHeight == 0 {
+			return nil, fmt.Errorf("entry %d has send momentum height 0", i)
+		}
+		w.u64(e.Ordinal)
+		w.u64(e.GlobalInputIndex)
+		w.raw(e.SourceAccountBlockHash[:])
+		w.u64(e.SendMomentumHeight)
+	}
+	return w.buf, nil
+}
+
+func decodeAssignment(p []byte) (Message, error) {
+	r := newPReader(p)
+	n, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	if uint64(n)*assignmentEntryLen != uint64(r.remaining()) {
+		return nil, errPayload
+	}
+	if n == 0 {
+		return Assignment{}, nil
+	}
+	entries := make([]ledger.AssignmentEntry, n)
+	for i := range entries {
+		e := &entries[i]
+		if e.Ordinal, err = r.u64(); err != nil {
+			return nil, err
+		}
+		if e.GlobalInputIndex, err = r.u64(); err != nil {
+			return nil, err
+		}
+		hashBytes, err := r.fixed(32)
+		if err != nil {
+			return nil, err
+		}
+		copy(e.SourceAccountBlockHash[:], hashBytes)
+		if e.SendMomentumHeight, err = r.u64(); err != nil {
+			return nil, err
+		}
+		if e.SendMomentumHeight == 0 {
+			return nil, errPayload
+		}
+	}
+	return Assignment{Entries: entries}, nil
 }
 
 // --- SourceError ---

@@ -41,18 +41,3 @@ const (
 // EmptyValueLength is the §27.2 EMPTY deletion sentinel: a StateDiff value length prefix of
 // 0xFFFFFFFF marks deletion rather than a present value of that length.
 const EmptyValueLength uint32 = 0xFFFFFFFF
-
-// MaxBatchWithdrawal is the per-asset withdrawal cap (§27.9). Step 5a applies it to one
-// input's contract withdrawals; internal/batch's builder applies it to the batch aggregate.
-// Both read this one symbol, so the two cannot disagree.
-//
-// Step 5a must read the Periphery value in force at the momentum containing the input; the
-// batch builder splits against the value it expects Settlement to apply when it registers the
-// batch's withdrawals. 2^255 stands in for both until the Periphery read is wired (§19,
-// §27.9).
-//
-// The u256 invariant: a lone input's withdrawalDebit is at most MaxBatchWithdrawal + deposit
-// <= 2^255 + (2^255 - 1) = 2^256 - 1, because go-zenon's TokenMaxSupplyBig is 2^255 - 1
-// (vm/constants/embedded.go:75), so internal/batch's breach() never rejects a lone input for
-// overflow. A placeholder above 2^255 breaks this invariant.
-var MaxBatchWithdrawal = U256{0x80}

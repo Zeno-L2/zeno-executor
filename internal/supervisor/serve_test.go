@@ -8,6 +8,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
+	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 	"github.com/digitalSloth/go-executor/internal/workerproc"
+	"github.com/digitalSloth/go-executor/internal/znnd"
 )
 
 // --- fake sources: structs of funcs, one goroutine at a time per internal/ipc/client_test.go:16-33 ---
@@ -39,6 +42,22 @@ type fakeAnchors struct {
 
 func (f fakeAnchors) FinalizedAnchor(domainID uint32) (recovery.Anchor, bool, error) {
 	return f.anchor(domainID)
+}
+
+type fakeAssignments struct {
+	assignment func(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error)
+}
+
+func (f fakeAssignments) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	return f.assignment(domainID, height, hash, nextOrdinal)
+}
+
+type fakeCaps struct {
+	cap func(domainID uint32, height uint64, hash types.Hash, assets []codec.AssetID) ([]codec.U256, error)
+}
+
+func (f fakeCaps) MaxBatchWithdrawals(domainID uint32, height uint64, hash types.Hash, assets []codec.AssetID) ([]codec.U256, error) {
+	return f.cap(domainID, height, hash, assets)
 }
 
 // --- harness ---
@@ -321,6 +340,141 @@ func TestServeMomentaRange(t *testing.T) {
 
 	wEnd.Close()
 	if err := waitServe(t, done); err != nil {
+		t.Fatalf("serve = %v, want nil", err)
+	}
+}
+
+// limitedMomenta serves fiveMomentumChain and fails any read above limit as an over-limit
+// response. serve calls it from another goroutine, so mu guards every field.
+type limitedMomenta struct {
+	mu     sync.Mutex
+	chain  []*nom.DetailedMomentum
+	limit  uint64
+	counts []uint64
+}
+
+func newLimitedMomenta(limit uint64) *limitedMomenta {
+	return &limitedMomenta{chain: fiveMomentumChain(), limit: limit}
+}
+
+func (l *limitedMomenta) byHeight(height, count uint64) ([]*nom.DetailedMomentum, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.counts = append(l.counts, count)
+	if count > l.limit {
+		return nil, fmt.Errorf("znnd: ledger.getDetailedMomentumsByHeight: %w", znnd.ErrResponseTooLarge)
+	}
+	start := int(height) - 1
+	if start < 0 || start >= len(l.chain) {
+		return nil, nil
+	}
+	end := min(start+int(count), len(l.chain))
+	return l.chain[start:end], nil
+}
+
+func (l *limitedMomenta) setLimit(n uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.limit = n
+}
+
+func (l *limitedMomenta) take() []uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c := l.counts
+	l.counts = nil
+	return c
+}
+
+func checkMomentaRead(t *testing.T, step string, lm *limitedMomenta, wEnd io.ReadWriter, height, count uint64, wantHeights []uint64, wantCounts []uint64) {
+	t.Helper()
+	got, end := requestMomenta(t, wEnd, height, count)
+	if int(end) != len(wantHeights) || len(got) != len(wantHeights) {
+		t.Fatalf("%s: got %d momenta, RangeEnd %d, want %d", step, len(got), end, len(wantHeights))
+	}
+	for i, dm := range got {
+		if dm.Momentum.Height != wantHeights[i] {
+			t.Fatalf("%s: momentum %d height = %d, want %d", step, i, dm.Momentum.Height, wantHeights[i])
+		}
+	}
+	if c := lm.take(); !reflect.DeepEqual(c, wantCounts) {
+		t.Fatalf("%s: counts = %v, want %v", step, c, wantCounts)
+	}
+}
+
+func TestServeMomentaHalvesOversizedRange(t *testing.T) {
+	t.Run("halves until it fits", func(t *testing.T) {
+		sEnd, wEnd := newChannel(t)
+		st := &workerState{}
+		lm := newLimitedMomenta(2)
+		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
+		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+
+		checkMomentaRead(t, "read", lm, wEnd, 1, 5, []uint64{1, 2}, []uint64{5, 2})
+		if sh := servedHeightOf(st); sh != 2 {
+			t.Fatalf("servedHeight = %d, want 2", sh)
+		}
+		wEnd.Close()
+		if err := waitServe(t, done); err != nil {
+			t.Fatalf("serve = %v, want nil", err)
+		}
+	})
+
+	t.Run("too large at count 1", func(t *testing.T) {
+		sEnd, wEnd := newChannel(t)
+		st := &workerState{}
+		lm := newLimitedMomenta(0)
+		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
+		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+
+		if err := ipc.WriteMessage(wEnd, ipc.MomentaRequest{Height: 1, Count: 5}); err != nil {
+			t.Fatalf("WriteMessage: %v", err)
+		}
+		m, err := ipc.ReadMessage(wEnd, ipc.Supervisor)
+		if err != nil {
+			t.Fatalf("ReadMessage: %v", err)
+		}
+		se, ok := m.(ipc.SourceError)
+		if !ok || se.Kind != ipc.SourceUnavailable {
+			t.Fatalf("reply = %#v, want a SourceError of kind unavailable", m)
+		}
+		if c := lm.take(); !reflect.DeepEqual(c, []uint64{5, 2, 1}) {
+			t.Fatalf("counts = %v, want [5 2 1]", c)
+		}
+		wEnd.Close()
+		if err := waitServe(t, done); err != nil {
+			t.Fatalf("serve = %v, want nil", err)
+		}
+	})
+}
+
+func TestServeMomentaCountGrowsBack(t *testing.T) {
+	sEnd, wEnd := newChannel(t)
+	st := &workerState{}
+	lm := newLimitedMomenta(1)
+	src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
+	done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+
+	checkMomentaRead(t, "step 1", lm, wEnd, 1, 5, []uint64{1}, []uint64{5, 2, 1})
+
+	lm.setLimit(5)
+	checkMomentaRead(t, "step 2", lm, wEnd, 3, 1, []uint64{3}, []uint64{1})
+	checkMomentaRead(t, "step 3", lm, wEnd, 1, 5, []uint64{1, 2}, []uint64{2})
+
+	wEnd.Close()
+	if err := waitServe(t, done); err != nil {
+		t.Fatalf("serve = %v, want nil", err)
+	}
+
+	// A restarted worker reuses the same workerState.
+	sEnd2, wEnd2 := newChannel(t)
+	done2 := runServe(t, sEnd2, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+	checkMomentaRead(t, "step 4", lm, wEnd2, 1, 5, []uint64{1, 2, 3, 4}, []uint64{4})
+	for i := 0; i < 2; i++ {
+		checkMomentaRead(t, "step 5", lm, wEnd2, 1, 5, []uint64{1, 2, 3, 4, 5}, []uint64{5})
+	}
+	wEnd2.Close()
+	if err := waitServe(t, done2); err != nil {
 		t.Fatalf("serve = %v, want nil", err)
 	}
 }
@@ -825,6 +979,151 @@ func TestServeWriteFailure(t *testing.T) {
 
 // --- against the real client (internal/ipc.Client) ---
 
+func TestServeAssignment(t *testing.T) {
+	entries := []ledger.AssignmentEntry{
+		{Ordinal: 3, GlobalInputIndex: 10, SourceAccountBlockHash: types.Hash{0x01}, SendMomentumHeight: 7},
+		{Ordinal: 4, GlobalInputIndex: 12, SourceAccountBlockHash: types.Hash{0x02}, SendMomentumHeight: 8},
+	}
+	type call struct {
+		domainID    uint32
+		height      uint64
+		hash        types.Hash
+		nextOrdinal uint64
+	}
+	run := func(t *testing.T, reply func() ([]ledger.AssignmentEntry, error)) (*ipc.Client, *call) {
+		t.Helper()
+		sEnd, wEnd := newChannel(t)
+		w := WorkerConfig{DomainID: 9, Role: "EXECUTOR", STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
+		cfg := Config{ExecutorAddress: types.Address{0x09}, NetworkName: "devnet", ConfirmationDepth: 10, StoragePath: "/var/lib/executor"}
+		if err := ipc.WriteMessage(sEnd, cfg.workerConfig(w)); err != nil {
+			t.Fatalf("WriteMessage config: %v", err)
+		}
+		got := new(call)
+		src := Sources{Assignments: fakeAssignments{assignment: func(d uint32, h uint64, hash types.Hash, n uint64) ([]ledger.AssignmentEntry, error) {
+			*got = call{d, h, hash, n}
+			return reply()
+		}}}
+		done := runServe(t, sEnd, w, types.Address{}, src, &workerState{})
+		client := ipc.NewClient(wEnd, nil)
+		if _, err := client.ReadConfig(); err != nil {
+			t.Fatalf("ReadConfig: %v", err)
+		}
+		t.Cleanup(func() {
+			wEnd.Close()
+			if err := waitServe(t, done); err != nil {
+				t.Errorf("serve = %v, want nil", err)
+			}
+		})
+		return client, got
+	}
+
+	t.Run("entries", func(t *testing.T) {
+		client, got := run(t, func() ([]ledger.AssignmentEntry, error) { return entries, nil })
+		out, err := client.Assignment(9, 20, types.Hash{0x0A}, 3)
+		if err != nil {
+			t.Fatalf("Assignment: %v", err)
+		}
+		if want := (call{9, 20, types.Hash{0x0A}, 3}); *got != want {
+			t.Fatalf("source saw %+v, want %+v", *got, want)
+		}
+		if !reflect.DeepEqual(out, entries) {
+			t.Fatalf("entries = %+v, want %+v", out, entries)
+		}
+	})
+
+	t.Run("plain error", func(t *testing.T) {
+		client, _ := run(t, func() ([]ledger.AssignmentEntry, error) { return nil, errors.New("node down") })
+		_, err := client.Assignment(9, 20, types.Hash{}, 0)
+		if err == nil || errors.Is(err, recovery.ErrHalted) || errors.Is(err, ipc.ErrChannel) {
+			t.Fatalf("err = %v, want a plain error", err)
+		}
+	})
+
+	t.Run("halt", func(t *testing.T) {
+		client, _ := run(t, func() ([]ledger.AssignmentEntry, error) {
+			return nil, fmt.Errorf("%w: bad", recovery.ErrHalted)
+		})
+		if _, err := client.Assignment(9, 20, types.Hash{}, 0); !errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("err = %v, want ErrHalted", err)
+		}
+	})
+
+	t.Run("unencodable entry", func(t *testing.T) {
+		client, _ := run(t, func() ([]ledger.AssignmentEntry, error) {
+			return []ledger.AssignmentEntry{{Ordinal: 0}}, nil
+		})
+		_, err := client.Assignment(9, 20, types.Hash{}, 0)
+		if !errors.Is(err, recovery.ErrHalted) || !strings.Contains(err.Error(), "cannot be sent") {
+			t.Fatalf("err = %v, want ErrHalted containing %q", err, "cannot be sent")
+		}
+	})
+}
+
+func TestServeCap(t *testing.T) {
+	type call struct {
+		domainID uint32
+		height   uint64
+		hash     types.Hash
+		assets   []codec.AssetID
+	}
+	asset := codec.AssetIDFromZTS(types.ZnnTokenStandard)
+	asset2 := codec.AssetIDFromZTS(types.QsrTokenStandard)
+	run := func(t *testing.T, reply func() ([]codec.U256, error)) (*ipc.Client, *[]call) {
+		t.Helper()
+		sEnd, wEnd := newChannel(t)
+		w := WorkerConfig{DomainID: 9, Role: "EXECUTOR", STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
+		cfg := Config{ExecutorAddress: types.Address{0x09}, NetworkName: "devnet", ConfirmationDepth: 10, StoragePath: "/var/lib/executor"}
+		if err := ipc.WriteMessage(sEnd, cfg.workerConfig(w)); err != nil {
+			t.Fatalf("WriteMessage config: %v", err)
+		}
+		got := new([]call)
+		src := Sources{Caps: fakeCaps{cap: func(d uint32, h uint64, hash types.Hash, a []codec.AssetID) ([]codec.U256, error) {
+			*got = append(*got, call{d, h, hash, a})
+			return reply()
+		}}}
+		done := runServe(t, sEnd, w, types.Address{}, src, &workerState{})
+		client := ipc.NewClient(wEnd, nil)
+		if _, err := client.ReadConfig(); err != nil {
+			t.Fatalf("ReadConfig: %v", err)
+		}
+		t.Cleanup(func() {
+			wEnd.Close()
+			if err := waitServe(t, done); err != nil {
+				t.Errorf("serve = %v, want nil", err)
+			}
+		})
+		return client, got
+	}
+
+	t.Run("amounts", func(t *testing.T) {
+		client, got := run(t, func() ([]codec.U256, error) { return []codec.U256{{31: 7}, {31: 8}}, nil })
+		out, err := client.MaxBatchWithdrawals(9, 20, types.Hash{0x0A}, []codec.AssetID{asset, asset2})
+		if want := []codec.U256{{31: 7}, {31: 8}}; err != nil || !reflect.DeepEqual(out, want) {
+			t.Fatalf("MaxBatchWithdrawals = %x, %v; want %x", out, err, want)
+		}
+		if want := []call{{9, 20, types.Hash{0x0A}, []codec.AssetID{asset, asset2}}}; !reflect.DeepEqual(*got, want) {
+			t.Fatalf("source saw %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("plain error", func(t *testing.T) {
+		client, _ := run(t, func() ([]codec.U256, error) { return nil, errors.New("node down") })
+		_, err := client.MaxBatchWithdrawals(9, 20, types.Hash{}, []codec.AssetID{asset})
+		if err == nil || errors.Is(err, recovery.ErrHalted) || errors.Is(err, ipc.ErrChannel) {
+			t.Fatalf("err = %v, want a plain error", err)
+		}
+	})
+
+	t.Run("halt", func(t *testing.T) {
+		client, _ := run(t, func() ([]codec.U256, error) {
+			return nil, fmt.Errorf("%w: bad", recovery.ErrHalted)
+		})
+		if _, err := client.MaxBatchWithdrawals(9, 20, types.Hash{}, []codec.AssetID{asset}); !errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("err = %v, want ErrHalted", err)
+		}
+	})
+}
+
 func TestServeAgainstRealClient(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
 
@@ -938,4 +1237,88 @@ func TestServeAgainstRealClient(t *testing.T) {
 	if err := waitServe(t, done); err != nil {
 		t.Fatalf("serve = %v, want nil", err)
 	}
+}
+
+func TestServeMomentaRememberedCount(t *testing.T) {
+	t.Run("a failure at count 1 is remembered", func(t *testing.T) {
+		sEnd, wEnd := newChannel(t)
+		st := &workerState{}
+		lm := newLimitedMomenta(0)
+		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
+		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+
+		for i, want := range [][]uint64{{5, 2, 1}, {1}} {
+			if err := ipc.WriteMessage(wEnd, ipc.MomentaRequest{Height: 1, Count: 5}); err != nil {
+				t.Fatalf("WriteMessage: %v", err)
+			}
+			m, err := ipc.ReadMessage(wEnd, ipc.Supervisor)
+			if err != nil {
+				t.Fatalf("ReadMessage: %v", err)
+			}
+			if se, ok := m.(ipc.SourceError); !ok || se.Kind != ipc.SourceUnavailable {
+				t.Fatalf("read %d: reply = %#v, want a SourceError of kind unavailable", i, m)
+			}
+			if c := lm.take(); !reflect.DeepEqual(c, want) {
+				t.Fatalf("read %d: counts = %v, want %v", i, c, want)
+			}
+		}
+		wEnd.Close()
+		if err := waitServe(t, done); err != nil {
+			t.Fatalf("serve = %v, want nil", err)
+		}
+	})
+
+	t.Run("another error is not retried and leaves the count", func(t *testing.T) {
+		sEnd, wEnd := newChannel(t)
+		st := &workerState{}
+		var mu sync.Mutex
+		var counts []uint64
+		src := Sources{Momenta: fakeMomenta{byHeight: func(height, count uint64) ([]*nom.DetailedMomentum, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			counts = append(counts, count)
+			return nil, errors.New("znnd: connection refused")
+		}}}
+		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+
+		if err := ipc.WriteMessage(wEnd, ipc.MomentaRequest{Height: 1, Count: 5}); err != nil {
+			t.Fatalf("WriteMessage: %v", err)
+		}
+		m, err := ipc.ReadMessage(wEnd, ipc.Supervisor)
+		if err != nil {
+			t.Fatalf("ReadMessage: %v", err)
+		}
+		if _, ok := m.(ipc.SourceError); !ok {
+			t.Fatalf("reply = %#v, want a SourceError", m)
+		}
+		wEnd.Close()
+		if err := waitServe(t, done); err != nil {
+			t.Fatalf("serve = %v, want nil", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !reflect.DeepEqual(counts, []uint64{5}) {
+			t.Fatalf("counts = %v, want [5]", counts)
+		}
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if st.momentaCount != 0 {
+			t.Fatalf("momentaCount = %d, want 0", st.momentaCount)
+		}
+	})
+
+	t.Run("each worker keeps its own count", func(t *testing.T) {
+		lm := newLimitedMomenta(2)
+		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
+		for i := 0; i < 2; i++ {
+			sEnd, wEnd := newChannel(t)
+			st := &workerState{}
+			done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
+			checkMomentaRead(t, "read", lm, wEnd, 1, 5, []uint64{1, 2}, []uint64{5, 2})
+			wEnd.Close()
+			if err := waitServe(t, done); err != nil {
+				t.Fatalf("serve = %v, want nil", err)
+			}
+		}
+	})
 }

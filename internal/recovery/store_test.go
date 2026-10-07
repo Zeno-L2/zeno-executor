@@ -190,7 +190,7 @@ func (c *committer) position(h uint64) Position {
 	return Position{
 		LastInputSeq: h * c.seqMul, PostStateRoot: root,
 		MomentumHeight: h, MomentumHash: canonHash(h, c.salt),
-		NextGlobalIndex: h + 1, NextBatchID: h + 1,
+		NextOrdinal: h + 1, NextBatchID: h + 1,
 	}
 }
 
@@ -270,7 +270,7 @@ func TestCursorRoundTrip(t *testing.T) {
 	if _, ok, err := ReadCursor(cfg.Layout); err != nil || ok {
 		t.Fatalf("ReadCursor on an empty tree = ok %v, err %v", ok, err)
 	}
-	want := Position{LastInputSeq: 5, PostStateRoot: types.Hash{1}, MomentumHeight: 9, MomentumHash: types.Hash{2}, NextGlobalIndex: 11, NextBatchID: 3}
+	want := Position{LastInputSeq: 5, PostStateRoot: types.Hash{1}, MomentumHeight: 9, MomentumHash: types.Hash{2}, NextOrdinal: 11, NextBatchID: 3}
 	if err := writeJSON(cfg.Layout.Cursor, want); err != nil {
 		t.Fatal(err)
 	}

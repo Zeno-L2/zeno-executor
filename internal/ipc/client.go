@@ -6,8 +6,10 @@ import (
 	"io"
 
 	"github.com/zenon-network/go-zenon/chain/nom"
+	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 )
 
@@ -17,8 +19,9 @@ import (
 var ErrChannel = errors.New("ipc: supervisor channel failed")
 
 // Client is the worker side of the channel: it implements ledger.MomentumSource,
-// recovery.AnchorSource and the OnCommit function runtime.Config takes. No locking: every call
-// comes from the runtime's single loop goroutine, one request and its whole reply at a time.
+// ledger.AssignmentSource, ledger.CapSource, recovery.AnchorSource and the OnCommit function runtime.Config
+// takes. No locking: every call comes from the runtime's single loop goroutine, one request
+// and its whole reply at a time.
 type Client struct {
 	conn     io.ReadWriter
 	onBroken func()
@@ -190,6 +193,75 @@ func (c *Client) FinalizedAnchor(domainID uint32) (recovery.Anchor, bool, error)
 		return recovery.Anchor{}, false, sourceErr(v)
 	default:
 		return recovery.Anchor{}, false, c.fail(fmt.Errorf("ipc: unexpected reply %T to an anchor request", m))
+	}
+}
+
+// Assignment implements ledger.AssignmentSource. A domainID other than the one ReadConfig
+// returned, or height 0, is a plain error: nothing is sent and the client stays healthy.
+func (c *Client) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	if c.broken != nil {
+		return nil, c.broken
+	}
+	if !c.haveDomainID || domainID != c.domainID {
+		return nil, fmt.Errorf("ipc: domainId %d is not this worker's configured domain", domainID)
+	}
+	if height < 1 {
+		return nil, errors.New("ipc: assignment height must be at least 1")
+	}
+	if err := c.send(AssignmentRequest{Height: height, Hash: hash, NextOrdinal: nextOrdinal}); err != nil {
+		return nil, err
+	}
+	m, err := c.recv()
+	if err != nil {
+		return nil, err
+	}
+	switch v := m.(type) {
+	case Assignment:
+		// The first entry's ordinal is the follower's check: a misnumbered start is a
+		// consistency fault, not a channel failure.
+		for i := 1; i < len(v.Entries); i++ {
+			if want := v.Entries[0].Ordinal + uint64(i); v.Entries[i].Ordinal != want {
+				return nil, c.fail(fmt.Errorf("ipc: assignment entry %d has ordinal %d, want %d", i, v.Entries[i].Ordinal, want))
+			}
+		}
+		return v.Entries, nil
+	case SourceError:
+		return nil, sourceErr(v)
+	default:
+		return nil, c.fail(fmt.Errorf("ipc: unexpected reply %T to an assignment request", m))
+	}
+}
+
+// MaxBatchWithdrawals implements ledger.CapSource with one CapRequest. A domainID other than
+// the one ReadConfig returned, height 0, or an asset count outside [1, codec.MaxAssetsPerBatch]
+// is a plain error: nothing is sent and the client stays healthy.
+func (c *Client) MaxBatchWithdrawals(domainID uint32, height uint64, hash types.Hash, assets []codec.AssetID) ([]codec.U256, error) {
+	if c.broken != nil {
+		return nil, c.broken
+	}
+	if !c.haveDomainID || domainID != c.domainID {
+		return nil, fmt.Errorf("ipc: domainId %d is not this worker's configured domain", domainID)
+	}
+	if height < 1 {
+		return nil, errors.New("ipc: cap height must be at least 1")
+	}
+	if err := c.send(CapRequest{Height: height, Hash: hash, Assets: assets}); err != nil {
+		return nil, err
+	}
+	m, err := c.recv()
+	if err != nil {
+		return nil, err
+	}
+	switch v := m.(type) {
+	case Cap:
+		if len(v.Amounts) != len(assets) {
+			return nil, c.fail(fmt.Errorf("ipc: cap reply carries %d amounts for %d assets", len(v.Amounts), len(assets)))
+		}
+		return v.Amounts, nil
+	case SourceError:
+		return nil, sourceErr(v)
+	default:
+		return nil, c.fail(fmt.Errorf("ipc: unexpected reply %T to a cap request", m))
 	}
 }
 

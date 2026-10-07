@@ -141,7 +141,7 @@ type Ready struct {
 	// Store is loaded from a snapshot, or empty and seeded with domain genesis.
 	Store *state.Store
 	// Position is where to resume; Fresh is true when nothing has been committed, in which case
-	// Position is zero and reading starts at momentum height 1 with global index 0.
+	// Position is zero and reading starts at momentum height 1 with domain ordinal 0.
 	Position Position
 	Fresh    bool
 	// Anchor is the finalized anchor this boot read; HaveAnchor is false when no batch for the
@@ -575,10 +575,8 @@ func momentumHashes(moms []*nom.DetailedMomentum) map[uint64]types.Hash {
 // it regains ConfirmationDepth+1 entries once that many momenta have been consumed, so until
 // then a second reorg below the entries it holds halts rather than rolling back again.
 //
-// The configured SettlementFilter must be stateless across Follower instances. The caller
-// builds a fresh Follower after this returns and hands it the same filter, which re-walks
-// momenta the retired Follower already fed it, on a different chain. Phase 1's UnwiredFilter
-// is stateless.
+// The caller builds a fresh Follower at the returned Position, so the next expected ordinal
+// rolls back with the cursor.
 //
 // The plugin's local code store is not rolled back: domain.Domain exposes no rollback hook.
 // A replayed canonical DeployStartArgs deletes every chunk slot and the pending record for its

@@ -21,6 +21,7 @@ import (
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
+	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 )
 
@@ -92,6 +93,15 @@ func (s *chainSource) DetailedMomentumsByHeight(height, count uint64) ([]*nom.De
 	return out, nil
 }
 
+// Assignment answers Settlement's assignment over a snapshot of the chain. It leaves the
+// request history alone, so tests asserting on ranged reads see only the follower's reads.
+func (s *chainSource) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	s.mu.Lock()
+	moms := append([]*nom.DetailedMomentum(nil), s.moms...)
+	s.mu.Unlock()
+	return ledgertest.Assign(moms, domainID, height, hash, nextOrdinal)
+}
+
 // requestedFrom reports whether a ranged read starting at height has happened since the last set.
 func (s *chainSource) requestedFrom(height uint64) bool {
 	s.mu.Lock()
@@ -143,20 +153,13 @@ func buildShape(from, to uint64, saltAt func(height uint64) byte, d1At func(heig
 	for h := from; h <= to; h++ {
 		var blocks []*nom.AccountBlock
 		add := func(domainID byte, j int) {
-			in := codec.Input{
-				SourceAccountBlockHash: blockHash(h, domainID, j),
-				Args:                   codec.CallL2Args{TargetContract: types.Hash{domainID}},
-			}
-			data, err := in.Encode()
-			if err != nil {
-				panic(fmt.Sprintf("encode input: %v", err))
-			}
-			blocks = append(blocks, &nom.AccountBlock{Address: types.Address{domainID}, Height: h, Hash: blockHash(h, domainID, j), Data: data})
+			blocks = append(blocks, &nom.AccountBlock{Address: types.Address{domainID}, Height: h, Hash: blockHash(h, domainID, j), Data: ledgertest.SendData(uint32(domainID), nil)})
 		}
 		for j := 0; j < d1At(h); j++ {
 			add(1, j)
 		}
 		add(2, 0)
+		blocks = append(blocks, &nom.AccountBlock{Address: types.SettlementContract, Height: h, Hash: blockHash(h, 0xFF, 0)})
 		hash := momHash(h, saltAt(h))
 		out = append(out, &nom.DetailedMomentum{
 			Momentum: &nom.Momentum{
@@ -177,11 +180,10 @@ func blockHash(h uint64, domainID byte, j int) types.Hash {
 	return out
 }
 
-// byAddress routes a block to the domain named by its address's first byte.
-type byAddress struct{}
-
-func (byAddress) Accept(_ *nom.Momentum, block *nom.AccountBlock) (*ledger.Envelope, error) {
-	return &ledger.Envelope{DomainID: uint32(block.Address[0]), Payload: block.Data}, nil
+// testSource is a momentum source that also answers Settlement's assignment.
+type testSource interface {
+	ledger.MomentumSource
+	ledger.AssignmentSource
 }
 
 type noAnchor struct{}
@@ -190,7 +192,7 @@ func (noAnchor) FinalizedAnchor(uint32) (recovery.Anchor, bool, error) {
 	return recovery.Anchor{}, false, nil
 }
 
-func validConfig(t *testing.T, src ledger.MomentumSource) Config {
+func validConfig(t *testing.T, src testSource) Config {
 	t.Helper()
 	return Config{
 		DomainID:          1,
@@ -200,7 +202,8 @@ func validConfig(t *testing.T, src ledger.MomentumSource) Config {
 		STFSpecHash:       types.Hash{0xAA},
 		ConfirmationDepth: 2,
 		Momenta:           src,
-		Filter:            byAddress{},
+		Assignments:       src,
+		Caps:              ledgertest.Caps{0x80},
 		Anchors:           noAnchor{},
 		Retry:             recovery.RetryPolicy{SourceAttempts: 2, SourceInterval: time.Millisecond, AwaitDAAttempts: 1, AwaitDAInterval: time.Millisecond},
 	}
@@ -261,7 +264,8 @@ func TestConfigValidation(t *testing.T) {
 		"zero confirmation depth":  func(c *Config) { c.ConfirmationDepth = 0 },
 		"depth above the maximum":  func(c *Config) { c.ConfirmationDepth = recovery.MaxConfirmationDepth + 1 },
 		"nil momentum source":      func(c *Config) { c.Momenta = nil },
-		"nil filter":               func(c *Config) { c.Filter = nil },
+		"nil assignment source":    func(c *Config) { c.Assignments = nil },
+		"nil cap source":           func(c *Config) { c.Caps = nil },
 		"nil anchor source":        func(c *Config) { c.Anchors = nil },
 	}
 	if err := validConfig(t, src).validate(); err != nil {
@@ -293,7 +297,7 @@ func TestRunCommitsAndRecovers(t *testing.T) {
 	}
 
 	pos, _ := cursorAt(t, cfg)
-	if pos.MomentumHeight != 10 || pos.NextGlobalIndex != 20 {
+	if pos.MomentumHeight != 10 || pos.NextOrdinal != 10 {
 		t.Fatalf("cursor = %+v", pos)
 	}
 	layout, _ := recovery.NewLayout(cfg.StoragePath, cfg.DomainID)
@@ -365,6 +369,101 @@ func (failingSource) FrontierHeight() (uint64, error) {
 
 func (failingSource) DetailedMomentumsByHeight(uint64, uint64) ([]*nom.DetailedMomentum, error) {
 	return nil, errors.New("znnd down")
+}
+
+func (failingSource) Assignment(uint32, uint64, types.Hash, uint64) ([]ledger.AssignmentEntry, error) {
+	return nil, errors.New("znnd down")
+}
+
+// overrideAssignment serves the chain from the embedded source and answers every assignment
+// with fn.
+type overrideAssignment struct {
+	*chainSource
+	fn func(height uint64, nextOrdinal uint64) ([]ledger.AssignmentEntry, error)
+}
+
+func (o overrideAssignment) Assignment(_ uint32, height uint64, _ types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	return o.fn(height, nextOrdinal)
+}
+
+func TestAssignmentErrorMapping(t *testing.T) {
+	run := func(t *testing.T, fn func(height, nextOrdinal uint64) ([]ledger.AssignmentEntry, error)) error {
+		t.Helper()
+		inner := &chainSource{}
+		inner.set(buildChain(t, 6, 0), 8)
+		cfg := validConfig(t, overrideAssignment{chainSource: inner, fn: fn})
+		cfg.StoragePath = filepath.Join(t.TempDir(), "x")
+		rt := New(cfg)
+		rt.Register(scriptDomain{})
+		return rt.Run(context.Background())
+	}
+
+	t.Run("a halt from the assignment source halts", func(t *testing.T) {
+		err := run(t, func(uint64, uint64) ([]ledger.AssignmentEntry, error) {
+			return nil, fmt.Errorf("cursor mismatch: %w", recovery.ErrHalted)
+		})
+		if !errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("Run = %v, want ErrHalted", err)
+		}
+	})
+	t.Run("a plain assignment error is a source outage", func(t *testing.T) {
+		err := run(t, func(uint64, uint64) ([]ledger.AssignmentEntry, error) {
+			return nil, errors.New("znnd down")
+		})
+		if !errors.Is(err, recovery.ErrSourceUnavailable) || errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("Run = %v, want ErrSourceUnavailable, not ErrHalted", err)
+		}
+	})
+	t.Run("an assignment fault halts", func(t *testing.T) {
+		err := run(t, func(height, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+			return []ledger.AssignmentEntry{{Ordinal: nextOrdinal, SourceAccountBlockHash: types.Hash{0x77}, SendMomentumHeight: height}}, nil
+		})
+		if !errors.Is(err, recovery.ErrHalted) || !errors.Is(err, ledger.ErrAssignmentFault) {
+			t.Fatalf("Run = %v, want ErrHalted matching ErrAssignmentFault", err)
+		}
+	})
+}
+
+// countingCaps answers every cap read with err and counts the reads.
+type countingCaps struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (c *countingCaps) MaxBatchWithdrawals(uint32, uint64, types.Hash, []codec.AssetID) ([]codec.U256, error) {
+	c.calls.Add(1)
+	return nil, c.err
+}
+
+func TestCapErrorMapping(t *testing.T) {
+	run := func(t *testing.T, caps *countingCaps) error {
+		t.Helper()
+		src := &chainSource{}
+		src.set(buildChain(t, 6, 0), 8)
+		cfg := validConfig(t, src)
+		cfg.Caps = caps
+		cfg.StoragePath = filepath.Join(t.TempDir(), "x")
+		rt := New(cfg)
+		rt.Register(capDomain{})
+		return rt.Run(context.Background())
+	}
+
+	t.Run("a plain cap error is a source outage without a retry", func(t *testing.T) {
+		caps := &countingCaps{err: errors.New("znnd down")}
+		err := run(t, caps)
+		if !errors.Is(err, recovery.ErrSourceUnavailable) || !errors.Is(err, ledger.ErrCapRead) || errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("Run = %v, want ErrSourceUnavailable matching ErrCapRead, not ErrHalted", err)
+		}
+		if n := caps.calls.Load(); n != 1 {
+			t.Fatalf("cap calls = %d, want 1", n)
+		}
+	})
+	t.Run("a halt from the cap source halts", func(t *testing.T) {
+		caps := &countingCaps{err: fmt.Errorf("bad proof: %w", recovery.ErrHalted)}
+		if err := run(t, caps); !errors.Is(err, recovery.ErrHalted) {
+			t.Fatalf("Run = %v, want ErrHalted", err)
+		}
+	})
 }
 
 func TestRunRecoversFromReorgAboveCommit(t *testing.T) {
@@ -1149,7 +1248,7 @@ func TestAnchorVerificationDuringTheRun(t *testing.T) {
 
 // flakySource fails FrontierHeight according to fail, called with the 1-based call number.
 type flakySource struct {
-	ledger.MomentumSource
+	testSource
 	mu    sync.Mutex
 	calls int
 	fail  func(call int) error
@@ -1163,7 +1262,7 @@ func (f *flakySource) FrontierHeight() (uint64, error) {
 	if err := f.fail(n); err != nil {
 		return 0, err
 	}
-	return f.MomentumSource.FrontierHeight()
+	return f.testSource.FrontierHeight()
 }
 
 func (f *flakySource) callCount() int {
@@ -1179,7 +1278,7 @@ func TestSourceRetryBudget(t *testing.T) {
 	newRun := func(attempts int, interval time.Duration, fail func(int) error) (Config, *flakySource) {
 		inner := &chainSource{}
 		inner.set(buildChain(t, 6, 0), 8)
-		src := &flakySource{MomentumSource: inner, fail: fail}
+		src := &flakySource{testSource: inner, fail: fail}
 		cfg := validConfig(t, src)
 		cfg.Retry = recovery.RetryPolicy{SourceAttempts: attempts, SourceInterval: interval}
 		return cfg, src
@@ -1263,6 +1362,10 @@ func (s streamSource) DetailedMomentumsByHeight(height, count uint64) ([]*nom.De
 		count = s.perRead
 	}
 	return buildShape(height, height+count-1, saltFrom(1<<62, 0), dense), nil
+}
+
+func (streamSource) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	return ledgertest.Assign(buildShape(1, height, saltFrom(1<<62, 0), dense), domainID, height, hash, nextOrdinal)
 }
 
 // gateDomain is scriptDomain that blocks the apply of input number stops[i] until the test lets
@@ -1470,7 +1573,7 @@ func TestCommitBoundaryClosesAtAMomentumBoundary(t *testing.T) {
 
 	f, err := ledger.New(ledger.Config{
 		DomainID: 1, ConfirmationDepth: 2, StartHeight: 1,
-		Source: streamSource{perRead: 1}, Filter: byAddress{},
+		Source: streamSource{perRead: 1}, Assignments: streamSource{perRead: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1511,7 +1614,7 @@ func TestDomainLock(t *testing.T) {
 	cfg2 := cfg
 	inner := &chainSource{}
 	inner.set(chain, 12)
-	flaky := &flakySource{MomentumSource: inner, fail: func(int) error { return nil }}
+	flaky := &flakySource{testSource: inner, fail: func(int) error { return nil }}
 	cfg2.Momenta = flaky
 	rt2 := New(cfg2)
 	rt2.Register(scriptDomain{})

@@ -104,18 +104,19 @@ func sleep(ctx context.Context, d time.Duration) bool {
 
 // build wires the follower, commit boundary and driver at a ready position.
 func (l *loop) build(rdy recovery.Ready) error {
-	startHeight, startIndex := uint64(1), uint64(0)
+	startHeight, startOrdinal := uint64(1), uint64(0)
 	if !rdy.Fresh {
-		startHeight, startIndex = rdy.Position.MomentumHeight+1, rdy.Position.NextGlobalIndex
+		startHeight, startOrdinal = rdy.Position.MomentumHeight+1, rdy.Position.NextOrdinal
 	}
 	follower, err := ledger.New(ledger.Config{
 		DomainID:          l.cfg.DomainID,
 		ConfirmationDepth: l.cfg.ConfirmationDepth,
 		StartHeight:       startHeight,
-		StartGlobalIndex:  startIndex,
+		StartOrdinal:      startOrdinal,
 		MaxBufferedInputs: commitInputInterval,
 		Source:            l.cfg.Momenta,
-		Filter:            l.cfg.Filter,
+		Assignments:       l.cfg.Assignments,
+		Caps:              l.cfg.Caps,
 	})
 	if err != nil {
 		return err
@@ -162,8 +163,13 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 			}
 			sourceFailures = 0
 			continue
+		// An assignment halt also matches ledger.ErrSourceRead, so this case precedes that one.
 		case errors.Is(err, recovery.ErrHalted):
 			return err
+		// The driver may have applied inputs it now discards, so a cap outage is never retried
+		// here: the run ends and a restart re-derives from the last commit.
+		case errors.Is(err, ledger.ErrCapRead):
+			return fmt.Errorf("%w: %w", recovery.ErrSourceUnavailable, err)
 		case errors.Is(err, ledger.ErrSourceRead):
 			sourceFailures++
 			if sourceFailures >= policy.SourceAttempts {
@@ -216,12 +222,12 @@ func (l *loop) commitStep() error {
 	}
 
 	pos := recovery.Position{
-		LastInputSeq:    last.LastInputSeq,
-		PostStateRoot:   last.PostStateRoot,
-		MomentumHeight:  cp.Height,
-		MomentumHash:    cp.Hash,
-		NextGlobalIndex: cp.NextGlobalIndex,
-		NextBatchID:     last.BatchID + 1,
+		LastInputSeq:   last.LastInputSeq,
+		PostStateRoot:  last.PostStateRoot,
+		MomentumHeight: cp.Height,
+		MomentumHash:   cp.Hash,
+		NextOrdinal:    cp.NextOrdinal,
+		NextBatchID:    last.BatchID + 1,
 	}
 	recent := l.follower.RecentMomenta()
 	window := make([]recovery.MomentumRef, len(recent))
@@ -303,9 +309,8 @@ func (l *loop) checkAnchor(b batch.Batch) error {
 // consumed since. The rollback there retracts nothing: it reloads the store this method just
 // discarded, from the cursor's own snapshot, and leaves the recorded window as it stands.
 //
-// The configured SettlementFilter is reused by the follower built afterwards, and that
-// follower re-walks momenta the retired one already fed it, on a different chain. Phase 1's
-// filter is stateless, which makes that sound; a stateful filter must not be wired in.
+// The follower built afterwards starts at the rolled-back Position, so its next expected
+// ordinal rolls back with the cursor.
 func (l *loop) reorg() error {
 	log.Printf("runtime: reorg detected at committed momentum height %d, rolling back", l.pos.MomentumHeight)
 	l.pending = nil

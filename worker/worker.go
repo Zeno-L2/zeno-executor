@@ -15,7 +15,6 @@ import (
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
 	"github.com/digitalSloth/go-executor/runtime"
 )
@@ -34,16 +33,16 @@ var retry recovery.RetryPolicy
 
 // Main is the worker binary's entry point: it drives run over the supervisor channel on
 // descriptor 3 and exits with the resulting status.
-func Main(newPlugin NewPlugin, filter ledger.SettlementFilter) {
+func Main(newPlugin NewPlugin) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	code := run(ctx, os.NewFile(3, "supervisor"), newPlugin, filter)
+	code := run(ctx, os.NewFile(3, "supervisor"), newPlugin)
 	stop() // a deferred call never runs past os.Exit
 	os.Exit(code)
 }
 
 // run reads the worker's configuration from conn, constructs and registers the domain plugin,
 // and drives runtime.Run to completion, returning the process exit status.
-func run(ctx context.Context, conn io.ReadWriter, newPlugin NewPlugin, filter ledger.SettlementFilter) int {
+func run(ctx context.Context, conn io.ReadWriter, newPlugin NewPlugin) int {
 	log.SetPrefix("worker: ")
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -70,7 +69,8 @@ func run(ctx context.Context, conn io.ReadWriter, newPlugin NewPlugin, filter le
 		STFSpecHash:       cfg.STFSpecHash,
 		ConfirmationDepth: cfg.ConfirmationDepth,
 		Momenta:           client,
-		Filter:            filter,
+		Assignments:       client,
+		Caps:              client,
 		Anchors:           client,
 		Retry:             retry,
 		OnCommit:          client.ReportCommitted,

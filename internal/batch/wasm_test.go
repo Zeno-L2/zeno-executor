@@ -162,7 +162,7 @@ func TestDriverEndToEndThroughWasmPlugin(t *testing.T) {
 		{Ctx: domain.InputContext{GlobalInputIndex: 2, L1Sender: deployer}, Payload: deployFinalize},
 		// The module hard-codes global_input_index 105; the deploy inputs' indices are
 		// otherwise unconstrained (the driver does no index arithmetic).
-		{Ctx: domain.InputContext{GlobalInputIndex: 105, L1Sender: deployer}, Payload: call},
+		{Ctx: domain.InputContext{GlobalInputIndex: 105, L1Sender: deployer, Caps: allCaps(codec.U256{0x80})}, Payload: call},
 	}
 
 	cfg := Config{

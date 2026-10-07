@@ -87,6 +87,9 @@ Encoding rules:
   that needs the distinction adds its own field rather than reinterpreting absence.
 - A vector's top-level `code_hash` is SPEC's pre-instrumentation `code_hash`; `instrumented_code_hash`
   and `receipt.code_hash` are §11.4's `CodeHash`, the post-instrumentation identity.
+- `withdrawal_caps` is always marshalled: an object from a 64-hex `AssetID` to its 64-hex big-endian
+  u256 `MaxBatchWithdrawal`. An asset absent from it has cap 0 (§27.9). The generator always assigns a
+  non-nil map, so a vector with no table renders `{}`.
 - `receipt.abort_code` is always marshalled, including at `0`, so a reader can see the field on
   every receipt.
 
@@ -153,6 +156,13 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 | `CV-QUOTA-3` | at a fully used quota, deleting a leaf frees its bytes and a smaller write reuses them without buying more |
 | `CV-QUOTA-4` | writes that net to `delta = 0` succeed at a fully used quota, commit no quota entry, and leave `0x0005` out of the witness set |
 | `CV-QUOTA-5` | a contract writing the reserved quota key `0x0005` is `UNAUTHORIZED` |
+| `CV-CAP-1` | two withdrawals in one asset summing exactly to its `MaxBatchWithdrawal` pass step 5a |
+| `CV-CAP-2` | two withdrawals in one asset summing to one above its `MaxBatchWithdrawal`: `RUNTIME_FAULT` at the metered gas, full rollback and the full deposit refunded |
+| `CV-CAP-3` | a non-zero withdrawal in an asset with no AssetConfig (absent from `withdrawal_caps`, cap 0): `RUNTIME_FAULT`, full rollback and the full deposit refunded |
+| `CV-CAP-4` | a zero-amount withdrawal in an asset with no AssetConfig (cap 0) passes step 5a |
+| `CV-CAP-5` | five withdrawals in three assets with different caps (300, 100, 200 in ascending asset order): the outbox lists 100-cap asset 25, 300-cap asset 100, 100-cap asset 75, 200-cap asset 200, 300-cap asset 200, so the first-appearance order is neither ascending nor descending, the first three withdrawals repeat an asset, and each asset totals exactly its own `MaxBatchWithdrawal` (100, 300, 200): step 5a passes and the status is `SUCCESS` |
+| `CV-CAP-6` | three assets with caps 300, 100, 200 in ascending asset order and six withdrawals 25 (200-cap asset), 25 (200-cap asset), 50 (100-cap asset), 50 (300-cap asset), 100 (100-cap asset), 150 (300-cap asset): the 100-cap asset is the middle asset in ascending and in first-appearance order, each of its withdrawals is within its cap but its total 150 is over it, the last withdrawal is of another asset and another asset has the largest total (200), and the other two assets are within their own caps: `RUNTIME_FAULT` at the metered gas, full rollback and the full deposit refunded |
+| `CV-CAP-7` | a withdrawal over its cap at a `plasma_limit` that leaves nothing for the §10.4 effect charge: `RUNTIME_FAULT` from step 5a, not `OUT_OF_GAS` from step 6 |
 | `CV-DEPLOY-1` | single-chunk deployment start: `chunk_count` 1 for a module within `MaxDeployChunkData` |
 | `CV-DEPLOY-2` | the single deploy chunk carrying the whole module at `chunk_index` 0 |
 | `EXEC-DEPLOY-1` | deploy finalize: the three reserved leaves are written and `ReturnData` is `code_hash` then `CodeHash` |

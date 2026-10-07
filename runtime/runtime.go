@@ -57,9 +57,13 @@ type Config struct {
 
 	// Wired by the binary, not by the operator's configuration file.
 	Momenta ledger.MomentumSource
-	// Filter must be stateless across ledger.Follower instances: Run hands the same instance to
-	// the follower it builds after every rollback.
-	Filter  ledger.SettlementFilter
+	// Assignments answers Settlement's input assignment for DomainID. An error wrapping
+	// recovery.ErrHalted halts Run; any other error is retried as a source outage.
+	Assignments ledger.AssignmentSource
+	// Caps answers Settlement's withdrawal caps for DomainID. An error wrapping
+	// recovery.ErrHalted halts Run; any other error ends Run at once with
+	// recovery.ErrSourceUnavailable, and a restart re-derives from the last commit.
+	Caps    ledger.CapSource
 	Anchors recovery.AnchorSource
 	// Retry is the bounded-retry schedule; the zero value is the production one.
 	Retry recovery.RetryPolicy
@@ -91,8 +95,11 @@ func (c Config) validate() error {
 	if c.Momenta == nil {
 		return fmt.Errorf("%w: momentum source is required", ErrConfig)
 	}
-	if c.Filter == nil {
-		return fmt.Errorf("%w: settlement filter is required", ErrConfig)
+	if c.Assignments == nil {
+		return fmt.Errorf("%w: assignment source is required", ErrConfig)
+	}
+	if c.Caps == nil {
+		return fmt.Errorf("%w: withdrawal cap source is required", ErrConfig)
 	}
 	if c.Anchors == nil {
 		return fmt.Errorf("%w: anchor source is required", ErrConfig)
@@ -125,8 +132,9 @@ func (r *Runtime) Register(d domain.Domain) {
 // and then drives the execution loop until ctx is cancelled, shutting down cleanly. A lock
 // already held by another process returns an error wrapping ErrLocked before boot.
 // Configuration errors wrap ErrConfig. Consistency faults wrap recovery.ErrHalted. A source
-// still unavailable after its retry budget wraps recovery.ErrSourceUnavailable. Any other
-// error, such as a failed batch commit or an OnCommit error, is transient.
+// still unavailable after its retry budget wraps recovery.ErrSourceUnavailable, and so does a
+// withdrawal-cap outage. Any other error, such as a failed batch commit or an OnCommit error, is
+// transient.
 func (r *Runtime) Run(ctx context.Context) error {
 	if err := r.cfg.validate(); err != nil {
 		return err

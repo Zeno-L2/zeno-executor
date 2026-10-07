@@ -11,6 +11,7 @@ import (
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
+	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
 )
 
 // This file drives Driver.NextBatch through a real *ledger.Follower (as opposed to the
@@ -47,25 +48,9 @@ func (s *followerSource) DetailedMomentumsByHeight(height, count uint64) ([]*nom
 	return out, nil
 }
 
-// acceptAllFilter derives one canonical kind-0 CallL2 input, for the configured domain, from
-// every account-block it sees.
-type acceptAllFilter struct {
-	domainID uint32
-	target   types.Hash
-}
-
-func (f acceptAllFilter) Accept(m *nom.Momentum, block *nom.AccountBlock) (*ledger.Envelope, error) {
-	src := types.Hash{}
-	src[0] = block.Address[0]
-	in := codec.Input{
-		SourceAccountBlockHash: src,
-		Args:                   codec.CallL2Args{TargetContract: f.target},
-	}
-	payload, err := in.Encode()
-	if err != nil {
-		return nil, err
-	}
-	return &ledger.Envelope{DomainID: f.domainID, Payload: payload}, nil
+// Assignment answers Settlement's assignment over the source's momenta.
+func (s *followerSource) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
+	return ledgertest.Assign(s.moms, domainID, height, hash, nextOrdinal)
 }
 
 func followerHash(b byte, height uint64) types.Hash {
@@ -80,12 +65,15 @@ func followerBlock(address byte, height uint64) *nom.AccountBlock {
 		Address: types.Address{address},
 		Height:  1,
 		Hash:    followerHash(address, height),
+		Data:    ledgertest.SendData(7, nil),
 	}
 }
 
 // followerMomentum builds one valid, self-consistent momentum at height with the given
 // account-blocks and previous-hash linkage.
-func followerMomentum(height uint64, prev types.Hash, blocks []*nom.AccountBlock) *nom.DetailedMomentum {
+func followerMomentum(height uint64, prev types.Hash, sends []*nom.AccountBlock) *nom.DetailedMomentum {
+	blocks := append(append([]*nom.AccountBlock(nil), sends...),
+		&nom.AccountBlock{Address: types.SettlementContract, Height: height, Hash: followerHash(0xEE, height)})
 	return &nom.DetailedMomentum{
 		Momentum: &nom.Momentum{
 			Height:        height,
@@ -98,14 +86,14 @@ func followerMomentum(height uint64, prev types.Hash, blocks []*nom.AccountBlock
 	}
 }
 
-func newTestFollower(t *testing.T, src *followerSource, domainID uint32, target types.Hash) *ledger.Follower {
+func newTestFollower(t *testing.T, src *followerSource, domainID uint32) *ledger.Follower {
 	t.Helper()
 	f, err := ledger.New(ledger.Config{
 		DomainID:          domainID,
 		ConfirmationDepth: 1,
 		StartHeight:       1,
 		Source:            src,
-		Filter:            acceptAllFilter{domainID: domainID, target: target},
+		Assignments:       src,
 	})
 	if err != nil {
 		t.Fatalf("ledger.New: %v", err)
@@ -127,7 +115,6 @@ func successDomain(contractID types.Hash, n int) *fakeDomain {
 // a scripted fake error.
 func TestDriverRealFollowerReorgMidBatch(t *testing.T) {
 	contractID := hashN(2)
-	target := contractID
 
 	// Momenta 1-3 form a valid chain; momentum 4 is confirmed (frontier 5, depth 1 -> ceiling
 	// 4) but names a PreviousHash that does not match momentum 3's Hash — the real trigger for
@@ -139,7 +126,7 @@ func TestDriverRealFollowerReorgMidBatch(t *testing.T) {
 	m3 := followerMomentum(3, followerHash(0xAA, 2), []*nom.AccountBlock{followerBlock(3, 3)})
 	m4 := followerMomentum(4, followerHash(0xBB, 99), []*nom.AccountBlock{followerBlock(4, 4)})
 	src := &followerSource{frontier: 5, moms: []*nom.DetailedMomentum{m1, m2, m3, m4}}
-	follower := newTestFollower(t, src, 7, target)
+	follower := newTestFollower(t, src, 7)
 
 	// Three successful steps: the driver consumes momenta 1-3's inputs before its fourth
 	// Inputs.Next() call surfaces the reorg buffered alongside them.
@@ -169,14 +156,13 @@ func TestDriverRealFollowerReorgMidBatch(t *testing.T) {
 // Follower's own latched-permanent-error path (follower.go:303-306), not a scripted fake.
 func TestDriverRealFollowerPermanentErrorClosesThenRepresents(t *testing.T) {
 	contractID := hashN(2)
-	target := contractID
 
 	// Height 1 is valid; height 2 is replaced by a momentum claiming height 5, which
 	// processMomentum rejects as a height mismatch and latches permanently.
 	m1 := followerMomentum(1, types.Hash{}, []*nom.AccountBlock{followerBlock(1, 1)})
 	bad := followerMomentum(5, followerHash(0xAA, 1), []*nom.AccountBlock{followerBlock(2, 2)})
 	src := &followerSource{frontier: 5, moms: []*nom.DetailedMomentum{m1, bad}}
-	follower := newTestFollower(t, src, 7, target)
+	follower := newTestFollower(t, src, 7)
 
 	dom := successDomain(contractID, 1)
 	cfg := testConfig(t, dom, follower, newFakeBundleStore())

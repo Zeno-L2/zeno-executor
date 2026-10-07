@@ -10,7 +10,9 @@ import (
 	"math/big"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -493,6 +495,9 @@ func checkShape(t *testing.T, file vectorFile, vec vectorJSON) {
 		checkCallRefund(t, vec)
 		if vec.Status == "SUCCESS" || vec.Status == "STORAGE_QUOTA_EXCEEDED" {
 			checkCallQuota(t, vec)
+		}
+		if vec.Status == "SUCCESS" {
+			checkCallWithdrawalCaps(t, vec)
 		}
 	case "unsupported_kind":
 		checkUnsupportedKind(t, vec)
@@ -1470,6 +1475,22 @@ func checkN2DiscardNotVacuous(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// inlineEffectCharge sums the §10.4 effect cost of every entry in eff, from the gas table alone.
+func inlineEffectCharge(eff codec.ContractEffects) uint64 {
+	var total uint64
+	for _, e := range eff.StateDiff {
+		total += module.EffectCost(module.Effect{Kind: module.EffectStateDiff, Bytes: len(e.Value)})
+	}
+	for _, e := range eff.Events {
+		total += module.EffectCost(module.Effect{Kind: module.EffectEvent, Bytes: len(e.Data)})
+	}
+	for _, m := range eff.Outbox {
+		total += module.EffectCost(module.Effect{Kind: module.EffectOutboxMessage, Bytes: len(m.Payload)})
+	}
+	total += module.EffectCost(module.Effect{Kind: module.EffectReturnData, Bytes: len(eff.ReturnData)})
+	return total
+}
+
 // checkPathGas recomputes gas_used from the gas table alone: module.InitialMemoryCost(pages),
 // plus module.OpcodeCost for each original opcode on the executed path, plus hostGas, plus the
 // §10.4 effect charge over the returned blob, computed inline from module.EffectCost. It must not
@@ -1497,16 +1518,7 @@ func checkPathGas(t *testing.T, vec vectorJSON, pages uint32, hostGas uint64, pa
 	}
 	total += hostGas
 
-	for _, e := range eff.StateDiff {
-		total += module.EffectCost(module.Effect{Kind: module.EffectStateDiff, Bytes: len(e.Value)})
-	}
-	for _, e := range eff.Events {
-		total += module.EffectCost(module.Effect{Kind: module.EffectEvent, Bytes: len(e.Data)})
-	}
-	for _, m := range eff.Outbox {
-		total += module.EffectCost(module.Effect{Kind: module.EffectOutboxMessage, Bytes: len(m.Payload)})
-	}
-	total += module.EffectCost(module.Effect{Kind: module.EffectReturnData, Bytes: len(eff.ReturnData)})
+	total += inlineEffectCharge(eff)
 
 	if vec.GasUsed != total {
 		t.Fatalf("checkPathGas: gas_used = %d, want %d (InitialMemoryCost(%d) + path opcodes + hostGas %d + effect charge)", vec.GasUsed, total, pages, hostGas)
@@ -1958,6 +1970,325 @@ func checkCVQUOTA5ReservedQuotaKey(t *testing.T, vec vectorJSON) {
 	t.Fatalf("CV-QUOTA-5: StateDiff carries no local key 0x0005")
 }
 
+// capOf returns the withdrawal_caps entry for asset (hex), 0 when absent.
+func capOf(t *testing.T, vec vectorJSON, asset string) *big.Int {
+	t.Helper()
+	v, ok := vec.WithdrawalCaps[asset]
+	if !ok {
+		return new(big.Int)
+	}
+	return new(big.Int).SetBytes(mustHex(t, v))
+}
+
+// withdrawalsOf returns the L1Withdrawal messages of vec's ContractEffects blob, in order.
+func withdrawalsOf(t *testing.T, vec vectorJSON) []codec.L1Withdrawal {
+	t.Helper()
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("%s: DecodeContractEffects: %v", vec.ID, err)
+	}
+	var out []codec.L1Withdrawal
+	for _, m := range eff.Outbox {
+		if w, ok := m.Target.(codec.L1Withdrawal); ok {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// withdrawalTotals sums vec's withdrawals per asset, keyed by asset hex.
+func withdrawalTotals(t *testing.T, vec vectorJSON) map[string]*big.Int {
+	t.Helper()
+	totals := map[string]*big.Int{}
+	for _, w := range withdrawalsOf(t, vec) {
+		asset := hex.EncodeToString(w.Asset[:])
+		if totals[asset] == nil {
+			totals[asset] = new(big.Int)
+		}
+		totals[asset].Add(totals[asset], new(big.Int).SetBytes(w.Amount[:]))
+	}
+	return totals
+}
+
+// C7. Withdrawal caps (call, SUCCESS): each asset's withdrawals sum to at most its
+// withdrawal_caps value, 0 when absent (§27.9).
+func checkCallWithdrawalCaps(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	for asset, total := range withdrawalTotals(t, vec) {
+		if limit := capOf(t, vec, asset); total.Cmp(limit) > 0 {
+			t.Fatalf("C7: asset %s withdraws %s, above its withdrawal_caps value %s", asset, total, limit)
+		}
+	}
+}
+
+// capWithdrawalsInOneAsset returns the vector's withdrawals after checking there are at least
+// min of them, all in one asset, and returns that asset (hex) and its total.
+func capWithdrawalsInOneAsset(t *testing.T, vec vectorJSON, min int) (string, *big.Int, []*big.Int) {
+	t.Helper()
+	ws := withdrawalsOf(t, vec)
+	if len(ws) < min {
+		t.Fatalf("%s: %d withdrawal messages, want at least %d", vec.ID, len(ws), min)
+	}
+	asset := hex.EncodeToString(ws[0].Asset[:])
+	total := new(big.Int)
+	amounts := make([]*big.Int, len(ws))
+	for i, w := range ws {
+		if hex.EncodeToString(w.Asset[:]) != asset {
+			t.Fatalf("%s: withdrawal %d is in asset %x, want every withdrawal in asset %s", vec.ID, i, w.Asset, asset)
+		}
+		amounts[i] = new(big.Int).SetBytes(w.Amount[:])
+		total.Add(total, amounts[i])
+	}
+	return asset, total, amounts
+}
+
+// checkCVCAP1 pins CV-CAP-1 as the boundary: the total equals a non-zero cap.
+func checkCVCAP1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "SUCCESS" {
+		t.Fatalf("CV-CAP-1: status %s, want SUCCESS", vec.Status)
+	}
+	asset, total, _ := capWithdrawalsInOneAsset(t, vec, 2)
+	limit := capOf(t, vec, asset)
+	if limit.Sign() == 0 || total.Cmp(limit) != 0 {
+		t.Fatalf("CV-CAP-1: total %s, cap %s; want a non-zero cap equal to the total", total, limit)
+	}
+}
+
+// checkCVCAP2 pins the RUNTIME_FAULT to the cap: each message fits the cap alone and the total
+// is one above it.
+func checkCVCAP2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkCVASSETSBase(t, vec)
+	asset, total, amounts := capWithdrawalsInOneAsset(t, vec, 2)
+	if _, ok := vec.WithdrawalCaps[asset]; !ok {
+		t.Fatalf("CV-CAP-2: asset %s is absent from withdrawal_caps", asset)
+	}
+	limit := capOf(t, vec, asset)
+	for i, a := range amounts {
+		if a.Cmp(limit) > 0 {
+			t.Fatalf("CV-CAP-2: withdrawal %d amount %s exceeds the cap %s alone", i, a, limit)
+		}
+	}
+	if want := new(big.Int).Add(limit, big.NewInt(1)); total.Cmp(want) != 0 {
+		t.Fatalf("CV-CAP-2: total %s, want the cap plus 1 (%s)", total, want)
+	}
+	if new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() == 0 {
+		t.Fatalf("CV-CAP-2: input.deposit_amount is zero")
+	}
+}
+
+// checkCVCAP3 pins the RUNTIME_FAULT to an unconfigured asset: one non-zero withdrawal in an
+// asset absent from withdrawal_caps.
+func checkCVCAP3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkCVASSETSBase(t, vec)
+	ws := withdrawalsOf(t, vec)
+	if len(ws) != 1 {
+		t.Fatalf("CV-CAP-3: %d withdrawal messages, want exactly 1", len(ws))
+	}
+	if new(big.Int).SetBytes(ws[0].Amount[:]).Sign() == 0 {
+		t.Fatalf("CV-CAP-3: the withdrawal amount is zero, want non-zero")
+	}
+	if _, ok := vec.WithdrawalCaps[hex.EncodeToString(ws[0].Asset[:])]; ok {
+		t.Fatalf("CV-CAP-3: asset %x is present in withdrawal_caps, want it absent", ws[0].Asset)
+	}
+	if len(vec.WithdrawalCaps) == 0 {
+		t.Fatalf("CV-CAP-3: withdrawal_caps is empty, want a non-empty table")
+	}
+	if new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() == 0 {
+		t.Fatalf("CV-CAP-3: input.deposit_amount is zero")
+	}
+}
+
+// checkCVCAP4 pins SUCCESS to a zero-amount withdrawal in an asset absent from withdrawal_caps.
+func checkCVCAP4(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "SUCCESS" {
+		t.Fatalf("CV-CAP-4: status %s, want SUCCESS", vec.Status)
+	}
+	ws := withdrawalsOf(t, vec)
+	if len(ws) != 1 {
+		t.Fatalf("CV-CAP-4: %d withdrawal messages, want exactly 1", len(ws))
+	}
+	if new(big.Int).SetBytes(ws[0].Amount[:]).Sign() != 0 {
+		t.Fatalf("CV-CAP-4: the withdrawal amount is non-zero, want 0")
+	}
+	if _, ok := vec.WithdrawalCaps[hex.EncodeToString(ws[0].Asset[:])]; ok {
+		t.Fatalf("CV-CAP-4: asset %x is present in withdrawal_caps, want it absent", ws[0].Asset)
+	}
+	if len(vec.WithdrawalCaps) == 0 {
+		t.Fatalf("CV-CAP-4: withdrawal_caps is empty, want a non-empty table")
+	}
+}
+
+// threeAssetTotals returns the totals of a vector that withdraws exactly three assets, all present
+// in withdrawal_caps, as the three asset hex keys sorted ascending, and the assets in outbox
+// first-appearance order. The first-appearance order must not be ascending, so an implementation
+// that reads the caps in sorted order but applies them in outbox order is told apart from one that
+// matches by asset. Some asset must also repeat with another asset between its withdrawals, so a
+// cap list fetched per withdrawal message is told apart from one fetched per distinct asset.
+func threeAssetTotals(t *testing.T, vec vectorJSON) (keys, seen []string, totals map[string]*big.Int) {
+	t.Helper()
+	totals = withdrawalTotals(t, vec)
+	if len(totals) != 3 {
+		t.Fatalf("%s: %d assets withdrawn, want exactly 3", vec.ID, len(totals))
+	}
+	for a, total := range totals {
+		if _, ok := vec.WithdrawalCaps[a]; !ok {
+			t.Fatalf("%s: asset %s is absent from withdrawal_caps", vec.ID, a)
+		}
+		if total.Sign() == 0 {
+			t.Fatalf("%s: asset %s total is zero, want non-zero", vec.ID, a)
+		}
+		keys = append(keys, a)
+	}
+	sort.Strings(keys)
+	var order []string
+	for _, w := range withdrawalsOf(t, vec) {
+		a := hex.EncodeToString(w.Asset[:])
+		order = append(order, a)
+		if !slices.Contains(seen, a) {
+			seen = append(seen, a)
+		}
+	}
+	if sort.StringsAreSorted(seen) {
+		t.Fatalf("%s: the outbox mentions the assets in ascending order %v, want a non-ascending first-appearance order", vec.ID, seen)
+	}
+	repeats := false
+	for i, a := range order {
+		for j := i + 2; j < len(order); j++ {
+			if order[j] == a && order[i+1] != a {
+				repeats = true
+			}
+		}
+	}
+	if !repeats {
+		t.Fatalf("%s: no asset repeats with another asset between its withdrawals in %v", vec.ID, order)
+	}
+	return keys, seen, totals
+}
+
+// checkCVCAP5 pins SUCCESS to three assets, each totalling exactly its own cap, with repeated
+// assets in a first-appearance order that is neither ascending nor descending, so a cap list
+// fetched in a reversed order is told apart from one fetched by asset, and a repeat among the first as many
+// withdrawals as there are assets, so a cap list requested per withdrawal and applied to the
+// distinct assets in either order is told apart. In ascending asset order the first cap is the
+// strict maximum and the middle cap the strict minimum, so the first, last, maximum and minimum
+// cap each differ from the others. Applying any one of them to every asset, or the sum of the
+// caps, then either faults this vector or leaves it to CV-CAP-6.
+func checkCVCAP5(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "SUCCESS" {
+		t.Fatalf("CV-CAP-5: status %s, want SUCCESS", vec.Status)
+	}
+	keys, seen, totals := threeAssetTotals(t, vec)
+	distinct := map[string]bool{}
+	for _, w := range withdrawalsOf(t, vec)[:len(seen)] {
+		distinct[hex.EncodeToString(w.Asset[:])] = true
+	}
+	if slices.IsSortedFunc(seen, func(x, y string) int { return strings.Compare(y, x) }) {
+		t.Fatalf("CV-CAP-5: the outbox mentions the assets in descending order %v, want an order that is neither ascending nor descending", seen)
+	}
+	if len(distinct) == len(seen) {
+		t.Fatalf("CV-CAP-5: the first %d withdrawals are all distinct assets, want a repeat among them", len(seen))
+	}
+	first, mid, last := capOf(t, vec, keys[0]), capOf(t, vec, keys[1]), capOf(t, vec, keys[2])
+	for _, k := range keys {
+		if limit := capOf(t, vec, k); limit.Sign() == 0 || totals[k].Cmp(limit) != 0 {
+			t.Fatalf("CV-CAP-5: asset %s total %s, cap %s; want a non-zero cap equal to the total", k, totals[k], limit)
+		}
+	}
+	if first.Cmp(last) <= 0 || last.Cmp(mid) <= 0 {
+		t.Fatalf("CV-CAP-5: caps %s, %s, %s in ascending asset order; want the first the largest and the middle the smallest", first, mid, last)
+	}
+	sum := new(big.Int).Add(totals[keys[0]], totals[keys[1]])
+	if sum.Add(sum, totals[keys[2]]); sum.Cmp(first) <= 0 {
+		t.Fatalf("CV-CAP-5: the summed totals %s do not exceed the largest cap %s", sum, first)
+	}
+}
+
+// checkCVCAP6 pins the RUNTIME_FAULT to the middle asset in both ascending and outbox
+// first-appearance order: its total alone is over its own cap while each of its withdrawals is
+// within the cap, by an amount both other caps cover, and the three totals together stay within
+// the sum of the caps. The last withdrawal is of another asset and the over-cap asset does not
+// have the largest total, so a check of only the last withdrawal's asset or only the largest-total
+// asset passes it only by missing the fault.
+func checkCVCAP6(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkCVASSETSBase(t, vec)
+	keys, seen, totals := threeAssetTotals(t, vec)
+	if seen[1] != keys[1] {
+		t.Fatalf("CV-CAP-6: the over-cap asset %s is not in the middle of the first-appearance order %v", keys[1], seen)
+	}
+	for _, w := range withdrawalsOf(t, vec) {
+		if a := hex.EncodeToString(w.Asset[:]); a == keys[1] && new(big.Int).SetBytes(w.Amount[:]).Cmp(capOf(t, vec, a)) > 0 {
+			t.Fatalf("CV-CAP-6: a single withdrawal of %s exceeds its cap %s, want each within the cap", w.Amount, capOf(t, vec, a))
+		}
+	}
+	ws := withdrawalsOf(t, vec)
+	if last := hex.EncodeToString(ws[len(ws)-1].Asset[:]); last == keys[1] {
+		t.Fatalf("CV-CAP-6: the last withdrawal is of the over-cap asset %s, want another asset", last)
+	}
+	largerElsewhere := false
+	for _, k := range []string{keys[0], keys[2]} {
+		if totals[k].Cmp(totals[keys[1]]) > 0 {
+			largerElsewhere = true
+		}
+	}
+	if !largerElsewhere {
+		t.Fatalf("CV-CAP-6: the over-cap asset has the largest total, want a larger total in another asset")
+	}
+	capSum, totalSum := new(big.Int), new(big.Int)
+	for i, k := range keys {
+		capSum.Add(capSum, capOf(t, vec, k))
+		totalSum.Add(totalSum, totals[k])
+		if over := totals[k].Cmp(capOf(t, vec, k)) > 0; over != (i == 1) {
+			t.Fatalf("CV-CAP-6: asset %s (position %d) over its own cap is %v, want only the middle asset over", k, i, over)
+		}
+	}
+	mid := totals[keys[1]]
+	for _, k := range []string{keys[0], keys[2]} {
+		if mid.Cmp(capOf(t, vec, k)) > 0 {
+			t.Fatalf("CV-CAP-6: the over-cap total %s exceeds the other asset's cap %s", mid, capOf(t, vec, k))
+		}
+	}
+	if totalSum.Cmp(capSum) > 0 {
+		t.Fatalf("CV-CAP-6: the summed totals %s exceed the summed caps %s", totalSum, capSum)
+	}
+	if new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() == 0 {
+		t.Fatalf("CV-CAP-6: input.deposit_amount is zero")
+	}
+}
+
+// checkCVCAP7 pins step 5a before step 6: the vector is over its cap, runs out of plasma exactly
+// at its limit, and has a non-zero effect charge it never paid.
+func checkCVCAP7(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("CV-CAP-7: status %s, want RUNTIME_FAULT", vec.Status)
+	}
+	if vec.Input == nil || vec.Input.PlasmaLimit == nil || vec.GasUsed != *vec.Input.PlasmaLimit {
+		t.Fatalf("CV-CAP-7: gas_used %d, want it equal to input.plasma_limit", vec.GasUsed)
+	}
+	over := false
+	for k, total := range withdrawalTotals(t, vec) {
+		if total.Cmp(capOf(t, vec, k)) > 0 {
+			over = true
+		}
+	}
+	if !over {
+		t.Fatalf("CV-CAP-7: no asset is over its cap")
+	}
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("CV-CAP-7: DecodeContractEffects: %v", err)
+	}
+	if inlineEffectCharge(eff) == 0 {
+		t.Fatalf("CV-CAP-7: the effect charge is zero, want non-zero")
+	}
+}
+
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-002":           checkN1WitnessBackendTripwire,
 	"EXEC-FAIL-OUTBOX-1": checkN2DiscardNotVacuous,
@@ -1988,6 +2319,13 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	},
 	"CV-QUOTA-4": checkCVQUOTA4ZeroDelta,
 	"CV-QUOTA-5": checkCVQUOTA5ReservedQuotaKey,
+	"CV-CAP-1":   checkCVCAP1,
+	"CV-CAP-2":   checkCVCAP2,
+	"CV-CAP-3":   checkCVCAP3,
+	"CV-CAP-4":   checkCVCAP4,
+	"CV-CAP-5":   checkCVCAP5,
+	"CV-CAP-6":   checkCVCAP6,
+	"CV-CAP-7":   checkCVCAP7,
 }
 
 // TestConformanceVectors re-derives every committed value in the artifact from the JSON
@@ -2025,6 +2363,330 @@ func TestConformanceVectors(t *testing.T) {
 	for id := range namedInvariants {
 		if !seen[id] {
 			t.Fatalf("named invariant for vector %q was never exercised: the artifact no longer contains that vector", id)
+		}
+	}
+}
+
+// capVariant re-derives step 5a for one vector: it reports whether the implementation faults.
+// outbox is the withdrawals in outbox order, sorted the distinct assets ascending, seen the
+// distinct assets in first-appearance order, totals the per-asset totals and capOf the cap of an
+// asset (0 when absent).
+type capVariant func(outbox []codec.L1Withdrawal, sorted, seen []string, totals map[string]*big.Int, capOf func(string) *big.Int) bool
+
+// capVariants returns the control step 5a check and every wrong implementation the cap vectors
+// must reject, by name.
+func capVariants() map[string]capVariant {
+	over := func(total, limit *big.Int) bool { return total.Cmp(limit) > 0 }
+	// only checks the first or the last asset of the chosen list and no other.
+	only := func(pick func(sorted, seen []string) []string, last bool) capVariant {
+		return func(_ []codec.L1Withdrawal, sorted, seen []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			list := pick(sorted, seen)
+			a := list[0]
+			if last {
+				a = list[len(list)-1]
+			}
+			return over(totals[a], c(a))
+		}
+	}
+	sortedList := func(sorted, _ []string) []string { return sorted }
+	seenList := func(_, seen []string) []string { return seen }
+	// shared applies one cap, chosen from the distinct assets' caps in sorted order, to every asset.
+	shared := func(choose func(caps []*big.Int) *big.Int) capVariant {
+		return func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			var caps []*big.Int
+			for _, a := range sorted {
+				caps = append(caps, c(a))
+			}
+			limit := choose(caps)
+			for _, a := range sorted {
+				if over(totals[a], limit) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	maxCap := func(caps []*big.Int) *big.Int {
+		m := caps[0]
+		for _, c := range caps {
+			if c.Cmp(m) > 0 {
+				m = c
+			}
+		}
+		return m
+	}
+	minCap := func(caps []*big.Int) *big.Int {
+		m := caps[0]
+		for _, c := range caps {
+			if c.Cmp(m) < 0 {
+				m = c
+			}
+		}
+		return m
+	}
+	sumCap := func(caps []*big.Int) *big.Int {
+		s := new(big.Int)
+		for _, c := range caps {
+			s.Add(s, c)
+		}
+		return s
+	}
+	// zip fetches one cap per asset name fetch returns and applies the caps by index to the
+	// distinct assets in the order of to.
+	zip := func(fetch func(outbox []codec.L1Withdrawal, sorted []string) []string, to func(sorted, seen []string) []string) capVariant {
+		return func(outbox []codec.L1Withdrawal, sorted, seen []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			names := fetch(outbox, sorted)
+			for i, a := range to(sorted, seen) {
+				if over(totals[a], c(names[i])) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	// reorder fetches the caps in the order of from and applies them by index in the order of to.
+	reorder := func(from, to func(sorted, seen []string) []string) capVariant {
+		return func(_ []codec.L1Withdrawal, sorted, seen []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			src, dst := from(sorted, seen), to(sorted, seen)
+			for i, a := range dst {
+				if over(totals[a], c(src[i])) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	// mostWithdrawn checks only the asset with the most withdrawals; of equal counts the one later in
+	// the chosen list wins.
+	mostWithdrawn := func(pick func(sorted, seen []string) []string) capVariant {
+		return func(outbox []codec.L1Withdrawal, sorted, seen []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			count := map[string]int{}
+			for _, w := range outbox {
+				count[hex.EncodeToString(w.Asset[:])]++
+			}
+			list := pick(sorted, seen)
+			a := list[0]
+			for _, b := range list {
+				if count[b] >= count[a] {
+					a = b
+				}
+			}
+			return over(totals[a], c(a))
+		}
+	}
+
+	variants := map[string]capVariant{
+		"control": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			for _, a := range sorted {
+				if over(totals[a], c(a)) {
+					return true
+				}
+			}
+			return false
+		},
+		"first sorted asset only":    only(sortedList, false),
+		"last sorted asset only":     only(sortedList, true),
+		"first outbox asset only":    only(seenList, false),
+		"last outbox asset only":     only(seenList, true),
+		"sorted fetch, outbox apply": reorder(sortedList, seenList),
+		"outbox fetch, sorted apply": reorder(seenList, sortedList),
+		"no per-asset totals": func(outbox []codec.L1Withdrawal, _, _ []string, _ map[string]*big.Int, c func(string) *big.Int) bool {
+			for _, w := range outbox {
+				if over(new(big.Int).SetBytes(w.Amount[:]), c(hex.EncodeToString(w.Asset[:]))) {
+					return true
+				}
+			}
+			return false
+		},
+		"one cap per withdrawal, outbox order": zip(func(outbox []codec.L1Withdrawal, _ []string) []string {
+			var out []string
+			for _, w := range outbox {
+				out = append(out, hex.EncodeToString(w.Asset[:]))
+			}
+			return out
+		}, sortedList),
+		"one cap per withdrawal, outbox order, applied in first-appearance order": zip(func(outbox []codec.L1Withdrawal, _ []string) []string {
+			var out []string
+			for _, w := range outbox {
+				out = append(out, hex.EncodeToString(w.Asset[:]))
+			}
+			return out
+		}, seenList),
+		"one cap per withdrawal, sorted order": zip(func(outbox []codec.L1Withdrawal, _ []string) []string {
+			var out []string
+			for _, w := range outbox {
+				out = append(out, hex.EncodeToString(w.Asset[:]))
+			}
+			sort.Strings(out)
+			return out
+		}, sortedList),
+		"one cap per withdrawal, sorted order, applied in first-appearance order": zip(func(outbox []codec.L1Withdrawal, _ []string) []string {
+			var out []string
+			for _, w := range outbox {
+				out = append(out, hex.EncodeToString(w.Asset[:]))
+			}
+			sort.Strings(out)
+			return out
+		}, seenList),
+		"last withdrawal's asset only": func(outbox []codec.L1Withdrawal, _, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			a := hex.EncodeToString(outbox[len(outbox)-1].Asset[:])
+			return over(totals[a], c(a))
+		},
+		"largest-total asset only": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			a := sorted[0]
+			for _, b := range sorted {
+				if totals[b].Cmp(totals[a]) > 0 {
+					a = b
+				}
+			}
+			return over(totals[a], c(a))
+		},
+		"second withdrawal's asset only": func(outbox []codec.L1Withdrawal, _, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			a := hex.EncodeToString(outbox[min(1, len(outbox)-1)].Asset[:])
+			return over(totals[a], c(a))
+		},
+		"most-withdrawn asset only, a tie going to the later asset in first-appearance order": mostWithdrawn(seenList),
+		"most-withdrawn asset only, a tie going to the later asset in sorted order":           mostWithdrawn(sortedList),
+		"first cap for every asset":   shared(func(caps []*big.Int) *big.Int { return caps[0] }),
+		"last cap for every asset":    shared(func(caps []*big.Int) *big.Int { return caps[len(caps)-1] }),
+		"max cap for every asset":     shared(maxCap),
+		"min cap for every asset":     shared(minCap),
+		"sum of caps for every asset": shared(sumCap),
+		"grand total against summed caps": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			sum, limit := new(big.Int), new(big.Int)
+			for _, a := range sorted {
+				sum.Add(sum, totals[a])
+				limit.Add(limit, c(a))
+			}
+			return over(sum, limit)
+		},
+		"grand total against max cap": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			sum := new(big.Int)
+			var caps []*big.Int
+			for _, a := range sorted {
+				sum.Add(sum, totals[a])
+				caps = append(caps, c(a))
+			}
+			return over(sum, maxCap(caps))
+		},
+		"stop after first asset": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			return over(totals[sorted[0]], c(sorted[0]))
+		},
+		"previous asset's cap": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+			for i, a := range sorted {
+				limit := c(a)
+				if i > 0 {
+					limit = c(sorted[i-1])
+				}
+				if over(totals[a], limit) {
+					return true
+				}
+			}
+			return false
+		},
+	}
+
+	// Every pairing of two different orders of the distinct assets: the caps are fetched in the
+	// order of one and applied by index in the order of the other.
+	orders := map[string]func(outbox []codec.L1Withdrawal, sorted, seen []string) []string{
+		"sorted":                    func(_ []codec.L1Withdrawal, sorted, _ []string) []string { return sorted },
+		"reversed sorted":           func(_ []codec.L1Withdrawal, sorted, _ []string) []string { return reversed(sorted) },
+		"first-appearance":          func(_ []codec.L1Withdrawal, _, seen []string) []string { return seen },
+		"reversed first-appearance": func(_ []codec.L1Withdrawal, _, seen []string) []string { return reversed(seen) },
+		"last-appearance":           func(outbox []codec.L1Withdrawal, _, _ []string) []string { return lastAppearance(outbox) },
+		"reversed last-appearance":  func(outbox []codec.L1Withdrawal, _, _ []string) []string { return reversed(lastAppearance(outbox)) },
+	}
+	for fromName, from := range orders {
+		for toName, to := range orders {
+			if fromName == toName {
+				continue
+			}
+			from, to := from, to
+			variants["caps fetched in "+fromName+" order, applied in "+toName+" order"] = func(outbox []codec.L1Withdrawal, sorted, seen []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
+				src := from(outbox, sorted, seen)
+				for i, a := range to(outbox, sorted, seen) {
+					if over(totals[a], c(src[i])) {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return variants
+}
+
+// reversed returns a copy of list in reverse order.
+func reversed(list []string) []string {
+	out := slices.Clone(list)
+	slices.Reverse(out)
+	return out
+}
+
+// lastAppearance returns the distinct assets of outbox ordered by their last withdrawal.
+func lastAppearance(outbox []codec.L1Withdrawal) []string {
+	var out []string
+	for i := len(outbox) - 1; i >= 0; i-- {
+		if a := hex.EncodeToString(outbox[i].Asset[:]); !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	return reversed(out)
+}
+
+// TestCapVectorsRejectWrongImplementations re-derives step 5a for CV-CAP-1 to CV-CAP-7 under each
+// wrong implementation and requires every one to get at least one vector's status wrong. The
+// control variant is the correct per-asset check and must get every status right.
+func TestCapVectorsRejectWrongImplementations(t *testing.T) {
+	data, err := os.ReadFile(vectorFilePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", vectorFilePath, err)
+	}
+	var file vectorFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	variants := capVariants()
+
+	vectors := map[string]vectorJSON{}
+	for _, vec := range file.Vectors {
+		if strings.HasPrefix(vec.ID, "CV-CAP-") {
+			vectors[vec.ID] = vec
+		}
+	}
+	if len(vectors) != 7 {
+		t.Fatalf("%d CV-CAP vectors in the artifact, want 7", len(vectors))
+	}
+
+	for name, v := range variants {
+		var wrong []string
+		for id, vec := range vectors {
+			outbox := withdrawalsOf(t, vec)
+			totals := withdrawalTotals(t, vec)
+			var sorted, seen []string
+			for _, w := range outbox {
+				if a := hex.EncodeToString(w.Asset[:]); !slices.Contains(seen, a) {
+					seen = append(seen, a)
+				}
+			}
+			sorted = append(sorted, seen...)
+			sort.Strings(sorted)
+			capFn := func(a string) *big.Int { return capOf(t, vec, a) }
+			want := vec.Status == "RUNTIME_FAULT"
+			if got := v(outbox, sorted, seen, totals, capFn); got != want {
+				wrong = append(wrong, id)
+			}
+		}
+		if name == "control" {
+			if len(wrong) != 0 {
+				t.Errorf("the correct per-asset check gets %v wrong", wrong)
+			}
+			continue
+		}
+		if len(wrong) == 0 {
+			t.Errorf("wrong implementation %q gets every CV-CAP vector's status right", name)
 		}
 	}
 }

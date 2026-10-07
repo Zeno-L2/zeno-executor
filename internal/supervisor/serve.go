@@ -14,6 +14,7 @@ import (
 	"github.com/digitalSloth/go-executor/internal/ipc"
 	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/digitalSloth/go-executor/internal/znnd"
 )
 
 // ErrMalformed marks a worker frame that breaks the protocol: over the frame cap, an unknown or
@@ -25,7 +26,11 @@ var ErrMalformed = errors.New("supervisor: malformed worker message")
 type Sources struct {
 	Momenta ledger.MomentumSource
 	Anchors recovery.AnchorSource
-	Ready   func(ctx context.Context) bool // nil: Run starts workers without waiting
+	// Assignments is required once a worker sends an AssignmentRequest.
+	Assignments ledger.AssignmentSource
+	// Caps is required once a worker sends a CapRequest.
+	Caps  ledger.CapSource
+	Ready func(ctx context.Context) bool // nil: Run starts workers without waiting
 }
 
 // workerState is shared by serve and the worker's supervision goroutine, guarded by mu.
@@ -33,6 +38,7 @@ type workerState struct {
 	mu            sync.Mutex
 	lastFrame     time.Time
 	servedHeight  uint64
+	momentaCount  uint64 // count serveMomenta tries first; 0 until a read is clipped or halved
 	lastCommitted *codec.BatchCommitment
 	highWater     uint64 // highest LastInputSeq committed; a Committed above it is progress
 	progressed    bool   // set by a Committed above highWater; cleared by the supervision goroutine
@@ -62,6 +68,16 @@ func serve(conn io.ReadWriter, w WorkerConfig, executor types.Address, src Sourc
 
 		case ipc.AnchorRequest:
 			if !serveAnchor(conn, w, src) {
+				return nil
+			}
+
+		case ipc.AssignmentRequest:
+			if !serveAssignment(conn, v, w, src) {
+				return nil
+			}
+
+		case ipc.CapRequest:
+			if !serveCap(conn, v, w, src) {
 				return nil
 			}
 
@@ -107,11 +123,59 @@ func serveAnchor(conn io.ReadWriter, w WorkerConfig, src Sources) bool {
 	return ipc.WriteMessage(conn, reply) == nil
 }
 
-// serveMomenta answers a MomentaRequest: it calls Momenta.DetailedMomentumsByHeight once, keeps
-// at most v.Count results, encodes every kept entry before writing anything, and only raises
-// st.servedHeight once RangeEnd is written. It returns false when a reply write failed.
+// serveAssignment answers an AssignmentRequest for w's own domain. It returns false when the
+// reply write failed.
+func serveAssignment(conn io.ReadWriter, v ipc.AssignmentRequest, w WorkerConfig, src Sources) bool {
+	entries, err := src.Assignments.Assignment(w.DomainID, v.Height, v.Hash, v.NextOrdinal)
+	if err != nil {
+		return ipc.WriteMessage(conn, sourceError(err)) == nil
+	}
+	b, err := ipc.Encode(ipc.Assignment{Entries: entries})
+	if err != nil {
+		msg := cut(fmt.Sprintf("supervisor: assignment at height %d cannot be sent: %s", v.Height, err))
+		return ipc.WriteMessage(conn, ipc.SourceError{Kind: ipc.SourceHalted, Message: msg}) == nil
+	}
+	_, err = conn.Write(b)
+	return err == nil
+}
+
+// serveCap answers a CapRequest for w's own domain. It returns false when the reply write
+// failed.
+func serveCap(conn io.ReadWriter, v ipc.CapRequest, w WorkerConfig, src Sources) bool {
+	amounts, err := src.Caps.MaxBatchWithdrawals(w.DomainID, v.Height, v.Hash, v.Assets)
+	if err != nil {
+		return ipc.WriteMessage(conn, sourceError(err)) == nil
+	}
+	return ipc.WriteMessage(conn, ipc.Cap{Amounts: amounts}) == nil
+}
+
+// serveMomenta answers a MomentaRequest. It reads at most v.Count momenta, starting at
+// st.momentaCount when that is lower. It halves the count while the node's response exceeds znnd's
+// body bound, down to 1, and records in st.momentaCount the count the next read starts at: double a
+// clipped count that succeeded, up to v.Count, or the last count tried after a halving that
+// failed. It keeps at most v.Count results, encodes every kept entry before writing anything, and
+// raises st.servedHeight only once RangeEnd is written. It returns false when a reply write failed.
 func serveMomenta(conn io.ReadWriter, v ipc.MomentaRequest, src Sources, st *workerState) bool {
-	ms, err := src.Momenta.DetailedMomentumsByHeight(v.Height, v.Count)
+	st.mu.Lock()
+	start := st.momentaCount
+	st.mu.Unlock()
+	if start == 0 || start > v.Count {
+		start = v.Count
+	}
+	count := start
+	ms, err := src.Momenta.DetailedMomentumsByHeight(v.Height, count)
+	for errors.Is(err, znnd.ErrResponseTooLarge) && count > 1 {
+		count /= 2
+		ms, err = src.Momenta.DetailedMomentumsByHeight(v.Height, count)
+	}
+	st.mu.Lock()
+	switch {
+	case err == nil && count < v.Count:
+		st.momentaCount = min(2*count, v.Count)
+	case err != nil && count < start:
+		st.momentaCount = count
+	}
+	st.mu.Unlock()
 	if err != nil {
 		return ipc.WriteMessage(conn, sourceError(err)) == nil
 	}
