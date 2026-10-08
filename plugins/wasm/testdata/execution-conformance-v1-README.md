@@ -82,9 +82,10 @@ Encoding rules:
 - `input`'s numeric/string fields that can legitimately be zero or empty for a kind that carries
   them (`plasma_limit`, `total_size`, `chunk_count`, `chunk_index`, `payload_hex`, `bytes`) are pointer
   types, so `omitempty` cannot be confused with a genuinely absent field.
-- `contract_effects_blob_hex` absent means the run returned no blob. A module returning a
-  zero-length blob is not distinguishable from that and no shape produces one; a future vector
-  that needs the distinction adds its own field rather than reinterpreting absence.
+- `contract_effects_blob_hex` absent means the run returned no blob or a zero-length blob.
+  `CV-DECODE-9`'s module returns a zero-length blob, which renders the same as no blob; its
+  status (`RUNTIME_FAULT`, because an empty blob does not decode) and its `gas_used` pin the
+  outcome.
 - A vector's top-level `code_hash` is SPEC's pre-instrumentation `code_hash`; `instrumented_code_hash`
   and `receipt.code_hash` are §11.4's `CodeHash`, the post-instrumentation identity.
 - `withdrawal_caps` is always marshalled: an object from a 64-hex `AssetID` to its 64-hex big-endian
@@ -109,11 +110,12 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 
 ## Coverage
 
+Vector IDs are stable names; gaps in numbering are intentional.
+
 | ID | What it freezes |
 |---|---|
 | `EXEC-001` | pure-return success |
 | `EXEC-002` | single-write success with an absent-key `storage_len` observation |
-| `EXEC-FAIL-OUTBOX-1` | a failed input carrying a deposit, proving §14.3's discard |
 | `EXEC-003` | update an existing key |
 | `EXEC-004` | delete an existing key via the EMPTY sentinel |
 | `EXEC-005` | write a present-empty value |
@@ -149,8 +151,8 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 | `EXEC-DEP-5` | a contract at `MaxOutboxPerExecution` with an unclaimed remainder: `SUCCESS`, `outbox_count = 33`, the refund at `outbox_index = 32` |
 | `CV-RTL-BLOB-1` | a well-formed `ContractEffects` blob longer than `MaxResultBlob`: `RESULT_TOO_LARGE`, metered `gas_used` with no effect charge |
 | `CV-RTL-BLOB-2` | the same, also malformed, proving step 0 precedes the decode |
-| `CV-ASSETS-1` | 17 distinct-asset withdrawals in one input breach the per-input asset footprint: `RUNTIME_FAULT` at the metered gas |
-| `CV-ASSETS-2` | 16 distinct-asset withdrawals plus a non-zero deposit in a 17th asset breach the footprint: `RUNTIME_FAULT`, full refund |
+| `CV-ASSETS-1` | 17 distinct-asset withdrawals in one input, every asset capped above its total, breach the per-input asset footprint, so only the footprint faults: `RUNTIME_FAULT` at the metered gas |
+| `CV-ASSETS-2` | 16 distinct-asset withdrawals plus a non-zero deposit in a 17th asset, every asset capped above its total, breach the footprint, so only the footprint faults: `RUNTIME_FAULT`, full refund |
 | `CV-QUOTA-1` | a write that brings `used` exactly to `purchased` succeeds, and the committed StateDiff carries the updated `0x0005` leaf |
 | `CV-QUOTA-2` | net state growth one byte over the remaining quota is `STORAGE_QUOTA_EXCEEDED` at metered plus effect gas, with the full deposit refunded |
 | `CV-QUOTA-3` | at a fully used quota, deleting a leaf frees its bytes and a smaller write reuses them without buying more |
@@ -160,9 +162,79 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 | `CV-CAP-2` | two withdrawals in one asset summing to one above its `MaxBatchWithdrawal`: `RUNTIME_FAULT` at the metered gas, full rollback and the full deposit refunded |
 | `CV-CAP-3` | a non-zero withdrawal in an asset with no AssetConfig (absent from `withdrawal_caps`, cap 0): `RUNTIME_FAULT`, full rollback and the full deposit refunded |
 | `CV-CAP-4` | a zero-amount withdrawal in an asset with no AssetConfig (cap 0) passes step 5a |
-| `CV-CAP-5` | five withdrawals in three assets with different caps (300, 100, 200 in ascending asset order): the outbox lists 100-cap asset 25, 300-cap asset 100, 100-cap asset 75, 200-cap asset 200, 300-cap asset 200, so the first-appearance order is neither ascending nor descending, the first three withdrawals repeat an asset, and each asset totals exactly its own `MaxBatchWithdrawal` (100, 300, 200): step 5a passes and the status is `SUCCESS` |
-| `CV-CAP-6` | three assets with caps 300, 100, 200 in ascending asset order and six withdrawals 25 (200-cap asset), 25 (200-cap asset), 50 (100-cap asset), 50 (300-cap asset), 100 (100-cap asset), 150 (300-cap asset): the 100-cap asset is the middle asset in ascending and in first-appearance order, each of its withdrawals is within its cap but its total 150 is over it, the last withdrawal is of another asset and another asset has the largest total (200), and the other two assets are within their own caps: `RUNTIME_FAULT` at the metered gas, full rollback and the full deposit refunded |
+| `CV-CAP-5` | five withdrawals in three assets with different caps (300, 100, 200 in ascending asset order): the outbox lists 100-cap asset 25, 300-cap asset 100, 100-cap asset 75, 200-cap asset 200, 300-cap asset 200, so the first-appearance order is neither ascending nor descending, the first three withdrawals repeat an asset, and each asset totals exactly its own `MaxBatchWithdrawal` (100, 300, 200): step 5a passes and the status is `SUCCESS`; the 300-cap and 100-cap assets differ only in the first ZTS byte (byte 22) and the 100-cap and 200-cap assets only in the last (byte 31), so a total keyed by a truncated asset ID merges two assets and faults |
+| `CV-CAP-6` | three assets with caps 300, 100, 200 in ascending asset order and six withdrawals 25 (200-cap asset), 25 (200-cap asset), 60 (100-cap asset), 50 (300-cap asset), 60 (100-cap asset), 150 (300-cap asset): the 100-cap asset is the middle asset in ascending and in first-appearance order, its two withdrawals are identical (60) and each is within its cap but their total 120 is over it, the last withdrawal is of another asset and another asset has the largest total (200), and the other two assets are within their own caps: `RUNTIME_FAULT` at the metered gas, full rollback and the full deposit refunded |
 | `CV-CAP-7` | a withdrawal over its cap at a `plasma_limit` that leaves nothing for the §10.4 effect charge: `RUNTIME_FAULT` from step 5a, not `OUT_OF_GAS` from step 6 |
+| `CV-CAP-8` | two withdrawals of 2^255 in one asset capped at 2^256 - 1: each is within the cap and the exact total 2^256 is over it, though a u256 sum wraps to 0: `RUNTIME_FAULT` at the metered gas from step 5a; with a state write, an event and a deposit: full rollback and the full deposit refunded |
+| `CV-CAP-9` | withdrawals of 2^64 + 1 and 2^128 + 1 in one asset capped at 2^129: the exact total is within the cap and step 5a passes |
+| `CV-CAP-10` | withdrawals of 2^128 and 2^128 + 2^64 in one asset capped at 2^128 + 2^64: each is within the cap and the exact total is over it, though the total truncated to 64 or 128 bits is within it: `RUNTIME_FAULT` at the metered gas; with a state write, an event and a deposit: full rollback and the full deposit refunded |
+| `CV-CAP-11` | withdrawals of 2^192 - 1 and 1 in one asset capped at 2^192 - 1, with a state write, an event and a deposit: the exact total 2^192 carries across the 2^64, 2^128 and 2^192 limb boundaries and is over the cap: `RUNTIME_FAULT` at the metered gas, full rollback and the full deposit refunded |
+| `CV-CAP-12` | withdrawals of 600 and 400 in the deposit asset, capped at 1000, with an unclaimed deposit of 1000: the deposit and its refund do not count toward the cap, so step 5a passes and the refund follows the two withdrawals |
+| `CV-ASSETS-3` | 16 distinct-asset withdrawals, every asset capped above its total, fill the per-input asset footprint exactly and pass step 5a |
+| `CV-ASSETS-4` | 16 distinct-asset withdrawals plus a non-zero deposit in one of those assets: the deposit asset is already in the footprint, which stays at 16, and step 5a passes |
+| `CV-ASSETS-5` | 16 capped distinct-asset withdrawals plus a zero-amount withdrawal in a 17th, uncapped asset breach the footprint, since a zero-amount withdrawal still names its asset: `RUNTIME_FAULT` at the metered gas |
+| `CV-ORDER-1` | a wrong input index and a reserved-key write: step 2 precedes step 3, so `RUNTIME_FAULT`, not `UNAUTHORIZED` |
+| `CV-ORDER-2` | an event attributed to another contract and a reserved-key write: step 2's attribution check precedes step 3, so `RUNTIME_FAULT`, not `UNAUTHORIZED` |
+| `CV-ORDER-3` | a duplicated local key, then a reserved key: the step 3 scan runs in blob order and meets the duplicate first, so `RUNTIME_FAULT`, not `UNAUTHORIZED` |
+| `CV-ORDER-4` | a reserved key, then a duplicated local key: the step 3 scan runs in blob order and meets the reserved key first, so `UNAUTHORIZED`, not `RUNTIME_FAULT` |
+| `CV-ORDER-5` | a reserved-key write followed by one trailing byte: step 1 decodes the whole blob before step 3 scans it, so `RUNTIME_FAULT`, not `UNAUTHORIZED` |
+| `CV-ORDER-6` | a reserved-key write and a non-zero claim with no deposit: step 3 precedes step 4, so `UNAUTHORIZED`, not `RUNTIME_FAULT` |
+| `CV-ORDER-7` | a reserved-key write and a withdrawal over its cap: step 3 precedes step 5a, so `UNAUTHORIZED`, not `RUNTIME_FAULT` |
+| `CV-ORDER-8` | a wrong input index at a `plasma_limit` that leaves nothing for the effect charge: step 2 precedes step 6, so `RUNTIME_FAULT`, not `OUT_OF_GAS` |
+| `CV-ORDER-9` | a reserved-key write at a `plasma_limit` that leaves nothing for the effect charge: step 3 precedes step 6, so `UNAUTHORIZED`, not `OUT_OF_GAS` |
+| `CV-ORDER-10` | a non-zero claim with no deposit at a `plasma_limit` that leaves nothing for the effect charge: step 4 precedes step 6, so `RUNTIME_FAULT`, not `OUT_OF_GAS` |
+| `CV-ORDER-11` | a write one byte over the remaining quota at a `plasma_limit` that leaves nothing for the effect charge: step 6 precedes step 6a, so `OUT_OF_GAS`, not `STORAGE_QUOTA_EXCEEDED` |
+| `CV-ORDER-12` | a write one byte over the remaining quota and ReturnData over `MaxReturnData`: step 6a precedes step 7, so `STORAGE_QUOTA_EXCEEDED` at metered plus effect gas, not `RESULT_TOO_LARGE` |
+| `CV-ORDER-13` | ReturnData over `MaxReturnData` at a `plasma_limit` that leaves nothing for the effect charge: step 6 precedes step 7, so `OUT_OF_GAS`, not `RESULT_TOO_LARGE` |
+| `CV-ORDER-14` | an outbox message whose `source_contract` is another contract, and a reserved-key write: step 2's outbox attribution check precedes step 3, so `RUNTIME_FAULT`, not `UNAUTHORIZED` |
+| `CV-ORDER-15` | withdrawals naming 17 distinct capped assets at a `plasma_limit` that leaves nothing for the effect charge: the step 5a footprint check precedes step 6, so `RUNTIME_FAULT`, not `OUT_OF_GAS` |
+| `CV-ORDER-16` | withdrawals naming 17 distinct capped assets and a reserved-key write: step 3 precedes the step 5a footprint check, so `UNAUTHORIZED`, not `RUNTIME_FAULT` |
+| `CV-ATTR-1` | an event whose `contract_id` is another contract: `RUNTIME_FAULT` at the metered gas |
+| `CV-ATTR-2` | an L2 delivery whose `source_contract` is another, non-zero contract: `RUNTIME_FAULT` at the metered gas |
+| `CV-ATTR-3` | a capped withdrawal whose `source_contract` is `bytes32(0)`, the runtime's refund marker, which a contract cannot emit: `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-1` | a blob whose `executionresult_version` is 2: an unknown version is rejected, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-2` | an event whose `input_index` is not the executing input's: the decoder rejects it (§27.1a), so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-3` | an outbox message whose `input_index` is not the executing input's: the decoder rejects it (§27.1a), so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-4` | one trailing byte after `claimed_deposit`: `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-5` | a blob that ends after ReturnData, omitting `claimed_deposit`: the field never defaults to 0, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-6` | a ReturnData length prefix one above the bytes present: the prefix is never repaired, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-7` | an outbox message of kind 2: only kinds 0 and 1 exist, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-8` | a zero-amount withdrawal naming a non-canonical AssetID whose only non-zero byte in `[0:22]` is byte 21, the last byte that must be zero: the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-9` | `run` returns a zero-length blob: an empty blob does not decode as a ContractEffects, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-10` | two events with `event_index` 0 and 2: the gap is rejected, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-11` | two outbox messages with `outbox_index` 0 and 2: the gap is rejected, so `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-1` | a StateDiff local key of `MaxStateKeySize` + 1 bytes: `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-2` | a StateDiff local key of exactly `MaxStateKeySize` bytes is accepted |
+| `CV-LIMIT-3` | a StateDiff value of `MaxStateValueSize` + 1 bytes, every byte present: `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-4` | `MaxEventsPerExecution` + 1 events: `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-5` | exactly `MaxEventsPerExecution` events are accepted |
+| `CV-LIMIT-6` | an event with `MaxTopicsPerEvent` + 1 topics: `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-7` | an event with exactly `MaxTopicsPerEvent` topics is accepted |
+| `CV-LIMIT-8` | an event with `MaxEventDataSize` + 1 data bytes: `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-9` | an event with exactly `MaxEventDataSize` data bytes is accepted |
+| `CV-LIMIT-10` | an L2 delivery with a payload of `MaxOutboxPayloadSize` + 1 bytes: `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-11` | an L2 delivery with a payload of exactly `MaxOutboxPayloadSize` bytes is accepted |
+| `CV-LIMIT-12` | a blob with `MaxOutboxPerExecution` + 1 messages: the ExecutionResult's refund slot does not widen a contract's own bound, so `RUNTIME_FAULT` at the metered gas |
+| `CV-LIMIT-13` | a StateDiff value of exactly `MaxStateValueSize` bytes is accepted |
+| `CV-DECODE-12` | a blob whose `executionresult_version` is 0: only version 1 is known, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-13` | a lone event with `event_index` 1: event indices start at 0, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-14` | a lone outbox message with `outbox_index` 1: outbox indices start at 0, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-15` | an outbox message of kind 2 followed by an `L1_WITHDRAWAL` body: only kinds 0 and 1 exist, and kind 2 is never read as a withdrawal, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-16` | an Events count prefix of 2 with one event present: the count is never treated as an upper bound, so `RUNTIME_FAULT` at the metered gas |
+| `CV-STATE-1` | deleting a key absent from the pre-state: a well-formed no-op that commits its `EMPTY` entry, leaves the root unchanged and reads no quota leaf |
+| `CV-STATE-2` | an `EMPTY` deletion sentinel followed by stray value bytes: `EMPTY` carries no value bytes, so `RUNTIME_FAULT` at the metered gas |
+| `CV-STATE-3` | rewriting a key with its current value: the entry is committed, the root is unchanged, and the net quota change is 0, so no quota entry is committed |
+| `CV-RESERVED-1` | writes to `0x00`, `0x0000`, `0x0006` and `0x000100`, each near a reserved key but none equal to one: reserved keys match exactly, never by prefix or range, so `SUCCESS` |
+| `CV-QUOTA-9` | a write by a contract with no quota leaf: an absent leaf means purchased = used = 0, so `STORAGE_QUOTA_EXCEEDED` at metered plus effect gas |
+| `EXEC-DEP-6` | a payable `CallL2` with a payload and a deposit of 1000 claims 400: `SUCCESS`, and the 600 refund follows the contract's message |
+| `EXEC-DEP-7` | `abort(7)` on an input carrying a deposit: `REVERT`, and the full deposit is refunded |
+| `EXEC-DEP-8` | the pre-execution initial-memory charge is unaffordable on an input carrying a deposit: `OUT_OF_GAS`, and the full deposit is refunded |
+| `EXEC-DEP-9` | a reserved-key write on an input carrying a deposit: `UNAUTHORIZED`, and the full deposit is refunded |
+| `EXEC-DEP-10` | a blob longer than `MaxResultBlob` on an input carrying a deposit: `RESULT_TOO_LARGE` from step 0, and the full deposit is refunded |
+| `CV-DECODE-17` | a zero-amount withdrawal naming a non-canonical AssetID whose only non-zero byte in `[0:22]` is byte 0, the first byte that must be zero: the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-18` | three events with `event_index` 0, 2 and 1: the list is a gap-free permutation but not ascending, so the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
+| `CV-DECODE-19` | three outbox messages with `outbox_index` 0, 2 and 1: the list is a gap-free permutation but not ascending, so the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
+| `EXEC-UNSUP-1` | an unrecognized `input_kind` is refused deterministically as `UNSUPPORTED_OPERATION` |
 | `CV-DEPLOY-1` | single-chunk deployment start: `chunk_count` 1 for a module within `MaxDeployChunkData` |
 | `CV-DEPLOY-2` | the single deploy chunk carrying the whole module at `chunk_index` 0 |
 | `EXEC-DEPLOY-1` | deploy finalize: the three reserved leaves are written and `ReturnData` is `code_hash` then `CodeHash` |
@@ -191,7 +263,7 @@ then update the `vectorFileDigest` literal in `../vectors_test.go` with the dige
 | `CV-QUOTA-6` | `BuyStorage` adds `bytes` to `purchased` and leaves `used` unchanged |
 | `CV-QUOTA-7` | `BuyStorage` naming a `contract_id` with no code-hash leaf is `VALIDATION_FAILED` |
 | `CV-QUOTA-8` | `BuyStorage` whose `purchased + bytes` is `2^64` is `VALIDATION_FAILED`, and its receipt carries the unchanged `CodeHash` |
-| `EXEC-UNSUP-1` | an unrecognized `input_kind` is refused deterministically as `UNSUPPORTED_OPERATION` |
+| `EXEC-FAIL-OUTBOX-1` | a failed input carrying a deposit, proving §14.3's discard |
 
 `CV-DEPLOY-1` and `CV-DEPLOY-2` together are the single-chunk sizing case: the kind-2 record
 declaring `chunk_count == 1` and the kind-3 chunk that carries the whole module.

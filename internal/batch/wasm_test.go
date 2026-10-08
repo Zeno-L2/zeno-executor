@@ -21,7 +21,7 @@ import (
 
 // exec008Fixture is the minimal subset of the execution-conformance-v1.json schema this test
 // needs from vector EXEC-008: the module bytes and the two pre_state leaves. The fixture file
-// is normative and append-only — read here, never written.
+// is normative, read here, never written.
 type exec008Fixture struct {
 	Vectors []struct {
 		ID            string            `json:"id"`
@@ -55,7 +55,7 @@ func loadExec008(t *testing.T) (moduleBytes []byte, preState map[trie.Path][]byt
 }
 
 // loadExecVector reads one vector's raw fields out of the checked-in execution conformance
-// artifact, normative and append-only — read here, never written.
+// artifact, normative, read here, never written.
 func loadExecVector(t *testing.T, id string) struct {
 	ID            string            `json:"id"`
 	ModuleWasmHex string            `json:"module_wasm_hex"`
@@ -160,9 +160,9 @@ func TestDriverEndToEndThroughWasmPlugin(t *testing.T) {
 		{Ctx: domain.InputContext{GlobalInputIndex: 0, L1Sender: deployer}, Payload: deployStart},
 		{Ctx: domain.InputContext{GlobalInputIndex: 1, L1Sender: deployer, SourceData: moduleBytes}, Payload: deployChunk},
 		{Ctx: domain.InputContext{GlobalInputIndex: 2, L1Sender: deployer}, Payload: deployFinalize},
-		// The module hard-codes global_input_index 105; the deploy inputs' indices are
+		// The module hard-codes global_input_index 1005; the deploy inputs' indices are
 		// otherwise unconstrained (the driver does no index arithmetic).
-		{Ctx: domain.InputContext{GlobalInputIndex: 105, L1Sender: deployer, Caps: allCaps(codec.U256{0x80})}, Payload: call},
+		{Ctx: domain.InputContext{GlobalInputIndex: 1005, L1Sender: deployer, Caps: allCaps(codec.U256{0x80})}, Payload: call},
 	}
 
 	cfg := Config{
