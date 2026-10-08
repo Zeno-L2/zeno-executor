@@ -8,6 +8,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -127,7 +128,7 @@ type vectorSpec struct {
 	Shape                  string
 	BatchID                uint64
 	Ctx                    domain.InputContext
-	SourceAccountBlockHash types.Hash
+	SourceAccountBlockHash types.Hash // set by TestGenerateVectors from ID
 	Args                   codec.InputArgs
 	ContractID             types.Hash
 	Module                 []byte                 // raw, pre-instrumentation
@@ -181,6 +182,12 @@ func capTableFromJSON(t *testing.T, m map[string]string) capTable {
 	return out
 }
 
+// sourceHash is the SourceAccountBlockHash of the vector with the given ID: the SHA-256 of a
+// fixed prefix and the ID, so no two IDs share one and no generator allocates its own.
+func sourceHash(id string) types.Hash {
+	return types.Hash(sha256.Sum256([]byte("conformance-vector:" + id)))
+}
+
 // repeatedHash builds a 32-byte hash whose every byte is b.
 func repeatedHash(b byte) types.Hash {
 	var h types.Hash
@@ -229,7 +236,6 @@ func spineVectors(t *testing.T) []vectorSpec {
 			MomentumTime:     1700000000,
 			L1Sender:         sender1,
 		},
-		SourceAccountBlockHash: repeatedHash(0xA1),
 		Args: codec.CallL2Args{
 			TargetContract: contract1,
 			PlasmaLimit:    plasmaLimit,
@@ -272,7 +278,6 @@ func spineVectors(t *testing.T) []vectorSpec {
 			MomentumTime:     1700000000,
 			L1Sender:         sender1,
 		},
-		SourceAccountBlockHash: repeatedHash(0xA2),
 		Args: codec.CallL2Args{
 			TargetContract: contract1,
 			PlasmaLimit:    plasmaLimit,
@@ -311,7 +316,6 @@ func spineVectors(t *testing.T) []vectorSpec {
 			MomentumTime:     1700000600,
 			L1Sender:         repeatedAddr(0x02),
 		},
-		SourceAccountBlockHash: repeatedHash(0xA3),
 		Args: codec.DepositArgs{
 			TargetContract: contract3,
 			PlasmaLimit:    plasmaLimit,
@@ -858,10 +862,10 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 }
 
 // assertUniqueIdentities fails the test if any two specs in the full artifact share an ID, a
-// SourceAccountBlockHash or a (BatchID, GlobalInputIndex) pair. Ticket-local identity values
-// (see newIdentity in callvectors_test.go) are append-only: a spec added by a later ticket must
-// take the next unused value in each sequence rather than reusing or renumbering one already in
-// this list, and this check is what catches it if it doesn't.
+// SourceAccountBlockHash or a (BatchID, GlobalInputIndex) pair. Indices are append-only within
+// each generator's block (see nextIndex in callvectors_test.go and deployvectors_test.go): a spec
+// added later takes the next unused index rather than reusing or renumbering one already
+// handed out, and this check catches it if it doesn't. Source hashes follow from IDs.
 func assertUniqueIdentities(t *testing.T, specs []vectorSpec) {
 	t.Helper()
 
@@ -901,6 +905,12 @@ func TestGenerateVectors(t *testing.T) {
 	specs = append(specs, callVectors(t)...)
 	deploySpecs := deployVectors(t)
 	unsupported := unsupportedVector()
+	unsupported.SourceAccountBlockHash = sourceHash(unsupported.ID)
+	for _, group := range [][]vectorSpec{specs, deploySpecs} {
+		for i := range group {
+			group[i].SourceAccountBlockHash = sourceHash(group[i].ID)
+		}
+	}
 	assertUniqueIdentities(t, append(append(append([]vectorSpec{}, specs...), deploySpecs...), unsupported))
 
 	vectors := make([]vectorJSON, 0, len(specs)+len(deploySpecs)+1)
@@ -911,6 +921,14 @@ func TestGenerateVectors(t *testing.T) {
 		vectors = append(vectors, generateDeployVector(t, spec))
 	}
 	vectors = append(vectors, generateUnsupportedVector(t, unsupported, 8, chainID))
+
+	// The pair (batch_id, global_input_index) is unique, so the order is total.
+	sort.SliceStable(vectors, func(i, j int) bool {
+		if vectors[i].BatchID != vectors[j].BatchID {
+			return vectors[i].BatchID < vectors[j].BatchID
+		}
+		return vectors[i].GlobalInputIndex < vectors[j].GlobalInputIndex
+	})
 
 	assertChainedRoots(t, vectors, [][2]string{
 		{"EXEC-UPGRADE-2", "EXEC-DEPLOY-2"},
@@ -988,7 +1006,7 @@ func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "e5344622a57f2dfdc281b8bdbae4656fd5d041b46e0bbbde835480e4576768c2"
+const vectorFileDigest = "e06cf0ee59e1bceff33ca4977238a2bc64471910e2d4979b3c82b41db0554c89"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {

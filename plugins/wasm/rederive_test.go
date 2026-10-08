@@ -493,6 +493,7 @@ func checkShape(t *testing.T, file vectorFile, vec vectorJSON) {
 		checkCallReservedWitnesses(t, vec)
 		checkCallEffects(t, vec)
 		checkCallRefund(t, vec)
+		checkCallSuccessRefund(t, vec)
 		if vec.Status == "SUCCESS" || vec.Status == "STORAGE_QUOTA_EXCEEDED" {
 			checkCallQuota(t, vec)
 		}
@@ -658,6 +659,8 @@ func checkCallEffects(t *testing.T, vec vectorJSON) {
 		t.Fatalf("C4: ContractEffects.ClaimedDeposit disagrees with ExecutionResult.ClaimedDeposit")
 	}
 
+	checkCallEffectsTie(t, vec, eff, er)
+
 	contractID := mustHex(t, vec.Receipt.ContractID)
 	wantSet := make(map[string]bool, len(eff.StateDiff))
 	for _, e := range eff.StateDiff {
@@ -671,6 +674,53 @@ func checkCallEffects(t *testing.T, vec vectorJSON) {
 	delete(gotSet, hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x05})))
 	if !reflect.DeepEqual(wantSet, gotSet) {
 		t.Fatalf("C4: inline-derived local StateDiff key set disagrees with ExecutionResult.StateDiff key set:\n got  %v\n want %v", gotSet, wantSet)
+	}
+}
+
+// checkCallEffectsTie ties the ExecutionResult's events and outbox to the contract effects
+// blob on SUCCESS (§27.1a, §27.3, §27.4): the events are the blob's events in order, the first n
+// outbox messages are the blob's n contract messages in order, and the only message after them
+// is the runtime-emitted refund at outbox_index n (§18.5), present exactly when the unclaimed
+// remainder deposit_amount - claimed_deposit is non-zero. Both sides come from the codec
+// decoders; the production result assembly is not consulted. The tie owns the events, the
+// contract messages in order and the message count; C5s owns the refund's fields.
+func checkCallEffectsTie(t *testing.T, vec vectorJSON, eff codec.ContractEffects, er codec.ExecutionResult) {
+	t.Helper()
+
+	if len(er.Events) != len(eff.Events) {
+		t.Fatalf("C4: ExecutionResult has %d events, want the blob's %d", len(er.Events), len(eff.Events))
+	}
+	for i := range eff.Events {
+		if !reflect.DeepEqual(er.Events[i], eff.Events[i]) {
+			t.Fatalf("C4: ExecutionResult event %d = %+v, want the blob's %+v", i, er.Events[i], eff.Events[i])
+		}
+	}
+
+	n := len(eff.Outbox)
+	if len(er.Outbox) < n {
+		t.Fatalf("C4: ExecutionResult has %d outbox messages, want at least the blob's %d contract messages", len(er.Outbox), n)
+	}
+	for i := 0; i < n; i++ {
+		if !reflect.DeepEqual(er.Outbox[i], eff.Outbox[i]) {
+			t.Fatalf("C4: ExecutionResult outbox message %d = %+v, want the blob's %+v", i, er.Outbox[i], eff.Outbox[i])
+		}
+	}
+
+	remainder := new(big.Int)
+	if vec.Input != nil && vec.Input.DepositAmount != "" {
+		remainder.SetBytes(mustHex(t, vec.Input.DepositAmount))
+	}
+	claim := new(big.Int).SetBytes(eff.ClaimedDeposit[:])
+	remainder.Sub(remainder, claim)
+	if remainder.Sign() < 0 {
+		t.Fatalf("C4: claimed_deposit exceeds deposit_amount by %s on a SUCCESS row", new(big.Int).Neg(remainder))
+	}
+	want := n
+	if remainder.Sign() > 0 {
+		want = n + 1
+	}
+	if len(er.Outbox) != want {
+		t.Fatalf("C4: ExecutionResult has %d outbox messages, want %d (%d contract messages, then the refund only when the remainder %s is non-zero)", len(er.Outbox), want, n, remainder)
 	}
 }
 
@@ -833,6 +883,76 @@ func checkCallRefund(t *testing.T, vec vectorJSON) {
 	}
 	if vec.Receipt.OutboxRoot == zeroHashHex {
 		t.Fatalf("C5: receipt.outbox_root is zero, want non-zero")
+	}
+}
+
+// checkCallSuccessRefund re-derives the SUCCESS refund of a call row with a deposit from the
+// row's own inputs (§18.5, §27.4): the unclaimed remainder deposit_amount - claimed_deposit is
+// refunded as a zero-source L1Withdrawal at outbox_index = the number of contract messages,
+// and no refund message exists when the remainder is 0. The claim and the contract messages
+// come from the contract effects blob, the deposit from the input view; the production refund
+// code is not consulted.
+func checkCallSuccessRefund(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "SUCCESS" || vec.Input == nil || vec.Input.DepositAmount == "" {
+		return
+	}
+	deposit := new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount))
+	if deposit.Sign() == 0 {
+		return
+	}
+
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("C5s: DecodeContractEffects: %v", err)
+	}
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("C5s: DecodeExecutionResult: %v", err)
+	}
+	claim := new(big.Int).SetBytes(eff.ClaimedDeposit[:])
+	remainder := new(big.Int).Sub(deposit, claim)
+	if remainder.Sign() < 0 {
+		t.Fatalf("C5s: claimed_deposit %s exceeds deposit_amount %s on a SUCCESS row", claim, deposit)
+	}
+
+	n := len(eff.Outbox)
+	wantMessages := n
+	if remainder.Sign() > 0 {
+		wantMessages = n + 1
+	}
+	if len(er.Outbox) != wantMessages {
+		t.Fatalf("C5s: ExecutionResult has %d outbox messages, want %d (%d contract messages, remainder %s)", len(er.Outbox), wantMessages, n, remainder)
+	}
+	if int(vec.Receipt.OutboxCount) != wantMessages {
+		t.Fatalf("C5s: receipt.outbox_count = %d, want %d", vec.Receipt.OutboxCount, wantMessages)
+	}
+	if remainder.Sign() == 0 {
+		return
+	}
+
+	refund := er.Outbox[n]
+	if refund.SourceContract != (types.Hash{}) {
+		t.Fatalf("C5s: refund SourceContract = %x, want zero", refund.SourceContract)
+	}
+	if refund.OutboxIndex != uint32(n) {
+		t.Fatalf("C5s: refund OutboxIndex = %d, want %d (the number of contract messages)", refund.OutboxIndex, n)
+	}
+	if refund.InputIndex != vec.Receipt.InputIndex {
+		t.Fatalf("C5s: refund InputIndex = %d, want receipt.input_index %d", refund.InputIndex, vec.Receipt.InputIndex)
+	}
+	if len(refund.Payload) != 0 {
+		t.Fatalf("C5s: refund Payload = %x, want empty", refund.Payload)
+	}
+	w, ok := refund.Target.(codec.L1Withdrawal)
+	if !ok {
+		t.Fatalf("C5s: refund Target = %T, want codec.L1Withdrawal", refund.Target)
+	}
+	if hex.EncodeToString(w.RecipientL1[:]) != vec.L1Sender || hex.EncodeToString(w.Asset[:]) != vec.Input.DepositAsset {
+		t.Fatalf("C5s: refund to %x in %x, want l1_sender %s in %s", w.RecipientL1, w.Asset, vec.L1Sender, vec.Input.DepositAsset)
+	}
+	if got := new(big.Int).SetBytes(w.Amount[:]); got.Cmp(remainder) != 0 {
+		t.Fatalf("C5s: refund amount %s, want deposit - claimed_deposit %s", got, remainder)
 	}
 }
 
@@ -1919,6 +2039,9 @@ func checkCVASSETS1(t *testing.T, vec vectorJSON) {
 	if n := distinctAssetCount(assets); n != 17 {
 		t.Fatalf("CV-ASSETS-1: %d distinct withdrawal assets, want 17", n)
 	}
+	want := noConditions()
+	want.FootprintOver = true
+	checkConditions(t, vec, "RUNTIME_FAULT", want)
 }
 
 // checkCVASSETS2 pins the RUNTIME_FAULT to the step-5a footprint: 16 distinct withdrawal
@@ -1936,6 +2059,9 @@ func checkCVASSETS2(t *testing.T, vec vectorJSON) {
 			t.Fatalf("CV-ASSETS-2: a withdrawal asset equals the deposit asset %s, want all 16 distinct from it", depositAsset)
 		}
 	}
+	want := noConditions()
+	want.FootprintOver = true
+	checkConditions(t, vec, "RUNTIME_FAULT", want)
 }
 
 // checkCVQUOTA4ZeroDelta is the CV-QUOTA-4 invariant: the returned blob's StateDiff is
@@ -2176,7 +2302,10 @@ func threeAssetTotals(t *testing.T, vec vectorJSON) (keys, seen []string, totals
 // distinct assets in either order is told apart. In ascending asset order the first cap is the
 // strict maximum and the middle cap the strict minimum, so the first, last, maximum and minimum
 // cap each differ from the others. Applying any one of them to every asset, or the sum of the
-// caps, then either faults this vector or leaves it to CV-CAP-6.
+// caps, then either faults this vector or leaves it to CV-CAP-6. Two of the assets differ only
+// in byte 22 and two only in byte 31, so a total keyed by the low 8 bytes merges the first pair,
+// a total keyed by the high ZTS bytes merges the second, and with every total equal to its cap
+// either merge faults.
 func checkCVCAP5(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	if vec.Status != "SUCCESS" {
@@ -2206,6 +2335,27 @@ func checkCVCAP5(t *testing.T, vec vectorJSON) {
 	if sum.Add(sum, totals[keys[2]]); sum.Cmp(first) <= 0 {
 		t.Fatalf("CV-CAP-5: the summed totals %s do not exceed the largest cap %s", sum, first)
 	}
+	// differsOnlyAt reports whether two asset keys differ in byte pos and in no other byte.
+	differsOnlyAt := func(x, y string, pos int) bool {
+		bx, by := mustHex(t, x), mustHex(t, y)
+		for i := range bx {
+			if (bx[i] != by[i]) != (i == pos) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, pos := range []int{22, 31} {
+		found := false
+		for i := range keys {
+			for j := i + 1; j < len(keys); j++ {
+				found = found || differsOnlyAt(keys[i], keys[j], pos)
+			}
+		}
+		if !found {
+			t.Fatalf("CV-CAP-5: no pair of assets differs only in byte %d", pos)
+		}
+	}
 }
 
 // checkCVCAP6 pins the RUNTIME_FAULT to the middle asset in both ascending and outbox
@@ -2213,7 +2363,9 @@ func checkCVCAP5(t *testing.T, vec vectorJSON) {
 // within the cap, by an amount both other caps cover, and the three totals together stay within
 // the sum of the caps. The last withdrawal is of another asset and the over-cap asset does not
 // have the largest total, so a check of only the last withdrawal's asset or only the largest-total
-// asset passes it only by missing the fault.
+// asset passes it only by missing the fault. The over-cap asset has exactly two withdrawals of
+// equal amount, so a total that counts identical withdrawals once passes it only by missing the
+// fault.
 func checkCVCAP6(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	checkCVASSETSBase(t, vec)
@@ -2227,6 +2379,15 @@ func checkCVCAP6(t *testing.T, vec vectorJSON) {
 		}
 	}
 	ws := withdrawalsOf(t, vec)
+	var overCapAmounts []codec.U256
+	for _, w := range ws {
+		if hex.EncodeToString(w.Asset[:]) == keys[1] {
+			overCapAmounts = append(overCapAmounts, w.Amount)
+		}
+	}
+	if len(overCapAmounts) != 2 || overCapAmounts[0] != overCapAmounts[1] {
+		t.Fatalf("CV-CAP-6: the over-cap asset has withdrawals %v, want exactly two of equal amount", overCapAmounts)
+	}
 	if last := hex.EncodeToString(ws[len(ws)-1].Asset[:]); last == keys[1] {
 		t.Fatalf("CV-CAP-6: the last withdrawal is of the over-cap asset %s, want another asset", last)
 	}
@@ -2289,6 +2450,1229 @@ func checkCVCAP7(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// checkCVCAP8 pins the RUNTIME_FAULT to the exact total: every amount is within the cap, the
+// cap is the largest u256 and the exact total reaches 2^256, which a u256 sum wraps to 0.
+func checkCVCAP8(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("CV-CAP-8: status %s, want RUNTIME_FAULT", vec.Status)
+	}
+	checkCVASSETSBase(t, vec)
+	checkCapFaultExtras(t, vec)
+	asset, total, amounts := capWithdrawalsInOneAsset(t, vec, 2)
+	limit := capOf(t, vec, asset)
+	if want := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)); limit.Cmp(want) != 0 {
+		t.Fatalf("CV-CAP-8: cap %s, want 2^256 - 1", limit)
+	}
+	for i, a := range amounts {
+		if a.Cmp(limit) > 0 {
+			t.Fatalf("CV-CAP-8: withdrawal %d amount %s exceeds the cap %s alone", i, a, limit)
+		}
+	}
+	if total.Cmp(new(big.Int).Lsh(big.NewInt(1), 256)) < 0 {
+		t.Fatalf("CV-CAP-8: total %s is below 2^256", total)
+	}
+}
+
+// checkCVCAP9 pins SUCCESS to a total above 2^64 and 2^128 that is within a wide cap: the
+// exact total fits the cap, while the total truncated to 64 or 128 bits does not fit the cap
+// truncated to the same width, so a cap truncated to those widths, alone or together with the
+// sum, faults it.
+func checkCVCAP9(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "SUCCESS" {
+		t.Fatalf("CV-CAP-9: status %s, want SUCCESS", vec.Status)
+	}
+	asset, total, amounts := capWithdrawalsInOneAsset(t, vec, 2)
+	limit := capOf(t, vec, asset)
+	for i, a := range amounts {
+		if a.Cmp(new(big.Int).Lsh(big.NewInt(1), 64)) <= 0 {
+			t.Fatalf("CV-CAP-9: withdrawal %d amount %s is not above 2^64", i, a)
+		}
+	}
+	if limit.Cmp(new(big.Int).Lsh(big.NewInt(1), 128)) <= 0 {
+		t.Fatalf("CV-CAP-9: cap %s is not above 2^128", limit)
+	}
+	if total.Cmp(limit) > 0 {
+		t.Fatalf("CV-CAP-9: total %s exceeds the cap %s", total, limit)
+	}
+	for _, k := range []uint{64, 128} {
+		mod := new(big.Int).Lsh(big.NewInt(1), k)
+		if new(big.Int).Mod(total, mod).Cmp(new(big.Int).Mod(limit, mod)) <= 0 {
+			t.Fatalf("CV-CAP-9: total mod 2^%d is not above the cap mod 2^%d", k, k)
+		}
+	}
+}
+
+// checkCVCAP10 pins the RUNTIME_FAULT to a total above the cap: each amount is within the cap,
+// while the total truncated to 64 or 128 bits is within the cap truncated to the same width.
+func checkCVCAP10(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("CV-CAP-10: status %s, want RUNTIME_FAULT", vec.Status)
+	}
+	checkCVASSETSBase(t, vec)
+	checkCapFaultExtras(t, vec)
+	asset, total, amounts := capWithdrawalsInOneAsset(t, vec, 2)
+	limit := capOf(t, vec, asset)
+	for i, a := range amounts {
+		if a.Cmp(new(big.Int).Lsh(big.NewInt(1), 64)) <= 0 || a.Cmp(limit) > 0 {
+			t.Fatalf("CV-CAP-10: withdrawal %d amount %s is not above 2^64 and within the cap %s", i, a, limit)
+		}
+	}
+	if total.Cmp(limit) <= 0 {
+		t.Fatalf("CV-CAP-10: total %s is not above the cap %s", total, limit)
+	}
+	for _, k := range []uint{64, 128} {
+		mod := new(big.Int).Lsh(big.NewInt(1), k)
+		if new(big.Int).Mod(total, mod).Cmp(new(big.Int).Mod(limit, mod)) > 0 {
+			t.Fatalf("CV-CAP-10: total mod 2^%d is above the cap mod 2^%d", k, k)
+		}
+	}
+}
+
+// checkCapFaultExtras asserts the capVector RUNTIME_FAULT extras: a non-empty StateDiff,
+// exactly one event, a non-zero deposit, and conditions {CapOver} at RUNTIME_FAULT.
+func checkCapFaultExtras(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	want := noConditions()
+	want.CapOver = true
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", want)
+	if len(eff.StateDiff) == 0 {
+		t.Fatalf("%s: StateDiff is empty, want a state write for the rollback to discard", vec.ID)
+	}
+	if len(eff.Events) != 1 {
+		t.Fatalf("%s: %d events, want exactly 1", vec.ID, len(eff.Events))
+	}
+	if vec.Input == nil || new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() == 0 {
+		t.Fatalf("%s: input.deposit_amount is zero, want a deposit for the refund to return", vec.ID)
+	}
+}
+
+// carryDroppedSum sums amounts in order, losing exactly the carry out of bit k at each step.
+func carryDroppedSum(amounts []*big.Int, k uint) *big.Int {
+	mod := new(big.Int).Lsh(big.NewInt(1), k)
+	sum := new(big.Int)
+	for _, a := range amounts {
+		low := new(big.Int).Mod(sum, mod)
+		low.Add(low, new(big.Int).Mod(a, mod)).Mod(low, mod)
+		high := new(big.Int).Rsh(sum, k)
+		high.Add(high, new(big.Int).Rsh(a, k)).Lsh(high, k)
+		sum = low.Add(low, high)
+	}
+	return sum
+}
+
+// checkCVCAP11 pins the RUNTIME_FAULT to a total that carries across the 2^64, 2^128 and 2^192
+// limb boundaries: each amount is within the cap, the exact total 2^192 is over it, and a sum
+// that loses the carry out of bit 64, 128 or 192 stays within it.
+func checkCVCAP11(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("CV-CAP-11: status %s, want RUNTIME_FAULT", vec.Status)
+	}
+	checkCVASSETSBase(t, vec)
+	asset, total, amounts := capWithdrawalsInOneAsset(t, vec, 2)
+	if len(amounts) != 2 {
+		t.Fatalf("CV-CAP-11: %d withdrawals, want exactly 2", len(amounts))
+	}
+	limit := capOf(t, vec, asset)
+	if want := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 192), big.NewInt(1)); limit.Cmp(want) != 0 {
+		t.Fatalf("CV-CAP-11: cap %s, want 2^192 - 1", limit)
+	}
+	for i, a := range amounts {
+		if a.Cmp(limit) > 0 {
+			t.Fatalf("CV-CAP-11: withdrawal %d amount %s exceeds the cap %s alone", i, a, limit)
+		}
+	}
+	if want := new(big.Int).Lsh(big.NewInt(1), 192); total.Cmp(want) != 0 {
+		t.Fatalf("CV-CAP-11: total %s, want 2^192", total)
+	}
+	for _, k := range []uint{64, 128, 192} {
+		if dropped := carryDroppedSum(amounts, k); dropped.Cmp(limit) > 0 {
+			t.Fatalf("CV-CAP-11: the sum losing the carry out of bit %d is %s, above the cap %s", k, dropped, limit)
+		}
+	}
+	checkCapFaultExtras(t, vec)
+}
+
+// checkCVCAP12 pins SUCCESS to the deposit not counting toward the cap: two withdrawals in the
+// deposit asset total exactly its cap, so adding the non-zero deposit would put it over.
+func checkCVCAP12(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	ws := withdrawalsOf(t, vec)
+	if len(ws) != 2 {
+		t.Fatalf("CV-CAP-12: %d withdrawals, want exactly 2", len(ws))
+	}
+	if vec.Input == nil {
+		t.Fatalf("CV-CAP-12: input is absent")
+	}
+	for i, w := range ws {
+		if hex.EncodeToString(w.Asset[:]) != vec.Input.DepositAsset {
+			t.Fatalf("CV-CAP-12: withdrawal %d is in asset %x, want input.deposit_asset %s", i, w.Asset, vec.Input.DepositAsset)
+		}
+	}
+	total := withdrawalTotals(t, vec)[vec.Input.DepositAsset]
+	limit := capOf(t, vec, vec.Input.DepositAsset)
+	if limit.Sign() == 0 || total.Cmp(limit) != 0 {
+		t.Fatalf("CV-CAP-12: total %s, cap %s; want a non-zero cap equal to the total", total, limit)
+	}
+	if new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() == 0 {
+		t.Fatalf("CV-CAP-12: input.deposit_amount is zero, want a non-zero deposit")
+	}
+	if eff.ClaimedDeposit != (codec.U256{}) {
+		t.Fatalf("CV-CAP-12: blob ClaimedDeposit is non-zero, want the deposit unclaimed")
+	}
+}
+
+// checkZeroChargeBudget asserts gas_used == plasma_limit == the one-page blob module's metered
+// gas, computed inline, and a non-zero effect charge for eff.
+func checkZeroChargeBudget(t *testing.T, vec vectorJSON, eff codec.ContractEffects) {
+	t.Helper()
+	metered := module.InitialMemoryCost(1)
+	for _, op := range []byte{0x42, 0x0B} {
+		cost, ok := module.OpcodeCost(module.Opcode(op))
+		if !ok {
+			t.Fatalf("%s: no gas-table cost for opcode 0x%02X", vec.ID, op)
+		}
+		metered += cost
+	}
+	if vec.Input == nil || vec.Input.PlasmaLimit == nil || *vec.Input.PlasmaLimit != metered {
+		t.Fatalf("%s: input.plasma_limit is not the metered gas %d", vec.ID, metered)
+	}
+	if vec.GasUsed != metered {
+		t.Fatalf("%s: gas_used %d, want the metered gas %d", vec.ID, vec.GasUsed, metered)
+	}
+	if inlineEffectCharge(eff) == 0 {
+		t.Fatalf("%s: the effect charge is zero, want non-zero", vec.ID)
+	}
+}
+
+// blobModuleMetered is the gas of a one-page module whose run executes i64.const then end,
+// from the gas table alone: module.InitialMemoryCost(1) plus module.OpcodeCost of 0x42 and
+// 0x0B. It fails the test, naming id, on a missing opcode cost.
+func blobModuleMetered(t *testing.T, id string) uint64 {
+	t.Helper()
+	metered := module.InitialMemoryCost(1)
+	for _, op := range []byte{0x42, 0x0B} {
+		cost, ok := module.OpcodeCost(module.Opcode(op))
+		if !ok {
+			t.Fatalf("%s: no gas-table cost for opcode 0x%02X", id, op)
+		}
+		metered += cost
+	}
+	return metered
+}
+
+// checkOneDefect asserts status RUNTIME_FAULT and gas_used == blobModuleMetered, that the
+// row's blob fails codec.DecodeContractEffects with errors.Is(err, wantErr), and that repair,
+// given a copy of the blob, returns bytes that decode, re-encode with ContractEffects.Encode
+// to the same bytes, and trip no condition (conditionsOf equals noConditions()).
+func checkOneDefect(t *testing.T, vec vectorJSON, wantErr error, repair func(blob []byte) []byte) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("%s: status %s, want RUNTIME_FAULT", vec.ID, vec.Status)
+	}
+	if want := blobModuleMetered(t, vec.ID); vec.GasUsed != want {
+		t.Fatalf("%s: gas_used %d, want the metered gas %d", vec.ID, vec.GasUsed, want)
+	}
+	blob := mustHex(t, vec.ContractEffectsBlobHex)
+	if _, err := codec.DecodeContractEffects(blob); !errors.Is(err, wantErr) {
+		t.Fatalf("%s: DecodeContractEffects error = %v, want errors.Is(..., %v)", vec.ID, err, wantErr)
+	}
+	repaired := repair(append([]byte(nil), blob...))
+	eff, err := codec.DecodeContractEffects(repaired)
+	if err != nil {
+		t.Fatalf("%s: DecodeContractEffects of the repaired blob: %v", vec.ID, err)
+	}
+	again, err := eff.Encode()
+	if err != nil {
+		t.Fatalf("%s: Encode of the repaired blob: %v", vec.ID, err)
+	}
+	if !bytes.Equal(again, repaired) {
+		t.Fatalf("%s: the repaired blob does not re-encode to the same bytes", vec.ID)
+	}
+	if got := conditionsOf(t, vec, eff); !reflect.DeepEqual(got, noConditions()) {
+		t.Fatalf("%s: repaired blob conditions\n got  %+v\n want %+v", vec.ID, got, noConditions())
+	}
+}
+
+// conditionsWith is noConditions with set applied.
+func conditionsWith(set func(c *blobConditions)) blobConditions {
+	c := noConditions()
+	set(&c)
+	return c
+}
+
+// checkCVASSETS3 pins SUCCESS at exactly the footprint limit: 16 distinct withdrawal assets and
+// no deposit.
+func checkCVASSETS3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if n := distinctAssetCount(checkCVASSETSBase(t, vec)); n != 16 {
+		t.Fatalf("CV-ASSETS-3: %d distinct withdrawal assets, want 16", n)
+	}
+	if new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() != 0 {
+		t.Fatalf("CV-ASSETS-3: input.deposit_amount is non-zero, want no deposit")
+	}
+	checkConditions(t, vec, "SUCCESS", noConditions())
+}
+
+// checkCVASSETS4 pins SUCCESS for a deposit in an asset that is already withdrawn: the footprint
+// stays at 16.
+func checkCVASSETS4(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	assets := checkCVASSETSBase(t, vec)
+	if n := distinctAssetCount(assets); n != 16 {
+		t.Fatalf("CV-ASSETS-4: %d distinct withdrawal assets, want 16", n)
+	}
+	deposit := new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount))
+	if deposit.Sign() == 0 {
+		t.Fatalf("CV-ASSETS-4: input.deposit_amount is zero, want a deposit")
+	}
+	withdrawn := false
+	for _, a := range assets {
+		if hex.EncodeToString(a[:]) == vec.Input.DepositAsset {
+			withdrawn = true
+		}
+	}
+	if !withdrawn {
+		t.Fatalf("CV-ASSETS-4: deposit asset %s is not one of the withdrawn assets", vec.Input.DepositAsset)
+	}
+	need := new(big.Int).Add(withdrawalTotals(t, vec)[vec.Input.DepositAsset], deposit)
+	if limit := capOf(t, vec, vec.Input.DepositAsset); limit.Cmp(need) < 0 {
+		t.Fatalf("CV-ASSETS-4: cap %s is below the withdrawal total plus the deposit %s", limit, need)
+	}
+	checkConditions(t, vec, "SUCCESS", noConditions())
+}
+
+// checkCVASSETS5 pins the RUNTIME_FAULT to a zero-amount withdrawal that names a 17th asset.
+func checkCVASSETS5(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if n := distinctAssetCount(checkCVASSETSBase(t, vec)); n != 17 {
+		t.Fatalf("CV-ASSETS-5: %d distinct withdrawal assets, want 17", n)
+	}
+	zero := 0
+	for _, total := range withdrawalTotals(t, vec) {
+		if total.Sign() == 0 {
+			zero++
+		}
+	}
+	if zero != 1 {
+		t.Fatalf("CV-ASSETS-5: %d assets with a zero total, want exactly 1", zero)
+	}
+	checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.FootprintOver = true }))
+}
+
+func checkCVORDER1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.IndexMismatch = true; c.FirstReserved = 0 }))
+}
+
+func checkCVORDER2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.ForeignAttribution = true; c.FirstReserved = 0 }))
+}
+
+func checkCVORDER3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.FirstDuplicate = 1; c.FirstReserved = 2 }))
+}
+
+func checkCVORDER4(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "UNAUTHORIZED", conditionsWith(func(c *blobConditions) { c.FirstReserved = 0; c.FirstDuplicate = 2 }))
+}
+
+// checkCVORDER5 pins the trailing byte: the blob does not decode, and without its last byte it
+// decodes to a reserved-key write.
+func checkCVORDER5(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("CV-ORDER-5: status %s, want RUNTIME_FAULT", vec.Status)
+	}
+	blob := mustHex(t, vec.ContractEffectsBlobHex)
+	if _, err := codec.DecodeContractEffects(blob); !errors.Is(err, codec.ErrTrailingBytes) {
+		t.Fatalf("CV-ORDER-5: DecodeContractEffects error = %v, want ErrTrailingBytes", err)
+	}
+	eff, err := codec.DecodeContractEffects(blob[:len(blob)-1])
+	if err != nil {
+		t.Fatalf("CV-ORDER-5: DecodeContractEffects without the trailing byte: %v", err)
+	}
+	want := conditionsWith(func(c *blobConditions) { c.FirstReserved = 0 })
+	if got := conditionsOf(t, vec, eff); !reflect.DeepEqual(got, want) {
+		t.Fatalf("CV-ORDER-5: blob conditions\n got  %+v\n want %+v", got, want)
+	}
+}
+
+func checkCVORDER6(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "UNAUTHORIZED", conditionsWith(func(c *blobConditions) { c.FirstReserved = 0; c.OverClaim = true }))
+}
+
+func checkCVORDER7(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "UNAUTHORIZED", conditionsWith(func(c *blobConditions) { c.FirstReserved = 0; c.CapOver = true }))
+}
+
+func checkCVORDER8(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.IndexMismatch = true }))
+	checkZeroChargeBudget(t, vec, eff)
+}
+
+func checkCVORDER9(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "UNAUTHORIZED", conditionsWith(func(c *blobConditions) { c.FirstReserved = 0 }))
+	checkZeroChargeBudget(t, vec, eff)
+}
+
+func checkCVORDER10(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.OverClaim = true }))
+	checkZeroChargeBudget(t, vec, eff)
+}
+
+func checkCVORDER11(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "OUT_OF_GAS", conditionsWith(func(c *blobConditions) { c.QuotaOver = true }))
+	checkZeroChargeBudget(t, vec, eff)
+}
+
+func checkCVORDER12(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "STORAGE_QUOTA_EXCEEDED", conditionsWith(func(c *blobConditions) { c.QuotaOver = true; c.ReturnDataOver = true }))
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+func checkCVORDER13(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "OUT_OF_GAS", conditionsWith(func(c *blobConditions) { c.ReturnDataOver = true }))
+	checkZeroChargeBudget(t, vec, eff)
+}
+
+// checkCVORDER14 pins the foreign outbox source: step 2 precedes the reserved-key scan.
+func checkCVORDER14(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.ForeignAttribution = true; c.FirstReserved = 0 }))
+	if len(eff.Events) != 0 || len(eff.Outbox) != 1 {
+		t.Fatalf("CV-ORDER-14: %d events and %d outbox messages, want 0 and 1", len(eff.Events), len(eff.Outbox))
+	}
+	m := eff.Outbox[0]
+	if _, ok := m.Target.(codec.L1Withdrawal); !ok {
+		t.Fatalf("CV-ORDER-14: outbox message is %T, want an L1Withdrawal", m.Target)
+	}
+	if m.SourceContract == (types.Hash{}) || bytes.Equal(m.SourceContract[:], mustHex(t, vec.Receipt.ContractID)) {
+		t.Fatalf("CV-ORDER-14: source_contract %x, want a non-zero contract other than the executing one", m.SourceContract[:])
+	}
+}
+
+// checkCVORDER15 pins the footprint breach at a plasma_limit with no room for the effect charge.
+func checkCVORDER15(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.FootprintOver = true }))
+	checkZeroChargeBudget(t, vec, eff)
+}
+
+// checkCVORDER16 pins the reserved-key write ahead of the footprint breach.
+func checkCVORDER16(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkConditions(t, vec, "UNAUTHORIZED", conditionsWith(func(c *blobConditions) { c.FirstReserved = 0; c.FootprintOver = true }))
+}
+
+// checkCVATTR1 pins the foreign event source: the one event is attributed to another contract
+// and is clean once attributed to the executing contract.
+func checkCVATTR1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.ForeignAttribution = true }))
+	if len(eff.Events) != 1 || len(eff.Outbox) != 0 {
+		t.Fatalf("CV-ATTR-1: %d events and %d outbox messages, want 1 and 0", len(eff.Events), len(eff.Outbox))
+	}
+	copy(eff.Events[0].ContractID[:], mustHex(t, vec.Receipt.ContractID))
+	if got := conditionsOf(t, vec, eff); !reflect.DeepEqual(got, noConditions()) {
+		t.Fatalf("CV-ATTR-1: attributed to the contract, conditions\n got  %+v\n want %+v", got, noConditions())
+	}
+}
+
+// checkCVATTR2 pins the foreign, non-zero L2 delivery source.
+func checkCVATTR2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.ForeignAttribution = true }))
+	if len(eff.Events) != 0 || len(eff.Outbox) != 1 {
+		t.Fatalf("CV-ATTR-2: %d events and %d outbox messages, want 0 and 1", len(eff.Events), len(eff.Outbox))
+	}
+	m := eff.Outbox[0]
+	if _, ok := m.Target.(codec.L2Delivery); !ok {
+		t.Fatalf("CV-ATTR-2: outbox message is %T, want an L2Delivery", m.Target)
+	}
+	contract := mustHex(t, vec.Receipt.ContractID)
+	if m.SourceContract == (types.Hash{}) || bytes.Equal(m.SourceContract[:], contract) {
+		t.Fatalf("CV-ATTR-2: source_contract %x, want a non-zero contract other than the executing one", m.SourceContract[:])
+	}
+	copy(eff.Outbox[0].SourceContract[:], contract)
+	if got := conditionsOf(t, vec, eff); !reflect.DeepEqual(got, noConditions()) {
+		t.Fatalf("CV-ATTR-2: sourced from the contract, conditions\n got  %+v\n want %+v", got, noConditions())
+	}
+}
+
+// checkCVATTR3 pins the zero source_contract on a withdrawal.
+func checkCVATTR3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "RUNTIME_FAULT", conditionsWith(func(c *blobConditions) { c.ForeignAttribution = true }))
+	if len(eff.Events) != 0 || len(eff.Outbox) != 1 {
+		t.Fatalf("CV-ATTR-3: %d events and %d outbox messages, want 0 and 1", len(eff.Events), len(eff.Outbox))
+	}
+	m := eff.Outbox[0]
+	if _, ok := m.Target.(codec.L1Withdrawal); !ok {
+		t.Fatalf("CV-ATTR-3: outbox message is %T, want an L1Withdrawal", m.Target)
+	}
+	if m.SourceContract != (types.Hash{}) {
+		t.Fatalf("CV-ATTR-3: source_contract %x, want bytes32(0)", m.SourceContract[:])
+	}
+	copy(eff.Outbox[0].SourceContract[:], mustHex(t, vec.Receipt.ContractID))
+	if got := conditionsOf(t, vec, eff); !reflect.DeepEqual(got, noConditions()) {
+		t.Fatalf("CV-ATTR-3: sourced from the contract, conditions\n got  %+v\n want %+v", got, noConditions())
+	}
+}
+
+// checkCVDECODE1 pins version 2 in the first two bytes.
+func checkCVDECODE1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrUnknownVersion, func(b []byte) []byte {
+		b[0], b[1] = 0x00, 0x01
+		return b
+	})
+}
+
+// checkCVDECODE2 pins the event input_index at [50:58].
+func checkCVDECODE2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexMismatch, func(b []byte) []byte {
+		copy(b[50:58], b[2:10])
+		return b
+	})
+}
+
+// checkCVDECODE3 pins the outbox message input_index at [54:62].
+func checkCVDECODE3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexMismatch, func(b []byte) []byte {
+		copy(b[54:62], b[2:10])
+		return b
+	})
+}
+
+// checkCVDECODE4 pins the one trailing byte.
+func checkCVDECODE4(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrTrailingBytes, func(b []byte) []byte {
+		return b[:len(b)-1]
+	})
+}
+
+// checkCVDECODE5 pins the blob that ends before claimed_deposit.
+func checkCVDECODE5(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrTruncated, func(b []byte) []byte {
+		return append(append([]byte{}, b...), make([]byte, 32)...)
+	})
+}
+
+// checkCVDECODE6 pins the ReturnData length prefix at [22:26].
+func checkCVDECODE6(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrTruncated, func(b []byte) []byte {
+		binary.BigEndian.PutUint32(b[22:26], 2)
+		return b
+	})
+}
+
+// checkCVDECODE7 pins the outbox kind byte at [66].
+func checkCVDECODE7(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrInvalidKind, func(b []byte) []byte {
+		b[66] = 0
+		return b
+	})
+}
+
+// checkCVDECODE8 pins the withdrawal's AssetID byte 21 at [108], the last byte that must be
+// zero: bytes [87:108] are zero and byte [108] is the only non-zero byte in [0:22].
+func checkCVDECODE8(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrInvalidAssetID, func(b []byte) []byte {
+		if !bytes.Equal(b[87:108], make([]byte, 21)) || b[108] == 0 {
+			t.Fatalf("CV-DECODE-8: asset bytes [0:21] = %x, byte 21 = %#x, want zeros and a non-zero byte", b[87:108], b[108])
+		}
+		b[108] = 0
+		return b
+	})
+}
+
+// checkCVDECODE9 pins the empty blob. The module returns ptr 1024, len 0, in bounds; gas_used
+// is the module's metered gas with no effect charge. CV-OOB-1 also has RUNTIME_FAULT, gas 1002
+// and no blob field, so the module's code section is checked last.
+func checkCVDECODE9(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "RUNTIME_FAULT" {
+		t.Fatalf("%s: status %s, want RUNTIME_FAULT", vec.ID, vec.Status)
+	}
+	if vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("%s: contract_effects_blob_hex is %q, want empty", vec.ID, vec.ContractEffectsBlobHex)
+	}
+	if want := blobModuleMetered(t, vec.ID); vec.GasUsed != want {
+		t.Fatalf("%s: gas_used %d, want the metered gas %d", vec.ID, vec.GasUsed, want)
+	}
+	if !strings.HasSuffix(vec.ModuleWasmHex, "0a0c010a0042808080808080010b") {
+		t.Fatalf("%s: module_wasm_hex does not end with the code section that returns ptr 1024, len 0", vec.ID)
+	}
+}
+
+// checkCVDECODE10 pins the second event's event_index at [110:114].
+func checkCVDECODE10(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexGap, func(b []byte) []byte {
+		binary.BigEndian.PutUint32(b[110:114], 1)
+		return b
+	})
+}
+
+// checkCVDECODE11 pins the second message's outbox_index at [143:147].
+func checkCVDECODE11(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexGap, func(b []byte) []byte {
+		binary.BigEndian.PutUint32(b[143:147], 1)
+		return b
+	})
+}
+
+// checkCVLIMIT1 pins the 33-byte local key: the repair drops its last byte.
+func checkCVLIMIT1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrLimitExceeded, func(b []byte) []byte {
+		out := append(append([]byte{}, b[:50]...), b[51:]...)
+		binary.BigEndian.PutUint32(out[14:18], 32)
+		return out
+	})
+}
+
+// checkCVLIMIT2 pins the 32-byte local key that is accepted.
+func checkCVLIMIT2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.StateDiff) != 1 || len(eff.StateDiff[0].LocalKey) != codec.MaxStateKeySize {
+		t.Fatalf("CV-LIMIT-2: want exactly one StateDiff entry with a %d-byte local key", codec.MaxStateKeySize)
+	}
+}
+
+// checkCVLIMIT3 pins the value one byte over the bound: the repair drops its last byte.
+func checkCVLIMIT3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrReservedLength, func(b []byte) []byte {
+		n := len(b)
+		out := append(append([]byte{}, b[:n-45]...), b[n-44:]...)
+		binary.BigEndian.PutUint32(out[19:23], codec.MaxStateValueSize)
+		return out
+	})
+}
+
+// checkCVLIMIT4 pins the 65th event: the repair drops it.
+func checkCVLIMIT4(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrLimitExceeded, func(b []byte) []byte {
+		n := len(b)
+		extra, err := codec.DecodeEvent(b[n-92 : n-40])
+		if err != nil {
+			t.Fatalf("CV-LIMIT-4: the 65th event does not decode: %v", err)
+		}
+		if !bytes.Equal(extra.ContractID[:], mustHex(t, vec.Receipt.ContractID)) || extra.InputIndex != binary.BigEndian.Uint64(b[2:10]) || extra.EventIndex != codec.MaxEventsPerExecution {
+			t.Fatalf("CV-LIMIT-4: the 65th event is %+v, want contract_id %s, the blob's input index and event_index %d", extra, vec.Receipt.ContractID, codec.MaxEventsPerExecution)
+		}
+		out := append(append([]byte{}, b[:n-92]...), b[n-40:]...)
+		binary.BigEndian.PutUint32(out[14:18], 64)
+		return out
+	})
+}
+
+// checkCVLIMIT5 pins the 64 events that are accepted.
+func checkCVLIMIT5(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.Events) != codec.MaxEventsPerExecution {
+		t.Fatalf("CV-LIMIT-5: %d events, want %d", len(eff.Events), codec.MaxEventsPerExecution)
+	}
+}
+
+// checkCVLIMIT6 pins the fifth topic: the repair drops it.
+func checkCVLIMIT6(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrLimitExceeded, func(b []byte) []byte {
+		n := len(b)
+		out := append(append([]byte{}, b[:n-76]...), b[n-44:]...)
+		binary.BigEndian.PutUint32(out[62:66], 4)
+		return out
+	})
+}
+
+// checkCVLIMIT7 pins the four topics that are accepted.
+func checkCVLIMIT7(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.Events) != 1 || len(eff.Events[0].Topics) != codec.MaxTopicsPerEvent {
+		t.Fatalf("CV-LIMIT-7: want exactly one event with %d topics", codec.MaxTopicsPerEvent)
+	}
+}
+
+// checkCVLIMIT8 pins the 1025th data byte: the repair drops it.
+func checkCVLIMIT8(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrLimitExceeded, func(b []byte) []byte {
+		n := len(b)
+		out := append(append([]byte{}, b[:n-41]...), b[n-40:]...)
+		binary.BigEndian.PutUint32(out[66:70], 1024)
+		return out
+	})
+}
+
+// checkCVLIMIT9 pins the 1024 data bytes that are accepted.
+func checkCVLIMIT9(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.Events) != 1 || len(eff.Events[0].Data) != codec.MaxEventDataSize {
+		t.Fatalf("CV-LIMIT-9: want exactly one event with %d data bytes", codec.MaxEventDataSize)
+	}
+}
+
+// checkCVLIMIT10 pins the 8193rd payload byte: the repair drops it.
+func checkCVLIMIT10(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrLimitExceeded, func(b []byte) []byte {
+		n := len(b)
+		out := append(append([]byte{}, b[:n-37]...), b[n-36:]...)
+		binary.BigEndian.PutUint32(out[99:103], 8192)
+		return out
+	})
+}
+
+// checkCVLIMIT11 pins the 8192-byte payload that is accepted.
+func checkCVLIMIT11(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.Outbox) != 1 {
+		t.Fatalf("CV-LIMIT-11: %d outbox messages, want 1", len(eff.Outbox))
+	}
+	_, ok := eff.Outbox[0].Target.(codec.L2Delivery)
+	if !ok || len(eff.Outbox[0].Payload) != codec.MaxOutboxPayloadSize {
+		t.Fatalf("CV-LIMIT-11: want an L2Delivery (got %T) with a %d-byte payload", eff.Outbox[0].Target, codec.MaxOutboxPayloadSize)
+	}
+}
+
+// checkCVLIMIT12 pins the 33rd message: the repair drops it.
+func checkCVLIMIT12(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrLimitExceeded, func(b []byte) []byte {
+		n := len(b)
+		extra, err := codec.DecodeOutboxMessage(b[n-117 : n-36])
+		if err != nil {
+			t.Fatalf("CV-LIMIT-12: the 33rd message does not decode: %v", err)
+		}
+		if _, ok := extra.Target.(codec.L2Delivery); !ok || !bytes.Equal(extra.SourceContract[:], mustHex(t, vec.Receipt.ContractID)) || extra.InputIndex != binary.BigEndian.Uint64(b[2:10]) || extra.OutboxIndex != codec.MaxOutboxPerExecution {
+			t.Fatalf("CV-LIMIT-12: the 33rd message is %+v, want an L2Delivery from contract_id %s with the blob's input index and outbox_index %d", extra, vec.Receipt.ContractID, codec.MaxOutboxPerExecution)
+		}
+		out := append(append([]byte{}, b[:n-117]...), b[n-36:]...)
+		binary.BigEndian.PutUint32(out[18:22], 32)
+		return out
+	})
+}
+
+// checkCVLIMIT13 pins the StateDiff value of exactly MaxStateValueSize bytes that is accepted.
+func checkCVLIMIT13(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.StateDiff) != 1 || len(eff.StateDiff[0].Value) != codec.MaxStateValueSize {
+		t.Fatalf("CV-LIMIT-13: want exactly one StateDiff entry with a %d-byte value", codec.MaxStateValueSize)
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+// checkCVDECODE12 pins version 0 in the first two bytes.
+func checkCVDECODE12(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrUnknownVersion, func(b []byte) []byte {
+		if b[0] != 0x00 || b[1] != 0x00 {
+			t.Fatalf("CV-DECODE-12: version bytes %x, want 0000", b[0:2])
+		}
+		b[0], b[1] = 0x00, 0x01
+		return b
+	})
+}
+
+// checkCVDECODE13 pins the lone event's event_index 1 at [58:62].
+func checkCVDECODE13(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexGap, func(b []byte) []byte {
+		if got := binary.BigEndian.Uint32(b[58:62]); got != 1 {
+			t.Fatalf("CV-DECODE-13: event_index %d, want 1", got)
+		}
+		binary.BigEndian.PutUint32(b[58:62], 0)
+		return b
+	})
+}
+
+// checkCVDECODE14 pins the lone message's outbox_index 1 at [62:66].
+func checkCVDECODE14(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexGap, func(b []byte) []byte {
+		if got := binary.BigEndian.Uint32(b[62:66]); got != 1 {
+			t.Fatalf("CV-DECODE-14: outbox_index %d, want 1", got)
+		}
+		binary.BigEndian.PutUint32(b[62:66], 0)
+		return b
+	})
+}
+
+// checkCVDECODE15 pins kind 2 at [66] on a withdrawal-shaped body: the repair to kind 1 decodes.
+func checkCVDECODE15(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrInvalidKind, func(b []byte) []byte {
+		if b[66] != 2 {
+			t.Fatalf("CV-DECODE-15: kind %d, want 2", b[66])
+		}
+		b[66] = 1
+		return b
+	})
+}
+
+// checkCVDECODE16 pins the Events count 2 at [14:18] over a single event.
+func checkCVDECODE16(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrOverflow, func(b []byte) []byte {
+		if got := binary.BigEndian.Uint32(b[14:18]); got != 2 {
+			t.Fatalf("CV-DECODE-16: Events count %d, want 2", got)
+		}
+		binary.BigEndian.PutUint32(b[14:18], 1)
+		return b
+	})
+}
+
+// checkCVDECODE17 pins the withdrawal's AssetID byte 0 at [87], the first byte that must be
+// zero: byte [87] is the only non-zero byte in [0:22] and bytes [88:109] are zero.
+func checkCVDECODE17(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrInvalidAssetID, func(b []byte) []byte {
+		if b[87] == 0 || !bytes.Equal(b[88:109], make([]byte, 21)) {
+			t.Fatalf("CV-DECODE-17: asset byte 0 = %#x, bytes [1:22] = %x, want a non-zero byte 0 and zeros", b[87], b[88:109])
+		}
+		b[87] = 0
+		return b
+	})
+}
+
+// permutedIndexRepair returns a repair for a three-element list whose elements start at
+// first and are size bytes wide, each carrying a u32 index at offset indexAt within the
+// element. It asserts the indices read 0, 2, 1, that the elements differ only in their index,
+// and swaps the second and third index so the list reads 0, 1, 2.
+func permutedIndexRepair(t *testing.T, id string, first, size, indexAt int) func(b []byte) []byte {
+	return func(b []byte) []byte {
+		at := func(i int) int { return first + i*size + indexAt }
+		for i, want := range []uint32{0, 2, 1} {
+			if got := binary.BigEndian.Uint32(b[at(i) : at(i)+4]); got != want {
+				t.Fatalf("%s: element %d index %d, want %d", id, i, got, want)
+			}
+		}
+		masked := func(i int) []byte {
+			e := append([]byte(nil), b[first+i*size:first+(i+1)*size]...)
+			copy(e[indexAt:indexAt+4], []byte{0, 0, 0, 0})
+			return e
+		}
+		if !bytes.Equal(masked(0), masked(1)) || !bytes.Equal(masked(1), masked(2)) {
+			t.Fatalf("%s: the three elements differ in more than their index", id)
+		}
+		binary.BigEndian.PutUint32(b[at(1):at(1)+4], 1)
+		binary.BigEndian.PutUint32(b[at(2):at(2)+4], 2)
+		return b
+	}
+}
+
+// checkCVDECODE18 pins three events whose event_index values read 0, 2, 1: three 52-byte
+// events from [18:174], each carrying its index at element offset 40.
+func checkCVDECODE18(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexGap, permutedIndexRepair(t, vec.ID, 18, 52, 40))
+}
+
+// checkCVDECODE19 pins three outbox messages whose outbox_index values read 0, 2, 1: three
+// 81-byte messages from [22:265], each carrying its index at element offset 40.
+func checkCVDECODE19(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrIndexGap, permutedIndexRepair(t, vec.ID, 22, 81, 40))
+}
+
+// checkStateDiffResult decodes the row's ExecutionResult and asserts its StateDiff is exactly
+// the one entry (key, value), a nil value meaning the EMPTY sentinel.
+func checkStateDiffResult(t *testing.T, vec vectorJSON, key string, value []byte) {
+	t.Helper()
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("%s: DecodeExecutionResult: %v", vec.ID, err)
+	}
+	if len(er.StateDiff) != 1 || hex.EncodeToString(er.StateDiff[0].Key[:]) != key {
+		t.Fatalf("%s: ExecutionResult.StateDiff = %+v, want exactly the entry at %s", vec.ID, er.StateDiff, key)
+	}
+	got := er.StateDiff[0].Value
+	if (got == nil) != (value == nil) || !bytes.Equal(got, value) {
+		t.Fatalf("%s: ExecutionResult.StateDiff value %x (nil %v), want %x (nil %v)", vec.ID, got, got == nil, value, value == nil)
+	}
+}
+
+// checkCVSTATE1 pins the deletion of a key absent from pre_state: one nil-valued blob entry,
+// its derived key and the quota key absent from pre_state, the entry committed, the root
+// unchanged and no quota witness.
+func checkCVSTATE1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.StateDiff) != 1 || eff.StateDiff[0].Value != nil {
+		t.Fatalf("CV-STATE-1: blob StateDiff = %+v, want exactly one entry with a nil value", eff.StateDiff)
+	}
+	key := hex.EncodeToString(crypto.Hash(mustHex(t, vec.Receipt.ContractID), eff.StateDiff[0].LocalKey))
+	quotaKey, _, _ := quotaLeaf(t, vec)
+	if _, ok := vec.PreState[key]; ok {
+		t.Fatalf("CV-STATE-1: pre_state holds the deleted key %s", key)
+	}
+	if _, ok := vec.PreState[quotaKey]; ok {
+		t.Fatalf("CV-STATE-1: pre_state holds the quota key %s", quotaKey)
+	}
+	for _, k := range vec.WitnessKeys {
+		if k == quotaKey {
+			t.Fatalf("CV-STATE-1: witness_keys holds the quota key %s", quotaKey)
+		}
+	}
+	checkStateDiffResult(t, vec, key, nil)
+	if vec.Receipt.StateDiffHash == zeroHashHex {
+		t.Fatalf("CV-STATE-1: receipt.state_diff_hash is zero, want non-zero")
+	}
+	if vec.PostStateRoot != vec.PreStateRoot {
+		t.Fatalf("CV-STATE-1: post_state_root %s, want pre_state_root %s", vec.PostStateRoot, vec.PreStateRoot)
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+// checkCVSTATE2 pins the EMPTY sentinel at [22:26] followed by the stray bytes at [26:31].
+func checkCVSTATE2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOneDefect(t, vec, codec.ErrOverflow, func(b []byte) []byte {
+		if hex.EncodeToString(b[22:26]) != "ffffffff" || hex.EncodeToString(b[26:31]) != "00000001ab" {
+			t.Fatalf("CV-STATE-2: bytes [22:26] = %x and [26:31] = %x, want ffffffff and 00000001ab", b[22:26], b[26:31])
+		}
+		return append(append([]byte{}, b[:26]...), b[31:]...)
+	})
+}
+
+// checkCVSTATE3 pins the rewrite of a key with its current value: the blob value equals the
+// pre_state value, the entry is committed, and the root is unchanged.
+func checkCVSTATE3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if len(eff.StateDiff) != 1 {
+		t.Fatalf("CV-STATE-3: blob StateDiff has %d entries, want 1", len(eff.StateDiff))
+	}
+	key := hex.EncodeToString(crypto.Hash(mustHex(t, vec.Receipt.ContractID), eff.StateDiff[0].LocalKey))
+	pre, ok := vec.PreState[key]
+	if !ok || !bytes.Equal(mustHex(t, pre), eff.StateDiff[0].Value) {
+		t.Fatalf("CV-STATE-3: pre_state value at %s is %q (present %v), want the blob value %x", key, pre, ok, eff.StateDiff[0].Value)
+	}
+	checkStateDiffResult(t, vec, key, eff.StateDiff[0].Value)
+	if vec.Receipt.StateDiffHash == zeroHashHex {
+		t.Fatalf("CV-STATE-3: receipt.state_diff_hash is zero, want non-zero")
+	}
+	if vec.PostStateRoot != vec.PreStateRoot {
+		t.Fatalf("CV-STATE-3: post_state_root %s, want pre_state_root %s", vec.PostStateRoot, vec.PreStateRoot)
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+// checkCVRESERVED1 pins four local keys that each sit next to a reserved key without equalling
+// one: a one-byte prefix, two two-byte keys outside 0x0001 to 0x0005, and a three-byte key
+// with a reserved key as its prefix.
+func checkCVRESERVED1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	want := [][]byte{{0x00}, {0x00, 0x00}, {0x00, 0x06}, {0x00, 0x01, 0x00}}
+	if len(eff.StateDiff) != len(want) {
+		t.Fatalf("CV-RESERVED-1: blob StateDiff has %d entries, want %d", len(eff.StateDiff), len(want))
+	}
+	// keys are the write keys decoded from the vector's own effects blob; every assertion
+	// below reads them, not the literals in want.
+	keys := make([][]byte, len(eff.StateDiff))
+	for i, e := range eff.StateDiff {
+		keys[i] = e.LocalKey
+		if !bytes.Equal(keys[i], want[i]) {
+			t.Fatalf("CV-RESERVED-1: local key %d = %x, want %x", i, keys[i], want[i])
+		}
+	}
+	reserved := [][]byte{{0x00, 0x01}, {0x00, 0x02}, {0x00, 0x03}, {0x00, 0x04}, {0x00, 0x05}}
+	for _, r := range reserved {
+		if !bytes.HasPrefix(r, keys[0]) || len(r) <= len(keys[0]) {
+			t.Fatalf("CV-RESERVED-1: blob key 0 %x is not a proper prefix of reserved key %x", keys[0], r)
+		}
+	}
+	if !bytes.HasPrefix(keys[3], reserved[0]) || len(keys[3]) <= len(reserved[0]) {
+		t.Fatalf("CV-RESERVED-1: reserved key 0001 is not a proper prefix of blob key 3 %x", keys[3])
+	}
+	for _, k := range keys[1:3] {
+		if len(k) != 2 {
+			t.Fatalf("CV-RESERVED-1: blob key %x is not two bytes long", k)
+		}
+		for _, r := range reserved {
+			if bytes.Equal(k, r) {
+				t.Fatalf("CV-RESERVED-1: blob key %x equals a reserved key", k)
+			}
+		}
+		if k[0] == 0x00 && k[1] >= 0x01 && k[1] <= 0x05 {
+			t.Fatalf("CV-RESERVED-1: blob key %x lies inside 0x0001 to 0x0005", k)
+		}
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+// checkCVQUOTA9 pins the absent quota leaf: purchased = used = 0, so the first write exceeds it.
+func checkCVQUOTA9(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	quotaKey, _, _ := quotaLeaf(t, vec)
+	if _, ok := vec.PreState[quotaKey]; ok {
+		t.Fatalf("CV-QUOTA-9: pre_state holds the quota key %s", quotaKey)
+	}
+	checkConditions(t, vec, "STORAGE_QUOTA_EXCEEDED", conditionsWith(func(c *blobConditions) { c.QuotaOver = true }))
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+// checkFailureRefund asserts status wantStatus, a non-zero input.deposit_amount and the
+// deposit asset in withdrawal_caps. Check C5 (checkCallRefund) owns the refund's shape.
+func checkFailureRefund(t *testing.T, vec vectorJSON, wantStatus string) {
+	t.Helper()
+	if vec.Status != wantStatus {
+		t.Fatalf("%s: status %s, want %s", vec.ID, vec.Status, wantStatus)
+	}
+	if vec.Input == nil || new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Sign() == 0 {
+		t.Fatalf("%s: input.deposit_amount is absent or zero, want a deposit", vec.ID)
+	}
+	if _, ok := vec.WithdrawalCaps[vec.Input.DepositAsset]; !ok {
+		t.Fatalf("%s: withdrawal_caps has no entry for the deposit asset %s", vec.ID, vec.Input.DepositAsset)
+	}
+}
+
+// checkEXECDEP6 pins a payable CallL2 with a payload and a partial claim: the refund of
+// deposit - claim follows the contract's messages.
+func checkEXECDEP6(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	eff := checkConditions(t, vec, "SUCCESS", noConditions())
+	if vec.InputKind != 0 || vec.Input == nil || vec.Input.PayloadHex == nil || *vec.Input.PayloadHex == "" {
+		t.Fatalf("EXEC-DEP-6: want input_kind 0 with a non-empty payload_hex")
+	}
+	deposit := new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount))
+	claim := new(big.Int).SetBytes(eff.ClaimedDeposit[:])
+	if claim.Sign() <= 0 || claim.Cmp(deposit) >= 0 {
+		t.Fatalf("EXEC-DEP-6: claim %s, want 0 < claim < deposit %s", claim, deposit)
+	}
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("EXEC-DEP-6: DecodeExecutionResult: %v", err)
+	}
+	n := len(eff.Outbox)
+	if len(er.Outbox) != n+1 {
+		t.Fatalf("EXEC-DEP-6: ExecutionResult has %d messages, want the blob's %d plus the refund", len(er.Outbox), n)
+	}
+	refund := er.Outbox[n]
+	w, ok := refund.Target.(codec.L1Withdrawal)
+	if !ok || refund.SourceContract != (types.Hash{}) || refund.OutboxIndex != uint32(n) || len(refund.Payload) != 0 {
+		t.Fatalf("EXEC-DEP-6: last message %+v, want a zero-source L1Withdrawal at outbox_index %d with no payload", refund, n)
+	}
+	if hex.EncodeToString(w.RecipientL1[:]) != vec.L1Sender || hex.EncodeToString(w.Asset[:]) != vec.Input.DepositAsset {
+		t.Fatalf("EXEC-DEP-6: refund to %x in %x, want l1_sender %s in %s", w.RecipientL1, w.Asset, vec.L1Sender, vec.Input.DepositAsset)
+	}
+	if want := new(big.Int).Sub(deposit, claim); new(big.Int).SetBytes(w.Amount[:]).Cmp(want) != 0 {
+		t.Fatalf("EXEC-DEP-6: refund amount %x, want deposit - claim %s", w.Amount, want)
+	}
+	if int(vec.Receipt.OutboxCount) != n+1 {
+		t.Fatalf("EXEC-DEP-6: receipt.outbox_count = %d, want %d", vec.Receipt.OutboxCount, n+1)
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+// checkEXECDEP7 pins abort(7) on a deposit input: REVERT, no blob, and the gas of
+// i32.const, call, i64.const, end plus abort's 1.
+func checkEXECDEP7(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkFailureRefund(t, vec, "REVERT")
+	if vec.Receipt.AbortCode != 7 {
+		t.Fatalf("EXEC-DEP-7: receipt.abort_code = %d, want 7", vec.Receipt.AbortCode)
+	}
+	if vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("EXEC-DEP-7: contract_effects_blob_hex is present, want absent")
+	}
+	if want := module.InitialMemoryCost(1) + costOf(t, 0x41, 0x10, 0x42, 0x0B) + 1; vec.GasUsed != want {
+		t.Fatalf("EXEC-DEP-7: gas_used %d, want %d", vec.GasUsed, want)
+	}
+}
+
+// checkEXECDEP8 pins the unaffordable initial-memory charge on a deposit input.
+func checkEXECDEP8(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkFailureRefund(t, vec, "OUT_OF_GAS")
+	checkOutOfGasBase(t, vec)
+	if *vec.Input.PlasmaLimit >= module.InitialMemoryCost(1) {
+		t.Fatalf("EXEC-DEP-8: plasma_limit %d, want below InitialMemoryCost(1) %d", *vec.Input.PlasmaLimit, module.InitialMemoryCost(1))
+	}
+	if vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("EXEC-DEP-8: contract_effects_blob_hex is present, want absent")
+	}
+}
+
+// checkEXECDEP9 pins the reserved-key write on a deposit input: the first entry is reserved,
+// and gas_used is the module's metered gas.
+func checkEXECDEP9(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkFailureRefund(t, vec, "UNAUTHORIZED")
+	checkConditions(t, vec, "UNAUTHORIZED", conditionsWith(func(c *blobConditions) { c.FirstReserved = 0 }))
+	if want := blobModuleMetered(t, vec.ID); vec.GasUsed != want {
+		t.Fatalf("EXEC-DEP-9: gas_used %d, want the metered gas %d", vec.GasUsed, want)
+	}
+}
+
+// checkEXECDEP10 pins the two-page module that returns a MaxResultBlob + 1 byte blob:
+// RESULT_TOO_LARGE at the metered gas of its two opcodes.
+func checkEXECDEP10(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkFailureRefund(t, vec, "RESULT_TOO_LARGE")
+	if !strings.Contains(vec.ModuleWasmHex, hex.EncodeToString(returnBlobBody(blobOffset, MaxResultBlob+1))) {
+		t.Fatalf("EXEC-DEP-10: module_wasm_hex does not return a blob of %d bytes", MaxResultBlob+1)
+	}
+	if want := module.InitialMemoryCost(2) + costOf(t, 0x42, 0x0B); vec.GasUsed != want {
+		t.Fatalf("EXEC-DEP-10: gas_used %d, want %d", vec.GasUsed, want)
+	}
+}
+
+// blobConditions is which §10.6 content condition a decoded ContractEffects trips,
+// evaluated from the vector's JSON fields alone.
+type blobConditions struct {
+	IndexMismatch      bool // step 2: blob globalInputIndex != global_input_index
+	ForeignAttribution bool // step 2: an event contract_id or outbox source_contract != receipt.contract_id
+	FirstReserved      int  // step 3: blob position of the first reserved local key, -1 if none
+	FirstDuplicate     int  // step 3: position of the first entry repeating an earlier local key, -1 if none
+	OverClaim          bool // step 4: claimed_deposit > input.deposit_amount
+	FootprintOver      bool // step 5a: distinct withdrawal assets, plus the deposit asset when deposit_amount > 0 and not withdrawn, > MaxAssetsPerBatch
+	CapOver            bool // step 5a: some asset's withdrawal total > its withdrawal_caps value (0 when absent)
+	QuotaOver          bool // step 6a: net growth > 0 and used + growth > purchased
+	ReturnDataOver     bool // step 7: len(ReturnData) > MaxReturnData
+}
+
+// noConditions is the blobConditions of a blob that trips nothing.
+func noConditions() blobConditions {
+	return blobConditions{FirstReserved: -1, FirstDuplicate: -1}
+}
+
+// conditionsOf evaluates every blobConditions field for eff against the vector's own JSON
+// fields. It shares no code with the runtime's validation.
+func conditionsOf(t *testing.T, vec vectorJSON, eff codec.ContractEffects) blobConditions {
+	t.Helper()
+	got := noConditions()
+	contractID := mustHex(t, vec.Receipt.ContractID)
+
+	got.IndexMismatch = eff.GlobalInputIndex != vec.GlobalInputIndex
+	for _, e := range eff.Events {
+		if !bytes.Equal(e.ContractID[:], contractID) {
+			got.ForeignAttribution = true
+		}
+	}
+	for _, m := range eff.Outbox {
+		if !bytes.Equal(m.SourceContract[:], contractID) {
+			got.ForeignAttribution = true
+		}
+	}
+
+	reservedLocal := [][]byte{{0x00, 0x01}, {0x00, 0x02}, {0x00, 0x03}, {0x00, 0x04}, {0x00, 0x05}}
+	for i, e := range eff.StateDiff {
+		if got.FirstReserved == -1 {
+			for _, r := range reservedLocal {
+				if bytes.Equal(e.LocalKey, r) {
+					got.FirstReserved = i
+				}
+			}
+		}
+		if got.FirstDuplicate == -1 {
+			for _, earlier := range eff.StateDiff[:i] {
+				if bytes.Equal(e.LocalKey, earlier.LocalKey) {
+					got.FirstDuplicate = i
+					break
+				}
+			}
+		}
+	}
+
+	deposit := new(big.Int)
+	if vec.Input != nil && vec.Input.DepositAmount != "" {
+		deposit.SetBytes(mustHex(t, vec.Input.DepositAmount))
+	}
+	got.OverClaim = new(big.Int).SetBytes(eff.ClaimedDeposit[:]).Cmp(deposit) > 0
+
+	totals := map[string]*big.Int{}
+	for _, m := range eff.Outbox {
+		w, ok := m.Target.(codec.L1Withdrawal)
+		if !ok {
+			continue
+		}
+		asset := hex.EncodeToString(w.Asset[:])
+		if totals[asset] == nil {
+			totals[asset] = new(big.Int)
+		}
+		totals[asset].Add(totals[asset], new(big.Int).SetBytes(w.Amount[:]))
+	}
+	footprint := len(totals)
+	if deposit.Sign() > 0 {
+		if _, withdrawn := totals[vec.Input.DepositAsset]; !withdrawn {
+			footprint++
+		}
+	}
+	got.FootprintOver = footprint > codec.MaxAssetsPerBatch
+	for asset, total := range totals {
+		if total.Cmp(capOf(t, vec, asset)) > 0 {
+			got.CapOver = true
+		}
+	}
+
+	var growth int64
+	for _, e := range eff.StateDiff {
+		if e.Value != nil {
+			growth += 64 + int64(len(e.Value))
+		}
+		if pre, present := vec.PreState[hex.EncodeToString(crypto.Hash(contractID, e.LocalKey))]; present {
+			growth -= 64 + int64(len(pre)/2)
+		}
+	}
+	_, purchased, used := quotaLeaf(t, vec)
+	got.QuotaOver = growth > 0 && used+uint64(growth) > purchased
+
+	got.ReturnDataOver = len(eff.ReturnData) > MaxReturnData
+	return got
+}
+
+// checkConditions asserts vec.Status == status, decodes the row's blob (fatal on error),
+// asserts conditionsOf equals want, and returns the decoded blob.
+func checkConditions(t *testing.T, vec vectorJSON, status string, want blobConditions) codec.ContractEffects {
+	t.Helper()
+	if vec.Status != status {
+		t.Fatalf("%s: status %s, want %s", vec.ID, vec.Status, status)
+	}
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("%s: DecodeContractEffects: %v", vec.ID, err)
+	}
+	if got := conditionsOf(t, vec, eff); !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s: blob conditions\n got  %+v\n want %+v", vec.ID, got, want)
+	}
+	return eff
+}
+
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-002":           checkN1WitnessBackendTripwire,
 	"EXEC-FAIL-OUTBOX-1": checkN2DiscardNotVacuous,
@@ -2317,15 +3701,84 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"CV-QUOTA-2": func(t *testing.T, vec vectorJSON) {
 		checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
 	},
-	"CV-QUOTA-4": checkCVQUOTA4ZeroDelta,
-	"CV-QUOTA-5": checkCVQUOTA5ReservedQuotaKey,
-	"CV-CAP-1":   checkCVCAP1,
-	"CV-CAP-2":   checkCVCAP2,
-	"CV-CAP-3":   checkCVCAP3,
-	"CV-CAP-4":   checkCVCAP4,
-	"CV-CAP-5":   checkCVCAP5,
-	"CV-CAP-6":   checkCVCAP6,
-	"CV-CAP-7":   checkCVCAP7,
+	"CV-QUOTA-4":    checkCVQUOTA4ZeroDelta,
+	"CV-QUOTA-5":    checkCVQUOTA5ReservedQuotaKey,
+	"CV-CAP-1":      checkCVCAP1,
+	"CV-CAP-2":      checkCVCAP2,
+	"CV-CAP-3":      checkCVCAP3,
+	"CV-CAP-4":      checkCVCAP4,
+	"CV-CAP-5":      checkCVCAP5,
+	"CV-CAP-6":      checkCVCAP6,
+	"CV-CAP-7":      checkCVCAP7,
+	"CV-CAP-8":      checkCVCAP8,
+	"CV-CAP-9":      checkCVCAP9,
+	"CV-CAP-10":     checkCVCAP10,
+	"CV-CAP-11":     checkCVCAP11,
+	"CV-CAP-12":     checkCVCAP12,
+	"CV-ASSETS-3":   checkCVASSETS3,
+	"CV-ASSETS-4":   checkCVASSETS4,
+	"CV-ASSETS-5":   checkCVASSETS5,
+	"CV-ORDER-1":    checkCVORDER1,
+	"CV-ORDER-2":    checkCVORDER2,
+	"CV-ORDER-3":    checkCVORDER3,
+	"CV-ORDER-4":    checkCVORDER4,
+	"CV-ORDER-5":    checkCVORDER5,
+	"CV-ORDER-6":    checkCVORDER6,
+	"CV-ORDER-7":    checkCVORDER7,
+	"CV-ORDER-8":    checkCVORDER8,
+	"CV-ORDER-9":    checkCVORDER9,
+	"CV-ORDER-10":   checkCVORDER10,
+	"CV-ORDER-11":   checkCVORDER11,
+	"CV-ORDER-12":   checkCVORDER12,
+	"CV-ORDER-13":   checkCVORDER13,
+	"CV-ORDER-14":   checkCVORDER14,
+	"CV-ORDER-15":   checkCVORDER15,
+	"CV-ORDER-16":   checkCVORDER16,
+	"CV-ATTR-1":     checkCVATTR1,
+	"CV-ATTR-2":     checkCVATTR2,
+	"CV-ATTR-3":     checkCVATTR3,
+	"CV-DECODE-1":   checkCVDECODE1,
+	"CV-DECODE-2":   checkCVDECODE2,
+	"CV-DECODE-3":   checkCVDECODE3,
+	"CV-DECODE-4":   checkCVDECODE4,
+	"CV-DECODE-5":   checkCVDECODE5,
+	"CV-DECODE-6":   checkCVDECODE6,
+	"CV-DECODE-7":   checkCVDECODE7,
+	"CV-DECODE-8":   checkCVDECODE8,
+	"CV-DECODE-9":   checkCVDECODE9,
+	"CV-DECODE-10":  checkCVDECODE10,
+	"CV-DECODE-11":  checkCVDECODE11,
+	"CV-LIMIT-1":    checkCVLIMIT1,
+	"CV-LIMIT-2":    checkCVLIMIT2,
+	"CV-LIMIT-3":    checkCVLIMIT3,
+	"CV-LIMIT-4":    checkCVLIMIT4,
+	"CV-LIMIT-5":    checkCVLIMIT5,
+	"CV-LIMIT-6":    checkCVLIMIT6,
+	"CV-LIMIT-7":    checkCVLIMIT7,
+	"CV-LIMIT-8":    checkCVLIMIT8,
+	"CV-LIMIT-9":    checkCVLIMIT9,
+	"CV-LIMIT-10":   checkCVLIMIT10,
+	"CV-LIMIT-11":   checkCVLIMIT11,
+	"CV-LIMIT-12":   checkCVLIMIT12,
+	"CV-LIMIT-13":   checkCVLIMIT13,
+	"CV-DECODE-12":  checkCVDECODE12,
+	"CV-DECODE-13":  checkCVDECODE13,
+	"CV-DECODE-14":  checkCVDECODE14,
+	"CV-DECODE-15":  checkCVDECODE15,
+	"CV-DECODE-16":  checkCVDECODE16,
+	"CV-DECODE-17":  checkCVDECODE17,
+	"CV-DECODE-18":  checkCVDECODE18,
+	"CV-DECODE-19":  checkCVDECODE19,
+	"CV-STATE-1":    checkCVSTATE1,
+	"CV-STATE-2":    checkCVSTATE2,
+	"CV-STATE-3":    checkCVSTATE3,
+	"CV-RESERVED-1": checkCVRESERVED1,
+	"CV-QUOTA-9":    checkCVQUOTA9,
+	"EXEC-DEP-6":    checkEXECDEP6,
+	"EXEC-DEP-7":    checkEXECDEP7,
+	"EXEC-DEP-8":    checkEXECDEP8,
+	"EXEC-DEP-9":    checkEXECDEP9,
+	"EXEC-DEP-10":   checkEXECDEP10,
 }
 
 // TestConformanceVectors re-derives every committed value in the artifact from the JSON
@@ -2476,6 +3929,67 @@ func capVariants() map[string]capVariant {
 		}
 	}
 
+	// truncatedKey sums exact amounts under the asset ID bytes [from:to] alone, so assets that
+	// agree on those bytes share one total, and checks each asset against its own cap.
+	truncatedKey := func(from, to int) capVariant {
+		return func(outbox []codec.L1Withdrawal, sorted, _ []string, _ map[string]*big.Int, c func(string) *big.Int) bool {
+			sums := map[string]*big.Int{}
+			keyOf := map[string]string{}
+			for _, w := range outbox {
+				key := string(w.Asset[from:to])
+				keyOf[hex.EncodeToString(w.Asset[:])] = key
+				if sums[key] == nil {
+					sums[key] = new(big.Int)
+				}
+				sums[key].Add(sums[key], new(big.Int).SetBytes(w.Amount[:]))
+			}
+			for _, a := range sorted {
+				if over(sums[keyOf[a]], c(a)) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	// carryDropped sums each asset's withdrawals in outbox order, losing the carry out of bit k at
+	// every step, and compares the sum to the exact cap.
+	carryDropped := func(k uint) capVariant {
+		return func(outbox []codec.L1Withdrawal, _, seen []string, _ map[string]*big.Int, c func(string) *big.Int) bool {
+			for _, a := range seen {
+				var amounts []*big.Int
+				for _, w := range outbox {
+					if hex.EncodeToString(w.Asset[:]) == a {
+						amounts = append(amounts, new(big.Int).SetBytes(w.Amount[:]))
+					}
+				}
+				if over(carryDroppedSum(amounts, k), c(a)) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	// wrapped keeps each asset's running sum, and the cap it is compared to, modulo 2^bits.
+	wrapped := func(bits uint) capVariant {
+		return func(outbox []codec.L1Withdrawal, sorted, _ []string, _ map[string]*big.Int, c func(string) *big.Int) bool {
+			mod := new(big.Int).Lsh(big.NewInt(1), bits)
+			sums := map[string]*big.Int{}
+			for _, w := range outbox {
+				a := hex.EncodeToString(w.Asset[:])
+				if sums[a] == nil {
+					sums[a] = new(big.Int)
+				}
+				sums[a].Add(sums[a], new(big.Int).SetBytes(w.Amount[:])).Mod(sums[a], mod)
+			}
+			for _, a := range sorted {
+				if over(sums[a], new(big.Int).Mod(c(a), mod)) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
 	variants := map[string]capVariant{
 		"control": func(_ []codec.L1Withdrawal, sorted, _ []string, totals map[string]*big.Int, c func(string) *big.Int) bool {
 			for _, a := range sorted {
@@ -2485,6 +3999,35 @@ func capVariants() map[string]capVariant {
 			}
 			return false
 		},
+		"totals keyed by the asset ID's first 10 bytes": truncatedKey(0, 10),
+		"totals keyed by the asset ID's low 8 bytes":    truncatedKey(24, 32),
+		"totals keyed by the asset ID's high ZTS bytes": truncatedKey(22, 30),
+		// identical withdrawals are one withdrawal: a repeat of all three fields is skipped.
+		"identical withdrawals summed once": func(outbox []codec.L1Withdrawal, sorted, _ []string, _ map[string]*big.Int, c func(string) *big.Int) bool {
+			sums := map[string]*big.Int{}
+			for i, w := range outbox {
+				if slices.Contains(outbox[:i], w) {
+					continue
+				}
+				a := hex.EncodeToString(w.Asset[:])
+				if sums[a] == nil {
+					sums[a] = new(big.Int)
+				}
+				sums[a].Add(sums[a], new(big.Int).SetBytes(w.Amount[:]))
+			}
+			for _, a := range sorted {
+				if over(sums[a], c(a)) {
+					return true
+				}
+			}
+			return false
+		},
+		"wrapping u256 sum":          wrapped(256),
+		"u64 sum":                    wrapped(64),
+		"u128 sum":                   wrapped(128),
+		"carry dropped at 2^64":      carryDropped(64),
+		"carry dropped at 2^128":     carryDropped(128),
+		"carry dropped at 2^192":     carryDropped(192),
 		"first sorted asset only":    only(sortedList, false),
 		"last sorted asset only":     only(sortedList, true),
 		"first outbox asset only":    only(seenList, false),
@@ -2635,7 +4178,7 @@ func lastAppearance(outbox []codec.L1Withdrawal) []string {
 	return reversed(out)
 }
 
-// TestCapVectorsRejectWrongImplementations re-derives step 5a for CV-CAP-1 to CV-CAP-7 under each
+// TestCapVectorsRejectWrongImplementations re-derives step 5a for every CV-CAP vector under each
 // wrong implementation and requires every one to get at least one vector's status wrong. The
 // control variant is the correct per-asset check and must get every status right.
 func TestCapVectorsRejectWrongImplementations(t *testing.T) {
@@ -2656,8 +4199,8 @@ func TestCapVectorsRejectWrongImplementations(t *testing.T) {
 			vectors[vec.ID] = vec
 		}
 	}
-	if len(vectors) != 7 {
-		t.Fatalf("%d CV-CAP vectors in the artifact, want 7", len(vectors))
+	if len(vectors) != 12 {
+		t.Fatalf("%d CV-CAP vectors in the artifact, want 12", len(vectors))
 	}
 
 	for name, v := range variants {

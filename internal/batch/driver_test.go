@@ -771,6 +771,54 @@ func TestDriverReceiptFields(t *testing.T) {
 	})
 }
 
+// --- test 6b: partial claim asset flow ---
+
+// TestDriverPartialClaimAssetFlow drives one payable CallL2 whose contract claims 400 of a
+// 1000 deposit and checks the §18.4 identity on the batch's AssetFlowSummary.
+func TestDriverPartialClaimAssetFlow(t *testing.T) {
+	asset := assetN(1)
+	deposit := u256N(1000)
+	inputs := []ledger.Input{ledgerInput(0, callPayload(t, hashN(1), hashN(2), asset, deposit))}
+	eff := domain.Effects{
+		Status:         codec.StatusSuccess,
+		ContractID:     hashN(2),
+		ClaimedDeposit: u256N(400),
+		OutboxMessages: []codec.OutboxMessage{
+			{SourceContract: types.Hash{}, InputIndex: 0, OutboxIndex: 0, Target: codec.L1Withdrawal{RecipientL1: types.Address{1}, Asset: asset, Amount: u256N(600)}},
+		},
+	}
+	dom := &fakeDomain{steps: []fakeStep{{effects: eff}}}
+	cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+	d, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	got, ok, err := d.NextBatch()
+	if err != nil || !ok {
+		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+	}
+	summary := got.Commitment.AssetFlowSummary
+	if len(summary) != 1 {
+		t.Fatalf("len(AssetFlowSummary) = %d, want 1", len(summary))
+	}
+	e := summary[0]
+	if e.Asset != asset {
+		t.Fatalf("AssetFlowSummary[0].Asset = %x, want %x", e.Asset, asset)
+	}
+	if e.DepositCredit != deposit {
+		t.Fatalf("DepositCredit = %x, want %x", e.DepositCredit, deposit)
+	}
+	if e.WithdrawalDebit != u256N(600) {
+		t.Fatalf("WithdrawalDebit = %x, want %x", e.WithdrawalDebit, u256N(600))
+	}
+	credit := new(big.Int).SetBytes(e.DepositCredit[:])
+	debit := new(big.Int).SetBytes(e.WithdrawalDebit[:])
+	if net := new(big.Int).Sub(credit, debit); net.Cmp(big.NewInt(400)) != 0 {
+		t.Fatalf("DepositCredit - WithdrawalDebit = %s, want the claim 400", net)
+	}
+}
+
 // --- test 7: unknown kind ---
 
 func TestDriverUnknownKind(t *testing.T) {
