@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
 	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
@@ -582,12 +584,16 @@ func TestHostChargeAtDepth512(t *testing.T) {
 	}
 }
 
-// abortBody returns i32.const code; call abort; unreachable; end -- the trailing unreachable
-// satisfies the i64 result type even though abort's host body always panics before it could
-// ever execute.
-func abortBody(code int32) []byte {
+// abortBody returns i32.const code; i32.const ptr; i32.const dataLen; call abort; unreachable;
+// end -- the trailing unreachable satisfies the i64 result type even though abort's host body
+// always panics before it could ever execute.
+func abortBody(code, ptr, dataLen int32) []byte {
 	b := []byte{0x41}
 	b = appendVarS32(b, code)
+	b = append(b, 0x41)
+	b = appendVarS32(b, ptr)
+	b = append(b, 0x41)
+	b = appendVarS32(b, dataLen)
 	b = append(b, 0x10, 0x00) // call 0 (abort)
 	b = append(b, 0x00)       // unreachable
 	b = append(b, 0x0B)       // end
@@ -606,7 +612,7 @@ func TestAbortReturnsCode(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			instrumented, codeHash := buildAndInstrument(t, buildModule([]string{"abort"}, nil, []byte{0x00}, abortBody(c.code), 1))
+			instrumented, codeHash := buildAndInstrument(t, buildModule([]string{"abort"}, nil, []byte{0x00}, abortBody(c.code, 0, 0), 1))
 			e := newTestEngine(t)
 			out, err := e.Run(HostContext{State: newTestState(t, nil), ContractID: contractID}, codeHash, instrumented, nil, 1_000_000)
 			if err != nil {
@@ -618,7 +624,7 @@ func TestAbortReturnsCode(t *testing.T) {
 			if out.AbortCode != c.code {
 				t.Fatalf("AbortCode = %d, want %d", out.AbortCode, c.code)
 			}
-			want := module.InitialMemoryCost(1) + opsCost(t, 0x41, 0x10, 0x00) + module.HostCost(module.HostAbort, 0)
+			want := module.InitialMemoryCost(1) + opsCost(t, 0x41, 0x41, 0x41, 0x10, 0x00) + module.HostCost(module.HostAbort, 0)
 			if out.GasUsed != want {
 				t.Fatalf("GasUsed = %d, want %d", out.GasUsed, want)
 			}
@@ -626,11 +632,86 @@ func TestAbortReturnsCode(t *testing.T) {
 	}
 }
 
+// TestAbortResolution covers env.abort's revert-data resolution: the size check, the
+// data_len 0 short-circuit, the out-of-bounds trap and the data charge.
+func TestAbortResolution(t *testing.T) {
+	contractID := testContractID()
+	pattern := make([]byte, codec.MaxReturnData)
+	for i := range pattern {
+		pattern[i] = byte(i)
+	}
+	memCost := module.InitialMemoryCost(1)
+	segTotal := opsCost(t, 0x41, 0x41, 0x41, 0x10, 0x00)
+	// The 4,096-byte data segment alone exceeds testLimits.MaxCodeSize.
+	limits := testLimits
+	limits.MaxCodeSize = 8192
+
+	cases := []struct {
+		name     string
+		ptr      int32
+		dataLen  int32
+		budget   func(charge uint64) uint64
+		wantKind OutcomeKind
+		wantData []byte
+	}{
+		{"40 bytes", 1024, 40, nil, Aborted, pattern[:40]},
+		{"zero length at any pointer", -1, 0, nil, Aborted, nil},
+		{"MaxReturnData bytes", 1024, codec.MaxReturnData, nil, Aborted, pattern},
+		{"over MaxReturnData out of memory", -16, codec.MaxReturnData + 1, nil, AbortTooLarge, nil},
+		{"range crossing the end of memory", 65520, 32, nil, Trapped, nil},
+		{"unaffordable data charge", 1024, 64, func(charge uint64) uint64 { return memCost + segTotal + charge - 1 }, OutOfGas, nil},
+		{"unaffordable charge with an out-of-memory range", 65520, 64, func(charge uint64) uint64 { return memCost + segTotal + charge - 1 }, OutOfGas, nil},
+		{"unaffordable charge with an oversized length", -16, codec.MaxReturnData + 1, func(charge uint64) uint64 { return memCost + segTotal + charge - 1 }, OutOfGas, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			spec := &dataSeg{offset: 1024, bytes: pattern}
+			wasm := buildModule([]string{"abort"}, spec, []byte{0x00}, abortBody(7, c.ptr, c.dataLen), 1)
+			if err := module.Validate(wasm, limits); err != nil {
+				t.Fatalf("Validate = %v, want nil", err)
+			}
+			instrumented, err := module.Instrument(wasm, limits)
+			if err != nil {
+				t.Fatalf("Instrument = %v, want nil", err)
+			}
+			codeHash := codeHashOf(instrumented)
+			charge := module.HostCostU32(module.HostAbort, uint32(c.dataLen))
+			budget := uint64(1_000_000)
+			if c.budget != nil {
+				budget = c.budget(charge)
+			}
+			e := newTestEngine(t)
+			out, err := e.Run(HostContext{State: newTestState(t, nil), ContractID: contractID}, codeHash, instrumented, nil, budget)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if out.Kind != c.wantKind {
+				t.Fatalf("Kind = %v, want %v", out.Kind, c.wantKind)
+			}
+			if c.wantKind == OutOfGas {
+				return
+			}
+			if want := memCost + segTotal + charge; out.GasUsed != want {
+				t.Fatalf("GasUsed = %d, want %d", out.GasUsed, want)
+			}
+			if !bytes.Equal(out.RevertData, c.wantData) || (c.wantData == nil && out.RevertData != nil) {
+				t.Fatalf("RevertData = %d bytes, want %d bytes", len(out.RevertData), len(c.wantData))
+			}
+			if c.wantKind == Aborted && out.AbortCode != 7 {
+				t.Fatalf("AbortCode = %d, want 7", out.AbortCode)
+			}
+			if c.wantKind != Aborted && out.AbortCode != 0 {
+				t.Fatalf("AbortCode = %d, want 0", out.AbortCode)
+			}
+		})
+	}
+}
+
 func TestAbortWithoutGasIsOutOfGas(t *testing.T) {
 	contractID := testContractID()
-	instrumented, codeHash := buildAndInstrument(t, buildModule([]string{"abort"}, nil, []byte{0x00}, abortBody(7), 1))
+	instrumented, codeHash := buildAndInstrument(t, buildModule([]string{"abort"}, nil, []byte{0x00}, abortBody(7, 0, 0), 1))
 	memCost := module.InitialMemoryCost(1)
-	segTotal := opsCost(t, 0x41, 0x10, 0x00)
+	segTotal := opsCost(t, 0x41, 0x41, 0x41, 0x10, 0x00)
 	hostCost := module.HostCost(module.HostAbort, 0)
 
 	t.Run("one short: OutOfGas", func(t *testing.T) {

@@ -30,6 +30,10 @@ const (
 	MaxOutboxPayloadSize = 8 << 10
 	MaxAssetsPerBatch    = 16
 	MaxCallPayload       = 8 << 10
+	// MaxReturnData bounds an ExecutionResult's ReturnData (§27.1a, §14.3), which on REVERT is
+	// the revert data (§15). It does not bound a ContractEffects blob's ReturnData: an
+	// oversized one must decode, so that step 7 rejects it as RESULT_TOO_LARGE (§10.6).
+	MaxReturnData = 4 << 10
 )
 
 // OutboxMessage kind ordinals (§27.4).

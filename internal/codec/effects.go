@@ -203,7 +203,7 @@ func (c ContractEffects) Encode() ([]byte, error) {
 	if err := encodeContractEffectsBody(w, c); err != nil {
 		return nil, fmt.Errorf("codec: encode contract effects: %w", err)
 	}
-	if _, err := DecodeExecutionResult(w.buf); err == nil {
+	if parsesAsExecutionResult(w.buf) {
 		return nil, fmt.Errorf("codec: encode contract effects: %w", ErrRootsPresent)
 	}
 	return w.buf, nil
@@ -222,7 +222,7 @@ func DecodeContractEffects(b []byte) (ContractEffects, error) {
 	if err := r.end(); err != nil {
 		return ContractEffects{}, fmt.Errorf("codec: decode contract effects: %w", err)
 	}
-	if _, err := DecodeExecutionResult(b); err == nil {
+	if parsesAsExecutionResult(b) {
 		return ContractEffects{}, fmt.Errorf("codec: decode contract effects: %w", ErrRootsPresent)
 	}
 	return c, nil
@@ -312,7 +312,7 @@ func (e ExecutionResult) Encode() ([]byte, error) {
 // DecodeExecutionResult decodes a canonical ExecutionResult.
 func DecodeExecutionResult(b []byte) (ExecutionResult, error) {
 	r := newReader(b)
-	e, err := decodeExecutionResultBody(r)
+	e, err := decodeExecutionResultBody(r, MaxReturnData)
 	if err != nil {
 		return e, fmt.Errorf("codec: decode execution result: %w", err)
 	}
@@ -320,6 +320,16 @@ func DecodeExecutionResult(b []byte) (ExecutionResult, error) {
 		return e, fmt.Errorf("codec: decode execution result: %w", err)
 	}
 	return e, nil
+}
+
+// parsesAsExecutionResult reports whether b is a canonical 9-field ExecutionResult with no
+// bound on ReturnData, which is the roots-present probe of §14.2.
+func parsesAsExecutionResult(b []byte) bool {
+	r := newReader(b)
+	if _, err := decodeExecutionResultBody(r, ^uint32(0)); err != nil {
+		return false
+	}
+	return r.end() == nil
 }
 
 func encodeExecutionResultBody(w *writer, e ExecutionResult) error {
@@ -339,12 +349,15 @@ func encodeExecutionResultBody(w *writer, e ExecutionResult) error {
 	if err := writeOutboxList(w, e.Outbox, e.GlobalInputIndex, MaxOutboxPerResult); err != nil {
 		return err
 	}
+	if len(e.ReturnData) > MaxReturnData {
+		return ErrLimitExceeded
+	}
 	w.bytes(e.ReturnData)
 	w.u256(e.ClaimedDeposit)
 	return nil
 }
 
-func decodeExecutionResultBody(r *reader) (ExecutionResult, error) {
+func decodeExecutionResultBody(r *reader, maxReturnData uint32) (ExecutionResult, error) {
 	var e ExecutionResult
 	var err error
 
@@ -375,7 +388,7 @@ func decodeExecutionResultBody(r *reader) (ExecutionResult, error) {
 	if e.Outbox, err = readOutboxList(r, e.GlobalInputIndex, MaxOutboxPerResult); err != nil {
 		return e, err
 	}
-	if e.ReturnData, err = r.bytes(^uint32(0)); err != nil {
+	if e.ReturnData, err = r.bytes(maxReturnData); err != nil {
 		return e, err
 	}
 	if e.ClaimedDeposit, err = r.u256(); err != nil {

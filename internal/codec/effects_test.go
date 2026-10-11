@@ -757,3 +757,82 @@ func TestRootsPresentPinned(t *testing.T) {
 		t.Fatalf("ContractEffects.Encode on crafted struct: got %v, want ErrRootsPresent", err)
 	}
 }
+
+func TestExecutionResultReturnDataBound(t *testing.T) {
+	withReturnData := func(n int) ExecutionResult {
+		return ExecutionResult{Version: ExecutionResultVersion, GlobalInputIndex: 42, ReturnData: bytes.Repeat([]byte{0xAB}, n)}
+	}
+
+	t.Run("encode refuses MaxReturnData+1", func(t *testing.T) {
+		if _, err := withReturnData(MaxReturnData + 1).Encode(); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("got %v, want ErrLimitExceeded", err)
+		}
+	})
+
+	t.Run("decode rejects MaxReturnData+1", func(t *testing.T) {
+		enc, err := withReturnData(MaxReturnData).Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		lenAt := len(enc) - 32 - 4 - MaxReturnData
+		over := append([]byte(nil), enc[:len(enc)-32]...)
+		binary.BigEndian.PutUint32(over[lenAt:], MaxReturnData+1)
+		over = append(over, 0xAB)
+		over = append(over, enc[len(enc)-32:]...)
+		if _, err := DecodeExecutionResult(over); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("got %v, want ErrLimitExceeded", err)
+		}
+	})
+
+	t.Run("MaxReturnData round-trips", func(t *testing.T) {
+		in := withReturnData(MaxReturnData)
+		enc, err := in.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		out, err := DecodeExecutionResult(enc)
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if !bytes.Equal(out.ReturnData, in.ReturnData) {
+			t.Fatalf("ReturnData = %d bytes, want %d", len(out.ReturnData), len(in.ReturnData))
+		}
+	})
+}
+
+// TestRootsPresentProbeUnbounded builds a blob whose 9-field ExecutionResult reading carries
+// MaxReturnData+1 bytes of ReturnData. DecodeExecutionResult rejects it, yet both
+// ContractEffects entry points still treat it as roots-present.
+func TestRootsPresentProbeUnbounded(t *testing.T) {
+	const m = MaxReturnData + 1
+	buf := &writer{}
+	buf.u16(ExecutionResultVersion)
+	buf.u64(42)
+	// 64-byte region: ContractEffects sees three zero counts and returnDataLen = 64 + m.
+	buf.raw(make([]byte, 12))
+	buf.u32(64 + m)
+	buf.raw(make([]byte, 48))
+	// ExecutionResult sees the region as the two roots, then its own counts and ReturnData.
+	buf.u32(0)
+	buf.u32(0)
+	buf.u32(0)
+	buf.u32(m)
+	buf.raw(make([]byte, m))
+	buf.raw(make([]byte, 32))
+
+	if _, err := DecodeExecutionResult(buf.buf); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("DecodeExecutionResult: got %v, want ErrLimitExceeded", err)
+	}
+	if _, err := DecodeContractEffects(buf.buf); !errors.Is(err, ErrRootsPresent) {
+		t.Fatalf("DecodeContractEffects: got %v, want ErrRootsPresent", err)
+	}
+
+	eff := ContractEffects{
+		Version:          ExecutionResultVersion,
+		GlobalInputIndex: 42,
+		ReturnData:       buf.buf[10+16 : len(buf.buf)-32],
+	}
+	if _, err := eff.Encode(); !errors.Is(err, ErrRootsPresent) {
+		t.Fatalf("ContractEffects.Encode: got %v, want ErrRootsPresent", err)
+	}
+}

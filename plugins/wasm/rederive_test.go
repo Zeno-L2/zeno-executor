@@ -452,7 +452,7 @@ func checkNonSuccess(t *testing.T, vec vectorJSON) {
 	if vec.Receipt.StateDiffHash != zeroHashHex {
 		t.Fatalf("B5 (§14.3): status %s carries state_diff_hash %s, want zero; %s", vec.Status, vec.Receipt.StateDiffHash, detail)
 	}
-	if vec.Receipt.ReturnHash != zeroHashHex {
+	if vec.Status != "REVERT" && vec.Receipt.ReturnHash != zeroHashHex {
 		t.Fatalf("B5 (§14.3): status %s carries return_hash %s, want zero; %s", vec.Status, vec.Receipt.ReturnHash, detail)
 	}
 
@@ -468,7 +468,11 @@ func checkNonSuccess(t *testing.T, vec vectorJSON) {
 		if len(er.Events) != 0 {
 			t.Fatalf("B5: ExecutionResult.Events has %d entries, want 0 (§14.3)", len(er.Events))
 		}
-		if len(er.ReturnData) != 0 {
+		if vec.Status == "REVERT" {
+			if len(er.ReturnData) > codec.MaxReturnData {
+				t.Fatalf("B5: ExecutionResult.ReturnData has %d bytes, want <= %d (§14.3)", len(er.ReturnData), codec.MaxReturnData)
+			}
+		} else if len(er.ReturnData) != 0 {
 			t.Fatalf("B5: ExecutionResult.ReturnData has %d bytes, want 0 (§14.3)", len(er.ReturnData))
 		}
 		if er.ClaimedDeposit != (codec.U256{}) {
@@ -1853,20 +1857,20 @@ func checkCVUNAUTH1ReservedKeyDiscardNotVacuous(t *testing.T, vec vectorJSON) {
 }
 
 // checkCVRTLRETURN1ReturnDataOversized is INV-10: the decoded blob's ReturnData is longer than
-// MaxReturnData.
+// codec.MaxReturnData.
 func checkCVRTLRETURN1ReturnDataOversized(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
 	if err != nil {
 		t.Fatalf("INV-10: DecodeContractEffects: %v", err)
 	}
-	if len(eff.ReturnData) <= MaxReturnData {
-		t.Fatalf("INV-10: len(ReturnData) = %d, want > MaxReturnData %d", len(eff.ReturnData), MaxReturnData)
+	if len(eff.ReturnData) <= codec.MaxReturnData {
+		t.Fatalf("INV-10: len(ReturnData) = %d, want > MaxReturnData %d", len(eff.ReturnData), codec.MaxReturnData)
 	}
 }
 
 // checkCVRTLRESULT1ResultTooLargeFromRefund is INV-11: the decoded blob's ReturnData is not
-// longer than MaxReturnData (so the other bound is not what tripped), the contract-only
+// longer than codec.MaxReturnData (so the other bound is not what tripped), the contract-only
 // ExecutionResult length computed inline is <= MaxExecutionResult, and input.deposit_amount is
 // non-zero (so a refund exists to push it over).
 func checkCVRTLRESULT1ResultTooLargeFromRefund(t *testing.T, vec vectorJSON) {
@@ -1875,8 +1879,8 @@ func checkCVRTLRESULT1ResultTooLargeFromRefund(t *testing.T, vec vectorJSON) {
 	if err != nil {
 		t.Fatalf("INV-11: DecodeContractEffects: %v", err)
 	}
-	if len(eff.ReturnData) > MaxReturnData {
-		t.Fatalf("INV-11: len(ReturnData) = %d > MaxReturnData %d, want <=", len(eff.ReturnData), MaxReturnData)
+	if len(eff.ReturnData) > codec.MaxReturnData {
+		t.Fatalf("INV-11: len(ReturnData) = %d > codec.MaxReturnData %d, want <=", len(eff.ReturnData), codec.MaxReturnData)
 	}
 	// A contract-only ExecutionResult with N state entries, no events, no outbox, empty
 	// ReturnData encodes to 122 + Σ(36+len(v)) bytes (§27.1a's fixed prefix/suffix plus one
@@ -3499,8 +3503,52 @@ func checkEXECDEP6(t *testing.T, vec vectorJSON) {
 	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
 }
 
-// checkEXECDEP7 pins abort(7) on a deposit input: REVERT, no blob, and the gas of
-// i32.const, call, i64.const, end plus abort's 1.
+// abortCharge is abort's §10.3 charge for dataLen bytes: 1 + 10 * ceil(dataLen / 32).
+func abortCharge(n uint64) uint64 { return 1 + 10*((n+31)/32) }
+
+// abortGas is the gas_used of a vector whose body is abortCallBody and whose abort carries
+// dataLen bytes: the initial memory charge, the metered opcodes through i64.const and end, and
+// abort's charge.
+func abortGas(t *testing.T, dataLen uint64) uint64 {
+	t.Helper()
+	return module.InitialMemoryCost(1) + costOf(t, 0x41, 0x41, 0x41, 0x10, 0x42, 0x0B) + abortCharge(dataLen)
+}
+
+// checkRevertData decodes the vector's ExecutionResult, asserts it carries n bytes of
+// ReturnData and, for n > 0, that module_wasm_hex contains them.
+func checkRevertData(t *testing.T, vec vectorJSON, n int) {
+	t.Helper()
+	if vec.ExecutionResultBlobHex == "" {
+		t.Fatalf("%s: execution_result_blob_hex is absent", vec.ID)
+	}
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("%s: DecodeExecutionResult: %v", vec.ID, err)
+	}
+	if len(er.ReturnData) != n {
+		t.Fatalf("%s: ExecutionResult.ReturnData has %d bytes, want %d", vec.ID, len(er.ReturnData), n)
+	}
+	if n > 0 && !strings.Contains(vec.ModuleWasmHex, hex.EncodeToString(er.ReturnData)) {
+		t.Fatalf("%s: module_wasm_hex does not contain the revert data", vec.ID)
+	}
+}
+
+// checkAbortRow pins an abort vector's status, receipt.abort_code and gas_used.
+func checkAbortRow(t *testing.T, vec vectorJSON, status string, abortCode int32, gas uint64) {
+	t.Helper()
+	if vec.Status != status {
+		t.Fatalf("%s: status %s, want %s", vec.ID, vec.Status, status)
+	}
+	if vec.Receipt.AbortCode != abortCode {
+		t.Fatalf("%s: receipt.abort_code = %d, want %d", vec.ID, vec.Receipt.AbortCode, abortCode)
+	}
+	if vec.GasUsed != gas {
+		t.Fatalf("%s: gas_used %d, want %d", vec.ID, vec.GasUsed, gas)
+	}
+}
+
+// checkEXECDEP7 pins abort(7) with data_len 0 on a deposit input: REVERT, no blob, empty
+// revert data, and the gas of the abort body.
 func checkEXECDEP7(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	checkFailureRefund(t, vec, "REVERT")
@@ -3510,9 +3558,10 @@ func checkEXECDEP7(t *testing.T, vec vectorJSON) {
 	if vec.ContractEffectsBlobHex != "" {
 		t.Fatalf("EXEC-DEP-7: contract_effects_blob_hex is present, want absent")
 	}
-	if want := module.InitialMemoryCost(1) + costOf(t, 0x41, 0x10, 0x42, 0x0B) + 1; vec.GasUsed != want {
+	if want := abortGas(t, 0); vec.GasUsed != want {
 		t.Fatalf("EXEC-DEP-7: gas_used %d, want %d", vec.GasUsed, want)
 	}
+	checkRevertData(t, vec, 0)
 }
 
 // checkEXECDEP8 pins the unaffordable initial-memory charge on a deposit input.
@@ -3563,7 +3612,7 @@ type blobConditions struct {
 	FootprintOver      bool // step 5a: distinct withdrawal assets, plus the deposit asset when deposit_amount > 0 and not withdrawn, > MaxAssetsPerBatch
 	CapOver            bool // step 5a: some asset's withdrawal total > its withdrawal_caps value (0 when absent)
 	QuotaOver          bool // step 6a: net growth > 0 and used + growth > purchased
-	ReturnDataOver     bool // step 7: len(ReturnData) > MaxReturnData
+	ReturnDataOver     bool // step 7: len(ReturnData) > codec.MaxReturnData
 }
 
 // noConditions is the blobConditions of a blob that trips nothing.
@@ -3652,7 +3701,7 @@ func conditionsOf(t *testing.T, vec vectorJSON, eff codec.ContractEffects) blobC
 	_, purchased, used := quotaLeaf(t, vec)
 	got.QuotaOver = growth > 0 && used+uint64(growth) > purchased
 
-	got.ReturnDataOver = len(eff.ReturnData) > MaxReturnData
+	got.ReturnDataOver = len(eff.ReturnData) > codec.MaxReturnData
 	return got
 }
 
@@ -3779,6 +3828,41 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-DEP-8":    checkEXECDEP8,
 	"EXEC-DEP-9":    checkEXECDEP9,
 	"EXEC-DEP-10":   checkEXECDEP10,
+	"CV-ABORT-1": func(t *testing.T, vec vectorJSON) {
+		checkAbortRow(t, vec, "REVERT", 7, abortGas(t, 40))
+		checkRevertData(t, vec, 40)
+	},
+	"CV-ABORT-2": func(t *testing.T, vec vectorJSON) {
+		checkAbortRow(t, vec, "REVERT", 7, abortGas(t, 0))
+		checkRevertData(t, vec, 0)
+	},
+	"CV-ABORT-3": func(t *testing.T, vec vectorJSON) {
+		checkAbortRow(t, vec, "REVERT", 7, abortGas(t, 4096))
+		checkRevertData(t, vec, 4096)
+	},
+	"CV-ABORT-4": func(t *testing.T, vec vectorJSON) {
+		checkAbortRow(t, vec, "RESULT_TOO_LARGE", 0, abortGas(t, 4097))
+	},
+	"CV-ABORT-5": func(t *testing.T, vec vectorJSON) {
+		checkAbortRow(t, vec, "RUNTIME_FAULT", 0, abortGas(t, 32))
+	},
+	"CV-ABORT-6": func(t *testing.T, vec vectorJSON) {
+		checkAbortRow(t, vec, "OUT_OF_GAS", 0, abortGas(t, 64)-1)
+		if got := *vec.Input.PlasmaLimit; got != vec.GasUsed {
+			t.Fatalf("CV-ABORT-6: plasma_limit %d, want gas_used %d", got, vec.GasUsed)
+		}
+		if got := *vec.Input.PlasmaLimit; got < abortGas(t, 0) {
+			t.Fatalf("CV-ABORT-6: plasma_limit %d, want >= abortGas(0) %d", got, abortGas(t, 0))
+		}
+	},
+	"EXEC-DEP-11": func(t *testing.T, vec vectorJSON) {
+		checkFailureRefund(t, vec, "REVERT")
+		if vec.InputKind != 0 {
+			t.Fatalf("EXEC-DEP-11: input_kind %d, want 0", vec.InputKind)
+		}
+		checkAbortRow(t, vec, "REVERT", 7, abortGas(t, 40))
+		checkRevertData(t, vec, 40)
+	},
 }
 
 // TestConformanceVectors re-derives every committed value in the artifact from the JSON

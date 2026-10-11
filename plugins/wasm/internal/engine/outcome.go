@@ -14,6 +14,7 @@ const (
 	Aborted
 	OutOfGas
 	Trapped
+	AbortTooLarge // env.abort with data_len > codec.MaxReturnData (§8.1 step 1)
 )
 
 // Outcome is Run's deterministic result for one input. Every field is meaningful only for the
@@ -25,6 +26,9 @@ type Outcome struct {
 	Ret       int64
 	AbortCode int32 // Aborted only; 0 otherwise
 	GasUsed   uint64
+	// RevertData is meaningful for Aborted only: a copy of the data_len bytes at data_ptr, nil
+	// when data_len is 0.
+	RevertData []byte
 	// ResultBlob is populated for Returned with Ret >= 0 only: a copy of exactly result_len
 	// bytes at result_ptr, never a view into module memory and never truncated at any length.
 	// It is a copy because it outlives the instance: the module instance, and its memory with
@@ -32,9 +36,13 @@ type Outcome struct {
 	ResultBlob []byte
 }
 
-// abortError is the typed abort a contract raises by calling env.abort(code); classify maps it
-// to Aborted regardless of the ledger's state.
-type abortError struct{ code int32 }
+// abortError is the typed abort a contract raises by calling env.abort; classify maps it to
+// Aborted regardless of the ledger's state, and Run turns tooLarge into AbortTooLarge.
+type abortError struct {
+	code     int32
+	data     []byte // copied revert data; nil when data_len is 0
+	tooLarge bool   // data_len > codec.MaxReturnData; code and data stay zero
+}
 
 func (e *abortError) Error() string { return fmt.Sprintf("engine: abort(%d)", e.code) }
 

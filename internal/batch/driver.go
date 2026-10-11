@@ -67,10 +67,11 @@ var (
 	// is unreachable in practice. Kept as a structural, fail-closed guard.
 	ErrUnbatchable = errors.New("batch: first input of a batch alone exceeds a per-batch cap")
 	// ErrEffectsInvariant reports that an input's Effects carried content that violates a
-	// committed invariant: on a non-SUCCESS status, §14.3/§15 forbid a non-empty StateDiff,
-	// Events or ReturnData, a non-zero ClaimedDeposit, a non-zero AbortCode outside REVERT, or an
-	// OutboxMessages set other than empty or exactly one runtime-emitted deposit refund; on
-	// SUCCESS, ClaimedDeposit must not exceed the input's own deposit_amount (§18.3).
+	// committed invariant: on a non-SUCCESS status, §14.3/§15 forbid a non-empty StateDiff or
+	// Events, a non-empty ReturnData outside REVERT, a non-zero ClaimedDeposit, a non-zero
+	// AbortCode outside REVERT, or an OutboxMessages set other than empty or exactly one
+	// runtime-emitted deposit refund; on SUCCESS, ClaimedDeposit must not exceed the input's own
+	// deposit_amount (§18.3).
 	ErrEffectsInvariant = errors.New("batch: non-success effects carry committed content")
 	// ErrDriverReorged reports that NextBatch was called again on a Driver that already returned
 	// a *ledger.ReorgError. The caller must discard this Driver and construct a fresh one over
@@ -513,13 +514,17 @@ func (d *Driver) finishApply(rec applied) (applied, error) {
 }
 
 // checkNonSuccessInvariant enforces edge case 7 / §14.3 / §15: a non-SUCCESS input's Effects
-// carry no StateDiff, Events or ReturnData, a zero ClaimedDeposit, AbortCode zero unless the
-// status is REVERT, and an OutboxMessages set that is either empty or exactly one message that
-// is a codec.L1Withdrawal at OutboxIndex 0 with a zero SourceContract — the runtime-emitted
-// deposit refund, the only outbox content a failed input may carry.
+// carry no StateDiff or Events, no ReturnData unless the status is REVERT (where it is the
+// revert data), a zero ClaimedDeposit, AbortCode zero unless the status is REVERT, and an
+// OutboxMessages set that is either empty or exactly one message that is a codec.L1Withdrawal
+// at OutboxIndex 0 with a zero SourceContract. That message is the runtime-emitted deposit
+// refund, the only outbox content a failed input may carry.
 func checkNonSuccessInvariant(eff domain.Effects) error {
-	if len(eff.StateDiff) != 0 || len(eff.Events) != 0 || len(eff.ReturnData) != 0 {
-		return fmt.Errorf("%w: non-empty StateDiff/Events/ReturnData", ErrEffectsInvariant)
+	if len(eff.StateDiff) != 0 || len(eff.Events) != 0 {
+		return fmt.Errorf("%w: non-empty StateDiff/Events", ErrEffectsInvariant)
+	}
+	if len(eff.ReturnData) != 0 && eff.Status != codec.StatusRevert {
+		return fmt.Errorf("%w: non-empty ReturnData outside REVERT", ErrEffectsInvariant)
 	}
 	if eff.ClaimedDeposit != (codec.U256{}) {
 		return fmt.Errorf("%w: non-zero ClaimedDeposit", ErrEffectsInvariant)

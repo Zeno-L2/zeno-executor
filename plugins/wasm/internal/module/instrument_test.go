@@ -102,7 +102,7 @@ func fixtureImports() []byte {
 	b := &builder{}
 	storageLenSig := funcType{form: 0x60, params: []byte{0x7F, 0x7F}, results: []byte{0x7E}}
 	storageReadSig := funcType{form: 0x60, params: []byte{0x7F, 0x7F, 0x7F, 0x7F}, results: []byte{0x7E}}
-	abortSig := funcType{form: 0x60, params: []byte{0x7F}, results: nil}
+	abortSig := funcType{form: 0x60, params: []byte{0x7F, 0x7F, 0x7F}, results: nil}
 	runSig := funcType{form: 0x60, params: []byte{0x7F, 0x7F}, results: []byte{0x7E}}
 	b.types = []funcType{storageLenSig, storageReadSig, abortSig, runSig}
 	b.imports = []importEntry{
@@ -246,7 +246,7 @@ func TestInstrumentGolden(t *testing.T) {
 		"branches":  "8fe614267fa8e70c7ad85cefc0fd34c50cf2a2b3dbd0c7e83965d6c79cd7517f",
 		"endleader": "a17362c2c484f3a6e4af713e9e3aac4d39b3d02fc7fab2b6172dfbb7968b4049",
 		"grow":      "ce59d568b628b4114dc048ae0fc47804f3120d87da366d0c82f8269a0022be82",
-		"imports":   "2fc938929c01e4c19cade76c3b3889de82f39d7e9a953a5ae17a2b963b40d47f",
+		"imports":   "9d10ac216120a86b51ba53221e85e695ce66b2659f3001b384b35a429c649b2f",
 		"void":      "51960d6236255f37ec5eb1b41674ab69bf1da5565942284d0f61ed4538d8d632",
 	}
 	for name, wantHex := range wantDigests {

@@ -31,7 +31,7 @@ vectors.
    `MaxDataSegments = 1024`; the largest module is ~64 KiB against a 256 KiB `MaxCodeSize`
    (`../limits.go`).
 4. §15 states the `state_diff_hash`/`return_hash` preimages and §14.3 states the non-`SUCCESS`
-   `ReturnData` discard normatively.
+   `ReturnData` discard normatively, except `REVERT`'s revert data.
 5. The §15 preimage corroboration outcome: the derived rule was checked against the four
    literals §15's own preimages name — EXEC-001's `return_hash`, and EXEC-002's put,
    EXEC-004's delete and EXEC-005's present-empty put `state_diff_hash` — each read out of the
@@ -97,7 +97,8 @@ Encoding rules:
 ## Receipt hash preimages
 
 `state_diff_hash` and `return_hash` follow §15's preimages; every non-`SUCCESS` receipt carries
-both as zero per §14.3.
+both as zero per §14.3, except `REVERT`, whose `return_hash` is `SHA3-256` of its revert data
+(zero when the revert data is empty).
 
 ## Regeneration
 
@@ -123,7 +124,7 @@ Vector IDs are stable names; gaps in numbering are intentional.
 | `EXEC-007` | one event, no state change |
 | `EXEC-008` | one contract-emitted L1 withdrawal |
 | `EXEC-009` | combined put + event + L2 delivery + return data |
-| `EXEC-010` | `abort(7)`: a `REVERT` receipt with a non-zero `abort_code` |
+| `EXEC-010` | `abort(7)` with `data_len` 0: a `REVERT` receipt with a non-zero `abort_code` |
 | `EXEC-011` | `unreachable`: a non-`REVERT` receipt with `abort_code = 0` |
 | `EXEC-012` | absent-key `storage_read`, then write a different key |
 | `EXEC-DEP-1` | full claim, no refund |
@@ -227,13 +228,20 @@ Vector IDs are stable names; gaps in numbering are intentional.
 | `CV-RESERVED-1` | writes to `0x00`, `0x0000`, `0x0006` and `0x000100`, each near a reserved key but none equal to one: reserved keys match exactly, never by prefix or range, so `SUCCESS` |
 | `CV-QUOTA-9` | a write by a contract with no quota leaf: an absent leaf means purchased = used = 0, so `STORAGE_QUOTA_EXCEEDED` at metered plus effect gas |
 | `EXEC-DEP-6` | a payable `CallL2` with a payload and a deposit of 1000 claims 400: `SUCCESS`, and the 600 refund follows the contract's message |
-| `EXEC-DEP-7` | `abort(7)` on an input carrying a deposit: `REVERT`, and the full deposit is refunded |
+| `EXEC-DEP-7` | `abort(7)` with `data_len` 0 on an input carrying a deposit: `REVERT`, and the full deposit is refunded |
 | `EXEC-DEP-8` | the pre-execution initial-memory charge is unaffordable on an input carrying a deposit: `OUT_OF_GAS`, and the full deposit is refunded |
 | `EXEC-DEP-9` | a reserved-key write on an input carrying a deposit: `UNAUTHORIZED`, and the full deposit is refunded |
 | `EXEC-DEP-10` | a blob longer than `MaxResultBlob` on an input carrying a deposit: `RESULT_TOO_LARGE` from step 0, and the full deposit is refunded |
 | `CV-DECODE-17` | a zero-amount withdrawal naming a non-canonical AssetID whose only non-zero byte in `[0:22]` is byte 0, the first byte that must be zero: the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
 | `CV-DECODE-18` | three events with `event_index` 0, 2 and 1: the list is a gap-free permutation but not ascending, so the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
 | `CV-DECODE-19` | three outbox messages with `outbox_index` 0, 2 and 1: the list is a gap-free permutation but not ascending, so the decoder rejects it, so `RUNTIME_FAULT` at the metered gas |
+| `CV-ABORT-1` | `abort(7)` with 40 bytes of revert data: `REVERT`, `abort_code` 7, `return_hash` = `SHA3-256` of the revert data |
+| `CV-ABORT-2` | `abort` with `data_len` 0 and `data_ptr` 0xFFFFFFFF: `REVERT` with empty revert data and a zero `return_hash`; the pointer is never read |
+| `CV-ABORT-3` | `data_len` = `MaxReturnData` is accepted: `REVERT` carrying all of it |
+| `CV-ABORT-4` | `data_len` = `MaxReturnData` + 1 over a range outside memory: `RESULT_TOO_LARGE`, not `RUNTIME_FAULT`, so memory is not read |
+| `CV-ABORT-5` | a revert-data range crossing the end of memory traps: `RUNTIME_FAULT` at the metered gas, including abort's charge |
+| `CV-ABORT-6` | abort's data charge is unaffordable though its base is not: `OUT_OF_GAS` |
+| `EXEC-DEP-11` | a payable `CallL2` that aborts with revert data: `REVERT`, and the full deposit refund sits beside the revert data |
 | `EXEC-UNSUP-1` | an unrecognized `input_kind` is refused deterministically as `UNSUPPORTED_OPERATION` |
 | `CV-DEPLOY-1` | single-chunk deployment start: `chunk_count` 1 for a module within `MaxDeployChunkData` |
 | `CV-DEPLOY-2` | the single deploy chunk carrying the whole module at `chunk_index` 0 |
@@ -267,3 +275,5 @@ Vector IDs are stable names; gaps in numbering are intentional.
 
 `CV-DEPLOY-1` and `CV-DEPLOY-2` together are the single-chunk sizing case: the kind-2 record
 declaring `chunk_count == 1` and the kind-3 chunk that carries the whole module.
+
+`env.abort` takes three parameters: `code`, `data_ptr` and `data_len`. Deploy validation rejects a module that imports the one-parameter form. A module with that import that is already in a store fails instantiation with an import type mismatch, and the call path returns that error to the driver, which halts the batch. A network with such state needs a fresh genesis or a devnet wipe.

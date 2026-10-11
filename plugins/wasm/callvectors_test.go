@@ -447,11 +447,11 @@ func callVectors(t *testing.T) []vectorSpec {
 
 	{
 		idx := nextIndex()
-		body := []byte{0x41, 0x07, 0x10, 0x00, 0x42, 0x00, 0x0B} // i32.const 7; call 0; i64.const 0; end
+		body := abortCallBody(7, 0, 0)
 		mod := buildWasmModule(runModuleSpec([]string{"abort"}, 1, []byte{0x00}, body, nil))
 		specs = append(specs, vectorSpec{
 			ID:         "EXEC-010",
-			Purpose:    "abort(7)",
+			Purpose:    "abort(7) with data_len 0",
 			Shape:      "call",
 			BatchID:    1,
 			Ctx:        stdCtx(idx),
@@ -698,7 +698,7 @@ func callVectors(t *testing.T) []vectorSpec {
 		blob := encodeEffects(t, codec.ContractEffects{
 			Version:          codec.ExecutionResultVersion,
 			GlobalInputIndex: idx,
-			ReturnData:       bytes.Repeat([]byte{0xAB}, MaxReturnData+1),
+			ReturnData:       bytes.Repeat([]byte{0xAB}, codec.MaxReturnData+1),
 		})
 		specs = append(specs, vectorSpec{
 			ID:         "CV-RTL-RETURN-1",
@@ -1569,7 +1569,7 @@ func callVectors(t *testing.T) []vectorSpec {
 	dupA := codec.LocalStateDiffEntry{LocalKey: []byte("dup"), Value: []byte("a")}
 	dupB := codec.LocalStateDiffEntry{LocalKey: []byte("dup"), Value: []byte("b")}
 	zeroChargeLimit := module.InitialMemoryCost(1) + costOf(t, 0x42, 0x0B)
-	oversizedReturn := bytes.Repeat([]byte{0xAB}, MaxReturnData+1)
+	oversizedReturn := bytes.Repeat([]byte{0xAB}, codec.MaxReturnData+1)
 
 	specs = append(specs, orderVector(nextIndex(), "CV-ORDER-1",
 		"a wrong input index and a reserved-key write: step 2 precedes step 3, so RUNTIME_FAULT, not UNAUTHORIZED",
@@ -1755,10 +1755,10 @@ func callVectors(t *testing.T) []vectorSpec {
 
 	{
 		idx := nextIndex()
-		body := []byte{0x41, 0x07, 0x10, 0x00, 0x42, 0x00, 0x0B} // i32.const 7; call 0; i64.const 0; end
+		body := abortCallBody(7, 0, 0)
 		specs = append(specs, vectorSpec{
 			ID:             "EXEC-DEP-7",
-			Purpose:        "abort(7) on an input carrying a deposit: REVERT, and the full deposit is refunded",
+			Purpose:        "abort(7) with data_len 0 on an input carrying a deposit: REVERT, and the full deposit is refunded",
 			Shape:          "call",
 			BatchID:        2,
 			Ctx:            stdCtx(idx),
@@ -1830,8 +1830,80 @@ func callVectors(t *testing.T) []vectorSpec {
 	}
 
 	specs = append(specs, blobOrderVectors(t, nextIndex)...)
+	specs = append(specs, abortVectors(t, nextIndex)...)
 
 	return specs
+}
+
+// abortCallBody returns i32.const code; i32.const ptr; i32.const dataLen; call 0 (abort);
+// i64.const 0; end.
+func abortCallBody(code, ptr, dataLen int32) []byte {
+	b := []byte{0x41}
+	b = appendVarS64(b, int64(code))
+	b = append(b, 0x41)
+	b = appendVarS64(b, int64(ptr))
+	b = append(b, 0x41)
+	b = appendVarS64(b, int64(dataLen))
+	return append(b, 0x10, 0x00, 0x42, 0x00, 0x0B)
+}
+
+// revertPattern returns n bytes with b[i] = byte(i).
+func revertPattern(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i)
+	}
+	return b
+}
+
+// abortVectors returns the env.abort revert-data vectors, drawing their indices from nextIndex.
+func abortVectors(t *testing.T, nextIndex func() uint64) []vectorSpec {
+	t.Helper()
+
+	abortModule := func(body []byte, data []dataSeg) []byte {
+		return buildWasmModule(runModuleSpec([]string{"abort"}, 1, []byte{0x00}, body, data))
+	}
+	atBlob := func(b []byte) []dataSeg { return []dataSeg{{offset: blobOffset, bytes: b}} }
+	callArgs := codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit}
+	spec := func(id, purpose string, mod []byte, args codec.InputArgs, caps capTable, want codec.Status) vectorSpec {
+		return vectorSpec{
+			ID:             id,
+			Purpose:        purpose,
+			Shape:          "call",
+			BatchID:        2,
+			Ctx:            stdCtx(nextIndex()),
+			Args:           args,
+			ContractID:     cid2,
+			Module:         mod,
+			WithdrawalCaps: caps,
+			WantStatus:     want,
+		}
+	}
+
+	exhausted := callArgs
+	exhausted.PlasmaLimit = module.InitialMemoryCost(1) + costOf(t, 0x41, 0x41, 0x41, 0x10, 0x42, 0x0B) + module.HostCost(module.HostAbort, 64) - 1
+	payable := callArgs
+	payable.DepositAsset = testAsset()
+	payable.DepositAmount = u256(1000)
+	payable.Payload = []byte{0xCA, 0xFE}
+
+	revert40 := abortModule(abortCallBody(7, blobOffset, 40), atBlob(revertPattern(40)))
+	return []vectorSpec{
+		spec("CV-ABORT-1", "abort(7) with 40 bytes of revert data: REVERT, abort_code 7, return_hash = SHA3-256 of the revert data",
+			revert40, callArgs, nil, codec.StatusRevert),
+		spec("CV-ABORT-2", "abort with data_len 0 and data_ptr 0xFFFFFFFF: REVERT with empty revert data and a zero return_hash; the pointer is never read",
+			abortModule(abortCallBody(7, -1, 0), nil), callArgs, nil, codec.StatusRevert),
+		spec("CV-ABORT-3", "data_len = MaxReturnData is accepted: REVERT carrying all of it",
+			abortModule(abortCallBody(7, blobOffset, codec.MaxReturnData), atBlob(revertPattern(codec.MaxReturnData))), callArgs, nil, codec.StatusRevert),
+		spec("CV-ABORT-4", "data_len = MaxReturnData + 1 over a range outside memory: RESULT_TOO_LARGE, not RUNTIME_FAULT, so memory is not read",
+			abortModule(abortCallBody(7, -16, codec.MaxReturnData+1), nil), callArgs, nil, codec.StatusResultTooLarge),
+		spec("CV-ABORT-5", "a revert-data range crossing the end of memory traps: RUNTIME_FAULT at the metered gas, including abort's charge",
+			abortModule(abortCallBody(7, 65520, 32), nil), callArgs, nil, codec.StatusRuntimeFault),
+		spec("CV-ABORT-6", "abort's data charge is unaffordable though its base is not: OUT_OF_GAS",
+			abortModule(abortCallBody(7, blobOffset, 64), atBlob(revertPattern(64))), exhausted, nil, codec.StatusOutOfGas),
+		spec("EXEC-DEP-11", "a payable CallL2 that aborts with revert data: REVERT, and the full deposit refund sits beside the revert data",
+			revert40, payable, capsOfOne(), codec.StatusRevert),
+	}
 }
 
 // assetsTestAssetDistinct returns a valid AssetID distinct from testAsset() for every b in

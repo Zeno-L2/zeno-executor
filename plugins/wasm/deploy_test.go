@@ -689,6 +689,8 @@ func TestApplyDeployFinalizeAssemblyVerification(t *testing.T) {
 func TestApplyDeployFinalizeModuleRejection(t *testing.T) {
 	oobData := buildModule(&dataSeg{offset: 65530, bytes: make([]byte, 16)}, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
 	illTyped := buildModule(nil, []byte{0x00}, []byte{0x41, 0x00, 0x0B}, 1)
+	oneParamAbort := runModuleSpec([]string{"abort"}, 1, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, nil)
+	oneParamAbort.Types[1].Params = []byte{0x7F}
 
 	cases := []struct {
 		name        string
@@ -699,6 +701,7 @@ func TestApplyDeployFinalizeModuleRejection(t *testing.T) {
 		{"ElementSegmentOutOfBounds", buildElementModule(1, 1), false},
 		{"ElementSegmentInBounds", buildElementModule(2, 0), true},
 		{"EngineRejectedIllTyped", illTyped, false},
+		{"OneParameterAbortImport", buildWasmModule(oneParamAbort), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

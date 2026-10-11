@@ -62,7 +62,9 @@ type Effects struct {
 	StateDiff      []StateDiffEntry
 	Events         []codec.Event
 	OutboxMessages []codec.OutboxMessage
-	ReturnData     []byte
+	// ReturnData is empty on every non-SUCCESS status except REVERT, where it is the revert
+	// data (§14.3).
+	ReturnData []byte
 }
 
 // StateInit is a domain's genesis contribution: the leaf set the runtime seeds the SMT

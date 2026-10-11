@@ -1,6 +1,7 @@
 package wasm
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -150,7 +151,7 @@ func TestSettleStatusMap(t *testing.T) {
 	reservedKeyEff.StateDiff = []codec.LocalStateDiffEntry{{LocalKey: keyCodeHash, Value: []byte{1}}}
 
 	oversizedReturnEff := validEffects(s, 500)
-	oversizedReturnEff.ReturnData = make([]byte, MaxReturnData+1)
+	oversizedReturnEff.ReturnData = make([]byte, codec.MaxReturnData+1)
 	oversizedReturnCharge := effectCharge(oversizedReturnEff)
 
 	oversizedResultEff := validEffects(s, 500)
@@ -222,6 +223,47 @@ func TestSettleUnknownOutcomeKindHalts(t *testing.T) {
 	if err == nil {
 		t.Fatal("settle: err = nil, want non-nil error for an unrecognized outcome kind")
 	}
+}
+
+func TestSettleRevertData(t *testing.T) {
+	s := baseSettlement()
+	metered := uint64(50_000)
+
+	t.Run("Aborted carries the revert data", func(t *testing.T) {
+		data := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+		eff, err := s.settle(engine.Outcome{Kind: engine.Aborted, GasUsed: metered, AbortCode: 7, RevertData: data})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		if eff.Status != codec.StatusRevert {
+			t.Fatalf("Status = %v, want StatusRevert", eff.Status)
+		}
+		if !bytes.Equal(eff.ReturnData, data) {
+			t.Fatalf("ReturnData = %x, want %x", eff.ReturnData, data)
+		}
+		if eff.AbortCode != 7 {
+			t.Fatalf("AbortCode = %d, want 7", eff.AbortCode)
+		}
+		eff.ReturnData = nil
+		assertRefundOnlyShape(t, s, eff)
+	})
+
+	t.Run("AbortTooLarge is RESULT_TOO_LARGE", func(t *testing.T) {
+		eff, err := s.settle(engine.Outcome{Kind: engine.AbortTooLarge, GasUsed: metered})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+		if eff.Status != codec.StatusResultTooLarge {
+			t.Fatalf("Status = %v, want StatusResultTooLarge", eff.Status)
+		}
+		if eff.GasUsed != metered {
+			t.Fatalf("GasUsed = %d, want %d", eff.GasUsed, metered)
+		}
+		if eff.AbortCode != 0 {
+			t.Fatalf("AbortCode = %d, want 0", eff.AbortCode)
+		}
+		assertRefundOnlyShape(t, s, eff)
+	})
 }
 
 func TestSettleAbortCode(t *testing.T) {
