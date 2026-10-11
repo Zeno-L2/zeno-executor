@@ -1215,6 +1215,141 @@ func TestMaxBufferedInputsCeilingBeforeBoundEndsCleanly(t *testing.T) {
 	}
 }
 
+// --- read-ahead limit ---
+
+func nextIndices(t *testing.T, f *Follower, n int) []uint64 {
+	t.Helper()
+	out := make([]uint64, 0, n)
+	for i := 0; i < n; i++ {
+		in, ok, err := f.Next()
+		if err != nil || !ok {
+			t.Fatalf("Next %d: got (ok=%v, err=%v), want (true, nil)", i, ok, err)
+		}
+		out = append(out, in.Ctx.GlobalInputIndex)
+	}
+	return out
+}
+
+func indicesOf(ins []Input) []uint64 {
+	out := make([]uint64, len(ins))
+	for i, in := range ins {
+		out[i] = in.Ctx.GlobalInputIndex
+	}
+	return out
+}
+
+// limitedAtTwo returns a follower over six two-input momenta that has read once with the limit at
+// index 2, which stops after height 2.
+func limitedAtTwo(t *testing.T) (*Follower, *fakeSource) {
+	t.Helper()
+	source := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+	f := newBoundedFollower(t, source, 0, 1)
+	f.LimitReadAhead(2, true)
+	if got := nextIndices(t, f, 1); !reflect.DeepEqual(got, []uint64{0}) {
+		t.Fatalf("first Next: got %v, want [0]", got)
+	}
+	return f, source
+}
+
+func TestReadAheadLimitStopsAtItsMomentum(t *testing.T) {
+	f, source := limitedAtTwo(t)
+
+	if f.nextHeight != 3 {
+		t.Fatalf("nextHeight: got %d, want 3", f.nextHeight)
+	}
+	if len(f.buf) != 3 {
+		t.Fatalf("buffered inputs: got %d, want 3", len(f.buf))
+	}
+	if source.reads != 1 {
+		t.Fatalf("source reads: got %d, want 1", source.reads)
+	}
+	recent := f.RecentMomenta()
+	if len(recent) == 0 || recent[len(recent)-1].Height != 2 {
+		t.Fatalf("RecentMomenta: got %+v, want the last at height 2", recent)
+	}
+
+	if got := nextIndices(t, f, 3); !reflect.DeepEqual(got, []uint64{1, 2, 3}) {
+		t.Fatalf("next three: got %v, want [1 2 3]", got)
+	}
+	cp, ok := f.Checkpoint()
+	if !ok || cp.Height != 2 {
+		t.Fatalf("Checkpoint: got (%+v, %v), want ok at height 2", cp, ok)
+	}
+}
+
+func TestReadAheadLimitUsesTheHeldTail(t *testing.T) {
+	f, source := limitedAtTwo(t)
+	got := nextIndices(t, f, 3)
+
+	f.LimitReadAhead(7, true)
+	got = append(got, nextIndices(t, f, 4)...)
+	if want := []uint64{1, 2, 3, 4, 5, 6, 7}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("indices: got %v, want %v", got, want)
+	}
+	if source.reads != 1 {
+		t.Fatalf("source reads with the tail held: got %d, want 1", source.reads)
+	}
+	if f.nextHeight != 5 {
+		t.Fatalf("nextHeight: got %d, want 5 (the limit index 7 is height 4's last)", f.nextHeight)
+	}
+
+	f.LimitReadAhead(0, false)
+	rest := drain(t, f)
+	if want := []uint64{8, 9, 10, 11}; !reflect.DeepEqual(indicesOf(rest), want) {
+		t.Fatalf("remaining indices: got %v, want %v", indicesOf(rest), want)
+	}
+	if source.reads != 2 {
+		t.Fatalf("source reads after clearing: got %d, want 2", source.reads)
+	}
+	if last := source.heights[len(source.heights)-1]; last != 5 {
+		t.Fatalf("last read height: got %d, want 5", last)
+	}
+
+	ref := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+	want := indicesOf(drain(t, newBoundedFollower(t, ref, 0, 1)))
+	all := append(append([]uint64{0}, got...), indicesOf(rest)...)
+	if !reflect.DeepEqual(all, want) {
+		t.Fatalf("limited sequence %v differs from the unlimited one %v", all, want)
+	}
+}
+
+func TestReadAheadLimitAlreadyPassed(t *testing.T) {
+	source := &fakeSource{frontier: 7, moms: chain(1, 6, twoBlocksPerMomentum)}
+	f := newBoundedFollower(t, source, 4, 1)
+
+	if got := nextIndices(t, f, 4); !reflect.DeepEqual(got, []uint64{0, 1, 2, 3}) {
+		t.Fatalf("first four: got %v, want [0 1 2 3]", got)
+	}
+	if len(f.buf) != 0 {
+		t.Fatalf("buffer: got %d, want empty", len(f.buf))
+	}
+
+	f.LimitReadAhead(1, true)
+	if got := nextIndices(t, f, 1); !reflect.DeepEqual(got, []uint64{4}) {
+		t.Fatalf("next: got %v, want [4]", got)
+	}
+	if f.nextHeight != 4 {
+		t.Fatalf("nextHeight: got %d, want 4 (one momentum, not the bound of 4)", f.nextHeight)
+	}
+}
+
+func TestReadAheadLimitHeldTailDroppedOnFrontierError(t *testing.T) {
+	f, source := limitedAtTwo(t)
+	nextIndices(t, f, 3)
+
+	source.frontierErr = errors.New("frontier down")
+	_, ok, err := f.Next()
+	if ok || !errors.Is(err, ErrSourceRead) {
+		t.Fatalf("Next after the error: got (ok=%v, err=%v), want ErrSourceRead", ok, err)
+	}
+	if got := nextIndices(t, f, 1); !reflect.DeepEqual(got, []uint64{4}) {
+		t.Fatalf("next: got %v, want [4]", got)
+	}
+	if last := source.heights[len(source.heights)-1]; last != 3 {
+		t.Fatalf("last read height: got %d, want 3 (the tail was dropped and re-read)", last)
+	}
+}
+
 // --- assignment-driven input derivation ---
 
 func TestAssignmentAcceptedAndRejected(t *testing.T) {

@@ -76,6 +76,9 @@ var (
 	// a *ledger.ReorgError. The caller must discard this Driver and construct a fresh one over
 	// the rolled-back store instead of reusing it.
 	ErrDriverReorged = errors.New("batch: driver reused after a *ledger.ReorgError")
+	// ErrMisaligned reports that the input stream cannot end a batch at the lastInputSeq NextBatchTo
+	// was given: an input past it, or MaxBatchInputs inputs without reaching it.
+	ErrMisaligned = errors.New("batch: input stream does not end a batch at the accepted lastInputSeq")
 )
 
 // Driver runs the per-input execution pipeline against Config.Domain and Config.Store, slices
@@ -96,6 +99,10 @@ type Driver struct {
 	// carried is the first input of the next batch when a cap closed the previous one: computed
 	// through step 7, unapplied, resumed at step 8 by the next NextBatch call.
 	carried *applied
+
+	// open holds the records of a batch NextBatchTo has not closed yet, applied to the store and
+	// waiting for the input that ends the batch. It is nil otherwise.
+	open []applied
 
 	// reorged is set once NextBatch returns a *ledger.ReorgError, and makes every subsequent call
 	// fail with ErrDriverReorged instead of silently caching a stale root past an external
@@ -202,8 +209,28 @@ type applied struct {
 // PostStateRoot: cap evaluation (step 8) precedes Store.Apply, so the store never runs ahead of a
 // batch NextBatch has not yet returned. Those two cases break the invariant: the store is then
 // ahead of it by the dropped records' writes. Restoring it is the rollback's job after a reorg
-// and the restart's job after a cap-read error, never the Driver's.
+// and the restart's job after a cap-read error, never the Driver's. While d.open holds records
+// the store is likewise ahead of the last returned batch's PostStateRoot, by their writes, and
+// the caller must not commit.
 func (d *Driver) NextBatch() (Batch, bool, error) {
+	return d.nextBatch(0, false)
+}
+
+// NextBatchTo builds a batch that ends exactly on the input whose GlobalInputIndex is
+// lastInputSeq, the end of a batch Settlement already accepted. It closes on that record before
+// asking the source again, and never earlier: a drained source, a non-reorg source error and the
+// per-batch withdrawal cap and asset footprint do not close it, because Settlement checks no
+// withdrawal cap at acceptance and the accepted entry decides.
+//
+// A drained source or a non-reorg source error with records accumulated keeps them in the Driver
+// and returns (Batch{}, false, nil) or the wrapped error; the next call resumes from them. A
+// reorg, an input past lastInputSeq (ErrMisaligned) and MaxBatchInputs inputs without reaching
+// lastInputSeq (ErrMisaligned) drop the records, and every other error behaves as in NextBatch.
+func (d *Driver) NextBatchTo(lastInputSeq uint64) (Batch, bool, error) {
+	return d.nextBatch(lastInputSeq, true)
+}
+
+func (d *Driver) nextBatch(to uint64, aligned bool) (Batch, bool, error) {
 	if d.reorged {
 		return Batch{}, false, ErrDriverReorged
 	}
@@ -211,13 +238,22 @@ func (d *Driver) NextBatch() (Batch, bool, error) {
 	var records []applied
 	totals := batchTotals{}
 
-	if d.carried != nil {
+	if aligned {
+		records = d.open
+		d.open = nil
+	}
+
+	if len(records) == 0 && d.carried != nil {
 		rec := *d.carried
 		d.carried = nil
 
-		// isFirst=true: a breach here is ErrUnbatchable (edge case 5), never a close-and-carry,
-		// since this batch has nothing accumulated yet to close.
-		if _, err := admitCandidate(&totals, &rec, true); err != nil {
+		if aligned {
+			if rec.input.Ctx.GlobalInputIndex > to {
+				return Batch{}, false, misalignedAt(rec.input.Ctx.GlobalInputIndex, nil, to)
+			}
+		} else if _, err := admitCandidate(&totals, &rec, true); err != nil {
+			// isFirst=true: a breach here is ErrUnbatchable (edge case 5), never a close-and-carry,
+			// since this batch has nothing accumulated yet to close.
 			return Batch{}, false, err
 		}
 
@@ -228,7 +264,13 @@ func (d *Driver) NextBatch() (Batch, bool, error) {
 		records = append(records, rec)
 	}
 
+	closed := false
 	for len(records) < MaxBatchInputs {
+		if aligned && len(records) > 0 && records[len(records)-1].input.Ctx.GlobalInputIndex == to {
+			closed = true
+			break
+		}
+
 		in, ok, err := d.cfg.Inputs.Next()
 		if err != nil {
 			var reorgErr *ledger.ReorgError
@@ -239,13 +281,29 @@ func (d *Driver) NextBatch() (Batch, bool, error) {
 			if len(records) == 0 {
 				return Batch{}, false, fmt.Errorf("batch: %w", err)
 			}
+			if aligned {
+				d.open = records
+				return Batch{}, false, fmt.Errorf("batch: %w", err)
+			}
 			break
 		}
 		if !ok {
-			if len(records) == 0 {
+			if aligned && len(records) > 0 {
+				d.open = records
+			}
+			if len(records) == 0 || aligned {
 				return Batch{}, false, nil
 			}
 			break
+		}
+
+		if aligned && in.Ctx.GlobalInputIndex > to {
+			var prev *uint64
+			if len(records) > 0 {
+				p := records[len(records)-1].input.Ctx.GlobalInputIndex
+				prev = &p
+			}
+			return Batch{}, false, misalignedAt(in.Ctx.GlobalInputIndex, prev, to)
 		}
 
 		rec, err := d.computeRecord(in)
@@ -253,13 +311,15 @@ func (d *Driver) NextBatch() (Batch, bool, error) {
 			return Batch{}, false, err
 		}
 
-		admitted, err := admitCandidate(&totals, &rec, len(records) == 0)
-		if err != nil {
-			return Batch{}, false, err
-		}
-		if !admitted {
-			d.carried = &rec
-			break
+		if !aligned {
+			admitted, err := admitCandidate(&totals, &rec, len(records) == 0)
+			if err != nil {
+				return Batch{}, false, err
+			}
+			if !admitted {
+				d.carried = &rec
+				break
+			}
 		}
 
 		rec, err = d.finishApply(rec)
@@ -269,12 +329,29 @@ func (d *Driver) NextBatch() (Batch, bool, error) {
 		records = append(records, rec)
 	}
 
+	if aligned && !closed {
+		if records[len(records)-1].input.Ctx.GlobalInputIndex != to {
+			return Batch{}, false, fmt.Errorf("%w: %d inputs from %d to %d do not reach %d",
+				ErrMisaligned, len(records), records[0].input.Ctx.GlobalInputIndex,
+				records[len(records)-1].input.Ctx.GlobalInputIndex, to)
+		}
+	}
+
 	batch, err := d.assemble(records)
 	if err != nil {
 		return Batch{}, false, err
 	}
 	d.batchID++
 	return batch, true, nil
+}
+
+// misalignedAt wraps ErrMisaligned for an input whose index is past the batch's last input index
+// to, naming the previous record's index when there is one.
+func misalignedAt(index uint64, prev *uint64, to uint64) error {
+	if prev == nil {
+		return fmt.Errorf("%w: input %d is past %d", ErrMisaligned, index, to)
+	}
+	return fmt.Errorf("%w: input %d after input %d is past %d", ErrMisaligned, index, *prev, to)
 }
 
 // currentRoot returns the driver's cached pre-state root, seeded by one Store.Root() call at

@@ -13,6 +13,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
@@ -142,6 +143,24 @@ func TestBootAfterCommit(t *testing.T) {
 	}
 	if storeRoot(t, rdy.Store) != want.PostStateRoot {
 		t.Fatalf("loaded store root differs from the cursor's postStateRoot")
+	}
+}
+
+// TestBootAcceptsZeroRootAtNonzeroSeq pins that a domain whose state is still empty, so its root
+// is the zero hash, boots from its own cursor at a non-zero input sequence.
+func TestBootAcceptsZeroRootAtNonzeroSeq(t *testing.T) {
+	cfg := testConfig(t, 4)
+	c := newCommitter(t, cfg, 0)
+	pos := Position{MomentumHeight: 1, MomentumHash: canonHash(1, 0), LastInputSeq: 3, NextBatchID: 2, NextOrdinal: 4}
+	if err := Commit(cfg, c.store, pos, nil, c.ring(1, 1)); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	c.store.Close()
+	cfg.Momenta = newChainSource(6, 0)
+
+	rdy := mustBoot(t, cfg)
+	if rdy.Fresh || rdy.Position != pos {
+		t.Fatalf("Position = %+v (fresh %v), want %+v", rdy.Position, rdy.Fresh, pos)
 	}
 }
 
@@ -782,4 +801,152 @@ func TestRollbackWindowAnchoring(t *testing.T) {
 			t.Fatalf("cursor survives a rollback to genesis")
 		}
 	})
+}
+
+// --- Unfinalized ---
+
+func unfinalizedCommitment(id, first, last uint64) codec.BatchCommitment {
+	return codec.BatchCommitment{
+		Versions: codec.Versions{
+			ProtocolVersion:        codec.ProtocolVersion,
+			RuntimeProfileVersion:  codec.RuntimeProfileVersion,
+			MeteringVersion:        codec.MeteringVersion,
+			SerializationVersion:   codec.SerializationVersion,
+			StateDiffVersion:       codec.StateDiffVersion,
+			ExecutionResultVersion: codec.ExecutionResultVersion,
+			ReceiptVersion:         codec.ReceiptVersion,
+			OutboxVersion:          codec.OutboxVersion,
+			DAModeVersion:          codec.DAModeVersion,
+		},
+		DomainID:      1,
+		BatchID:       id,
+		FirstInputSeq: first,
+		LastInputSeq:  last,
+		PreStateRoot:  types.Hash{0x10, byte(id)},
+		PostStateRoot: types.Hash{0x20, byte(id)},
+		DAHash:        types.Hash{0x30, byte(id)},
+		ExecutorID:    types.Address{0x08},
+	}
+}
+
+// recordOf copies each field the loop copies from a commitment into a record.
+func recordOf(t *testing.T, c codec.BatchCommitment, withCommitment bool) BatchRecord {
+	t.Helper()
+	rec := BatchRecord{
+		BatchID: c.BatchID, Status: StatusBuilt, FirstInputSeq: c.FirstInputSeq, LastInputSeq: c.LastInputSeq,
+		PreStateRoot: c.PreStateRoot, PostStateRoot: c.PostStateRoot, DAHash: c.DAHash,
+	}
+	if withCommitment {
+		enc, err := c.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		rec.Commitment = enc
+	}
+	return rec
+}
+
+func writeRecord(t *testing.T, l Layout, rec BatchRecord) {
+	t.Helper()
+	if err := os.MkdirAll(l.Batches, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(batchPath(l, rec.BatchID), rec); err != nil {
+		t.Fatalf("writeJSON: %v", err)
+	}
+}
+
+func TestUnfinalized(t *testing.T) {
+	newLayout := func(t *testing.T) Layout {
+		l, err := NewLayout(t.TempDir(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+	c0 := unfinalizedCommitment(0, 1, 3)
+	c1 := unfinalizedCommitment(1, 4, 6)
+	c2 := unfinalizedCommitment(2, 7, 9)
+
+	t.Run("no anchor and an anchor", func(t *testing.T) {
+		l := newLayout(t)
+		for _, c := range []codec.BatchCommitment{c2, c0, c1} {
+			writeRecord(t, l, recordOf(t, c, true))
+		}
+		got, err := Unfinalized(l, Anchor{}, false)
+		if err != nil {
+			t.Fatalf("Unfinalized: %v", err)
+		}
+		want := []codec.BatchCommitment{c0, c1, c2}
+		if len(got) != len(want) {
+			t.Fatalf("got %d commitments, want %d", len(got), len(want))
+		}
+		for i := range want {
+			g, _ := got[i].Encode()
+			w, _ := want[i].Encode()
+			if !reflect.DeepEqual(g, w) {
+				t.Fatalf("commitment %d = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+
+		got, err = Unfinalized(l, Anchor{LastInputSeq: c0.LastInputSeq}, true)
+		if err != nil || len(got) != 2 || got[0].BatchID != 1 || got[1].BatchID != 2 {
+			t.Fatalf("anchored Unfinalized = %+v, %v, want batches 1 and 2", got, err)
+		}
+	})
+
+	t.Run("missing commitment", func(t *testing.T) {
+		l := newLayout(t)
+		writeRecord(t, l, recordOf(t, c0, false))
+		_, err := Unfinalized(l, Anchor{}, false)
+		if !errors.Is(err, ErrHalted) || !strings.Contains(err.Error(), "batch record 0") || !strings.Contains(err.Error(), "re-sync") {
+			t.Fatalf("Unfinalized = %v, want an ErrHalted naming batch 0 and the re-sync remedy", err)
+		}
+		got, err := Unfinalized(l, Anchor{LastInputSeq: c0.LastInputSeq}, true)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("at the anchor: %+v, %v, want skipped silently", got, err)
+		}
+	})
+
+	t.Run("corrupt commitment", func(t *testing.T) {
+		l := newLayout(t)
+		rec := recordOf(t, c1, true)
+		rec.Commitment = rec.Commitment[:len(rec.Commitment)-3]
+		writeRecord(t, l, rec)
+		_, err := Unfinalized(l, Anchor{}, false)
+		if !errors.Is(err, ErrHalted) || !strings.Contains(err.Error(), "batch record 1") || !strings.Contains(err.Error(), "re-sync") {
+			t.Fatalf("Unfinalized = %v, want an ErrHalted naming batch 1 and the re-sync remedy", err)
+		}
+	})
+
+	// The record keeps its own fields; the stored commitment differs in exactly one.
+	mismatches := []struct {
+		name   string
+		mutate func(*codec.BatchCommitment)
+	}{
+		{"BatchID", func(c *codec.BatchCommitment) { c.BatchID++ }},
+		{"FirstInputSeq", func(c *codec.BatchCommitment) { c.FirstInputSeq++ }},
+		{"LastInputSeq", func(c *codec.BatchCommitment) { c.LastInputSeq++ }},
+		{"DAHash", func(c *codec.BatchCommitment) { c.DAHash[0] ^= 0xff }},
+		{"PreStateRoot", func(c *codec.BatchCommitment) { c.PreStateRoot[0] ^= 0xff }},
+		{"PostStateRoot", func(c *codec.BatchCommitment) { c.PostStateRoot[0] ^= 0xff }},
+	}
+	for _, m := range mismatches {
+		t.Run("disagreeing "+m.name, func(t *testing.T) {
+			l := newLayout(t)
+			rec := recordOf(t, c1, false)
+			other := c1
+			m.mutate(&other)
+			enc, err := other.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec.Commitment = enc
+			writeRecord(t, l, rec)
+			_, err = Unfinalized(l, Anchor{}, false)
+			if !errors.Is(err, ErrHalted) || !strings.Contains(err.Error(), "disagrees") || !strings.Contains(err.Error(), "re-sync") {
+				t.Fatalf("Unfinalized = %v, want an ErrHalted naming the disagreement and the re-sync remedy", err)
+			}
+		})
+	}
 }

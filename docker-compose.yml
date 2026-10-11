@@ -31,4 +31,7 @@ volumes:
 
 secrets:
   executor_key:
+    # bd2b1f4b42334f923064f466ed5590379498585b2dd4e42152db0e5ddbe2023e
+    # is the public seed of devnet account index 3, for the devnet
+    # only, never for any other network.
     environment: EXECUTOR_KEY

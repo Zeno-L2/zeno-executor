@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
@@ -65,6 +66,7 @@ func validTable() []msgCase {
 			Role:              "EXECUTOR",
 			NetworkName:       "test",
 			StoragePath:       "/data",
+			MaxPendingBatches: 8,
 		}},
 		{"frontier", Supervisor, Frontier{Height: 12}},
 		{"momentum", Supervisor, testMomentum()},
@@ -76,6 +78,8 @@ func validTable() []msgCase {
 		{"momentaRequest", Worker, MomentaRequest{Height: 1, Count: 10}},
 		{"anchorRequest", Worker, AnchorRequest{}},
 		{"committed", Worker, Committed{Commitment: validCommitment()}},
+		{"retract", Worker, Retract{FromBatchID: 5}},
+		{"recovered", Worker, Recovered{Commitment: validCommitment()}},
 		{"assignmentRequest", Worker, AssignmentRequest{Height: 9, Hash: types.Hash{0x0A}, NextOrdinal: 3}},
 		{"assignment", Supervisor, Assignment{Entries: []ledger.AssignmentEntry{
 			{Ordinal: 3, GlobalInputIndex: 10, SourceAccountBlockHash: types.Hash{0x01}, SendMomentumHeight: 7},
@@ -84,6 +88,11 @@ func validTable() []msgCase {
 		{"assignmentEmpty", Supervisor, Assignment{}},
 		{"capRequest", Worker, CapRequest{Height: 9, Hash: types.Hash{1}, Assets: []codec.AssetID{codec.AssetIDFromZTS(types.ZnnTokenStandard), codec.AssetIDFromZTS(types.QsrTokenStandard)}}},
 		{"cap", Supervisor, Cap{Amounts: []codec.U256{{31: 7}, {31: 8}}}},
+		{"cursorRequest", Worker, CursorRequest{}},
+		{"cursor", Supervisor, Cursor{NextBatchID: 12}},
+		{"acceptedRequest", Worker, AcceptedRequest{FromBatchID: 6}},
+		{"accepted", Supervisor, Accepted{NextBatchID: 9, Entries: []*definition.BatchEntry{acceptedEntry(6, 0), acceptedEntry(7, 100)}}},
+		{"acceptedEmpty", Supervisor, Accepted{NextBatchID: 9}},
 	}
 }
 
@@ -152,6 +161,7 @@ func TestStr16Overrun(t *testing.T) {
 		Role:              "R",
 		NetworkName:       "N",
 		StoragePath:       "S",
+		MaxPendingBatches: 1,
 	}
 	enc, err := Encode(cfg)
 	if err != nil {
@@ -259,6 +269,7 @@ func handEncodeConfig(t *testing.T, c WorkerConfig) []byte {
 	w.str16(c.Role)
 	w.str16(c.NetworkName)
 	w.str16(c.StoragePath)
+	w.u64(c.MaxPendingBatches)
 	frame, err := assembleFrame(TypeConfig, w.buf, MaxFrame)
 	if err != nil {
 		t.Fatalf("assembleFrame: %v", err)
@@ -280,8 +291,8 @@ func handEncodeSourceError(t *testing.T, s SourceError) []byte {
 
 func TestUnknownTypes(t *testing.T) {
 	known := map[byte]bool{
-		0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x05: true, 0x06: true, 0x07: true, 0x08: true,
-		0x81: true, 0x82: true, 0x83: true, 0x84: true, 0x85: true, 0x86: true,
+		0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x05: true, 0x06: true, 0x07: true, 0x08: true, 0x09: true,
+		0x81: true, 0x82: true, 0x83: true, 0x84: true, 0x85: true, 0x86: true, 0x87: true, 0x88: true, 0x89: true,
 	}
 	for b := 0; b <= 0xff; b++ {
 		if known[byte(b)] {
@@ -558,4 +569,218 @@ func handEncodeAssignment(t *testing.T, n uint32, entries int) []byte {
 		t.Fatalf("assembleFrame: %v", err)
 	}
 	return frame
+}
+
+func TestCursorRequestRejectsPayload(t *testing.T) {
+	frame, err := assembleFrame(TypeCursorRequest, []byte{0x00}, MaxWorkerFrame)
+	if err != nil {
+		t.Fatalf("assembleFrame: %v", err)
+	}
+	if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("non-empty CursorRequest: err = %v, want ErrMalformed", err)
+	}
+}
+
+func TestConfigCarriesMaxPendingBatches(t *testing.T) {
+	enc, err := Encode(WorkerConfig{DomainID: 1, Role: "R", NetworkName: "N", StoragePath: "S", MaxPendingBatches: 64})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	m, err := ReadMessage(bytes.NewReader(enc), Supervisor)
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if got := m.(WorkerConfig).MaxPendingBatches; got != 64 {
+		t.Fatalf("MaxPendingBatches = %d, want 64", got)
+	}
+}
+
+// acceptedEntry builds an entry with every wire-carried field set to a value derived from id and
+// an asset flow summary of summaryLen bytes.
+func acceptedEntry(id uint64, summaryLen int) *definition.BatchEntry {
+	e := &definition.BatchEntry{
+		ProtocolVersion: uint16(10 + id),
+		FirstInputSeq:   id * 10,
+		LastInputSeq:    id*10 + 4,
+		PreStateRoot:    types.Hash{0x11, byte(id)},
+		PostStateRoot:   types.Hash{0x12, byte(id)},
+		InputRoot:       types.Hash{0x13, byte(id)},
+		ReceiptRoot:     types.Hash{0x14, byte(id)},
+		EventRoot:       types.Hash{0x15, byte(id)},
+		OutboxRoot:      types.Hash{0x16, byte(id)},
+		DaHash:          types.Hash{0x17, byte(id)},
+		DaMode:          1,
+		ProofData:       []byte{},
+	}
+	e.BatchId = id
+	if summaryLen > 0 {
+		e.AssetFlowSummary = bytes.Repeat([]byte{byte(id)}, summaryLen)
+	}
+	return e
+}
+
+func readAs(t *testing.T, m Message, side Side) Message {
+	t.Helper()
+	enc, err := Encode(m)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := ReadMessage(bytes.NewReader(enc), side)
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	return got
+}
+
+func TestAcceptedRequestRoundTrip(t *testing.T) {
+	got := readAs(t, AcceptedRequest{FromBatchID: 1<<40 + 3}, Worker)
+	if got != (AcceptedRequest{FromBatchID: 1<<40 + 3}) {
+		t.Fatalf("got %+v, want FromBatchID %d", got, uint64(1<<40+3))
+	}
+}
+
+func TestAcceptedRoundTripCarriesEveryField(t *testing.T) {
+	in := Accepted{NextBatchID: 9, Entries: []*definition.BatchEntry{acceptedEntry(6, 0), acceptedEntry(7, 100)}}
+	in.Entries[1].ProofData = []byte{1, 2, 3}
+	got := readAs(t, in, Supervisor).(Accepted)
+
+	if got.NextBatchID != 9 || len(got.Entries) != 2 {
+		t.Fatalf("got NextBatchID %d with %d entries, want 9 with 2", got.NextBatchID, len(got.Entries))
+	}
+	for i, e := range got.Entries {
+		w := in.Entries[i]
+		if e.BatchId != w.BatchId || e.ProtocolVersion != w.ProtocolVersion || e.FirstInputSeq != w.FirstInputSeq ||
+			e.LastInputSeq != w.LastInputSeq || e.DaMode != w.DaMode {
+			t.Fatalf("entry %d scalars = %+v, want %+v", i, e, w)
+		}
+		for name, pair := range map[string][2]types.Hash{
+			"PreStateRoot": {e.PreStateRoot, w.PreStateRoot}, "PostStateRoot": {e.PostStateRoot, w.PostStateRoot},
+			"InputRoot": {e.InputRoot, w.InputRoot}, "ReceiptRoot": {e.ReceiptRoot, w.ReceiptRoot},
+			"EventRoot": {e.EventRoot, w.EventRoot}, "OutboxRoot": {e.OutboxRoot, w.OutboxRoot}, "DaHash": {e.DaHash, w.DaHash},
+		} {
+			if pair[0] != pair[1] {
+				t.Fatalf("entry %d %s = %x, want %x", i, name, pair[0], pair[1])
+			}
+		}
+		if !bytes.Equal(e.AssetFlowSummary, w.AssetFlowSummary) || !bytes.Equal(e.ProofData, w.ProofData) {
+			t.Fatalf("entry %d byte fields differ: summary %x proof %x", i, e.AssetFlowSummary, e.ProofData)
+		}
+		if e.DomainId != 0 || e.ExecutorPillar != "" || e.SubmittedAtHeight != 0 || e.FinalizeAtHeight != 0 || e.State != 0 {
+			t.Fatalf("entry %d carries a field outside the wire format: %+v", i, e)
+		}
+	}
+	if len(got.Entries[1].AssetFlowSummary) != 100 {
+		t.Fatalf("AssetFlowSummary length = %d, want 100", len(got.Entries[1].AssetFlowSummary))
+	}
+}
+
+func TestAcceptedDecodeCopiesByteFields(t *testing.T) {
+	enc, err := Encode(Accepted{NextBatchID: 9, Entries: []*definition.BatchEntry{acceptedEntry(1, 8)}})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := ReadMessage(bytes.NewReader(enc), Supervisor)
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	e := got.(Accepted).Entries[0]
+	want := append([]byte(nil), e.AssetFlowSummary...)
+	for i := range enc {
+		enc[i] = 0xEE
+	}
+	if !bytes.Equal(e.AssetFlowSummary, want) {
+		t.Fatalf("AssetFlowSummary aliases the frame buffer")
+	}
+}
+
+func TestAcceptedEntryLimits(t *testing.T) {
+	// The limit is 64 entries, one Settlement batch's input cap.
+	if MaxAcceptedEntries != 64 {
+		t.Fatalf("MaxAcceptedEntries = %d, want 64", MaxAcceptedEntries)
+	}
+	entries := func(n int) []*definition.BatchEntry {
+		out := make([]*definition.BatchEntry, n)
+		for i := range out {
+			out[i] = acceptedEntry(uint64(i), 0)
+		}
+		return out
+	}
+
+	if _, err := Encode(Accepted{NextBatchID: 100, Entries: entries(64)}); err != nil {
+		t.Fatalf("Encode of 64 entries: %v", err)
+	}
+	if _, err := Encode(Accepted{NextBatchID: 100, Entries: entries(65)}); err == nil {
+		t.Fatalf("Encode of 65 entries succeeded")
+	}
+	if _, err := Encode(Accepted{NextBatchID: 100, Entries: []*definition.BatchEntry{nil}}); err == nil {
+		t.Fatalf("Encode of a nil entry succeeded")
+	}
+
+	// A frame that claims 65 well-formed entries is malformed because of the count alone.
+	one, err := Encode(Accepted{NextBatchID: 100, Entries: entries(1)})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	entry := one[5+8+4:]
+	w := &pwriter{}
+	w.u64(100)
+	w.u32(65)
+	for i := 0; i < 65; i++ {
+		w.raw(entry)
+	}
+	frame, err := assembleFrame(TypeAccepted, w.buf, MaxFrame)
+	if err != nil {
+		t.Fatalf("assembleFrame: %v", err)
+	}
+	if _, err := ReadMessage(bytes.NewReader(frame), Supervisor); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("count 65: err = %v, want ErrMalformed", err)
+	}
+
+	w = &pwriter{}
+	w.u64(100)
+	w.u32(64)
+	for i := 0; i < 64; i++ {
+		w.raw(entry)
+	}
+	frame, err = assembleFrame(TypeAccepted, w.buf, MaxFrame)
+	if err != nil {
+		t.Fatalf("assembleFrame: %v", err)
+	}
+	if _, err := ReadMessage(bytes.NewReader(frame), Supervisor); err != nil {
+		t.Fatalf("count 64: %v", err)
+	}
+}
+
+func TestAcceptedRequestRejectsWrongLength(t *testing.T) {
+	for _, n := range []int{7, 9} {
+		frame, err := assembleFrame(TypeAcceptedRequest, make([]byte, n), MaxWorkerFrame)
+		if err != nil {
+			t.Fatalf("assembleFrame: %v", err)
+		}
+		if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("%d-byte AcceptedRequest: err = %v, want ErrMalformed", n, err)
+		}
+	}
+}
+
+func TestAcceptedIsReadOnlyFromItsSide(t *testing.T) {
+	for _, c := range []struct {
+		m    Message
+		from Side
+		bad  Side
+	}{
+		{Accepted{NextBatchID: 1}, Supervisor, Worker},
+		{AcceptedRequest{FromBatchID: 1}, Worker, Supervisor},
+	} {
+		enc, err := Encode(c.m)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		if _, err := ReadMessage(bytes.NewReader(enc), c.from); err != nil {
+			t.Fatalf("%T from its own side: %v", c.m, err)
+		}
+		if _, err := ReadMessage(bytes.NewReader(enc), c.bad); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("%T from the other side: err = %v, want ErrMalformed", c.m, err)
+		}
+	}
 }

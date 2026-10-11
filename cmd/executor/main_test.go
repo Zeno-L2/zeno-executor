@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -262,12 +263,19 @@ func runWithProbe(t *testing.T, marker string, keySource map[string]any, inherit
 
 	storage := openTempDir(t)
 
+	seed, err := hex.DecodeString(marker)
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	executorAddress := types.PubKeyToAddress(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey))
+
 	fx := znndtest.Load(t)
 	node := znndtest.NewServer(t, fx, fx.ReadHeight+2)
 
 	cfg := map[string]any{
-		"executorAddress":     types.Address{0x01}.String(),
+		"executorAddress":     executorAddress.String(),
 		"networkName":         "test",
+		"pillarName":          "test",
 		"znndEndpoint":        node.URL,
 		"confirmationDepth":   float64(2),
 		"storagePath":         storage,
@@ -413,12 +421,13 @@ func runWithProbe(t *testing.T, marker string, keySource map[string]any, inherit
 	}
 	wantCfg := ipc.WorkerConfig{
 		DomainID:          1,
-		ExecutorAddress:   types.Address{0x01},
+		ExecutorAddress:   executorAddress,
 		STFSpecHash:       types.HexToHashPanic(validHash),
 		ConfirmationDepth: 2,
 		Role:              "EXECUTOR",
 		NetworkName:       "test",
 		StoragePath:       storage,
+		MaxPendingBatches: 8,
 	}
 	if gotCfg != wantCfg {
 		t.Errorf("Config frame = %+v, want %+v", gotCfg, wantCfg)
@@ -635,5 +644,52 @@ func TestWaitForNode(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("waitForNode did not return while a check was in flight")
+	}
+}
+
+func TestBootRejectsMismatchedKey(t *testing.T) {
+	seed := newMarker(t)
+	cfg := map[string]any{
+		"executorAddress":   types.Address{0x01}.String(),
+		"networkName":       "test",
+		"pillarName":        "test",
+		"znndEndpoint":      "http://127.0.0.1:1",
+		"confirmationDepth": float64(2),
+		"storagePath":       openTempDir(t),
+		"submissionKeySource": map[string]any{
+			"kind": "ENV",
+			"name": "EXECUTOR_KEY",
+		},
+		"workers": []any{
+			map[string]any{
+				"domainId":    float64(1),
+				"binary":      probeBin,
+				"role":        "EXECUTOR",
+				"stfSpecHash": validHash,
+				"memoryLimit": float64(268435456),
+				"cpuLimit":    1.0,
+			},
+		},
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "executor.json")
+	if err := os.WriteFile(cfgPath, b, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := exec.Command(executorBin, "-config", cfgPath)
+	cmd.Env = append(os.Environ(), "EXECUTOR_KEY="+seed)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 78 {
+		t.Fatalf("Run = %v, want exit status 78; stderr:\n%s", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), seed) {
+		t.Errorf("seed found in supervisor stderr")
 	}
 }

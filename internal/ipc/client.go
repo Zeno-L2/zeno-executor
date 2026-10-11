@@ -7,6 +7,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
@@ -196,6 +197,73 @@ func (c *Client) FinalizedAnchor(domainID uint32) (recovery.Anchor, bool, error)
 	}
 }
 
+// NextBatchID implements runtime.CursorSource: it returns the supervisor's observed
+// nextBatchId for the domain. A domainID other than the one ReadConfig returned is a plain
+// error: nothing is sent and the client stays healthy.
+func (c *Client) NextBatchID(domainID uint32) (uint64, error) {
+	if c.broken != nil {
+		return 0, c.broken
+	}
+	if !c.haveDomainID || domainID != c.domainID {
+		return 0, fmt.Errorf("ipc: domainId %d is not this worker's configured domain", domainID)
+	}
+	if err := c.send(CursorRequest{}); err != nil {
+		return 0, err
+	}
+	m, err := c.recv()
+	if err != nil {
+		return 0, err
+	}
+	switch v := m.(type) {
+	case Cursor:
+		return v.NextBatchID, nil
+	case SourceError:
+		return 0, sourceErr(v)
+	default:
+		return 0, c.fail(fmt.Errorf("ipc: unexpected reply %T to a cursor request", m))
+	}
+}
+
+// AcceptedEntries implements runtime.CursorSource: it returns the supervisor's observed
+// nextBatchId and Settlement's accepted entries for consecutive batchIds from `from`. A domainID
+// other than the one ReadConfig returned is a plain error: nothing is sent and the client stays
+// healthy. A reply whose entries are not consecutive from `from`, not below its nextBatchId, or
+// empty while `from` is below it breaks the channel.
+func (c *Client) AcceptedEntries(domainID uint32, from uint64) (uint64, []*definition.BatchEntry, error) {
+	if c.broken != nil {
+		return 0, nil, c.broken
+	}
+	if !c.haveDomainID || domainID != c.domainID {
+		return 0, nil, fmt.Errorf("ipc: domainId %d is not this worker's configured domain", domainID)
+	}
+	if err := c.send(AcceptedRequest{FromBatchID: from}); err != nil {
+		return 0, nil, err
+	}
+	m, err := c.recv()
+	if err != nil {
+		return 0, nil, err
+	}
+	switch v := m.(type) {
+	case Accepted:
+		for i, e := range v.Entries {
+			if want := from + uint64(i); e.BatchId != want {
+				return 0, nil, c.fail(fmt.Errorf("ipc: accepted entry %d has batchId %d, want %d", i, e.BatchId, want))
+			}
+			if e.BatchId >= v.NextBatchID {
+				return 0, nil, c.fail(fmt.Errorf("ipc: accepted entry %d has batchId %d, not below nextBatchId %d", i, e.BatchId, v.NextBatchID))
+			}
+		}
+		if len(v.Entries) == 0 && from < v.NextBatchID {
+			return 0, nil, c.fail(fmt.Errorf("ipc: no accepted entries from batch %d below nextBatchId %d", from, v.NextBatchID))
+		}
+		return v.NextBatchID, v.Entries, nil
+	case SourceError:
+		return 0, nil, sourceErr(v)
+	default:
+		return 0, nil, c.fail(fmt.Errorf("ipc: unexpected reply %T to an accepted request", m))
+	}
+}
+
 // Assignment implements ledger.AssignmentSource. A domainID other than the one ReadConfig
 // returned, or height 0, is a plain error: nothing is sent and the client stays healthy.
 func (c *Client) Assignment(domainID uint32, height uint64, hash types.Hash, nextOrdinal uint64) ([]ledger.AssignmentEntry, error) {
@@ -263,6 +331,23 @@ func (c *Client) MaxBatchWithdrawals(domainID uint32, height uint64, hash types.
 	default:
 		return nil, c.fail(fmt.Errorf("ipc: unexpected reply %T to a cap request", m))
 	}
+}
+
+// ReportRecovered implements runtime.Config.OnRecover: it writes Retract{FromBatchID:
+// nextBatchID}, then one Recovered frame per commitment, in order, and reads no reply.
+func (c *Client) ReportRecovered(nextBatchID uint64, cs []codec.BatchCommitment) error {
+	if c.broken != nil {
+		return c.broken
+	}
+	if err := c.send(Retract{FromBatchID: nextBatchID}); err != nil {
+		return err
+	}
+	for _, cm := range cs {
+		if err := c.send(Recovered{Commitment: cm}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReportCommitted implements runtime.Config.OnCommit: it writes one Committed frame per

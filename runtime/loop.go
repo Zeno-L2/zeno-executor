@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/digitalSloth/go-executor/internal/settlement"
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
@@ -41,13 +43,24 @@ var commitInputInterval = 1024
 // wrapper first and gets ok == false with nothing accumulated. Nothing is lost — that batch
 // closed at a safe boundary and the commit step already took it — and the cost is one
 // pollInterval before the loop asks again.
+//
+// stop forces the same boundary as the interval does, at the next checkpoint. The loop sets it
+// while the batches above Settlement's nextBatchId have reached MaxPendingBatches and clears it
+// once the cursor shows room.
+//
+// While align is set the loop is building a batch Settlement already accepted, which closes only
+// at its accepted lastInputSeq; a fire could not close it and would only cost a pollInterval
+// sleep, so Next never reports the source drained. delivered keeps counting, so the first batch
+// after the aligned stretch fires at the next checkpoint.
 type commitBoundary struct {
 	follower  *ledger.Follower
 	delivered int
+	stop      bool
+	align     bool
 }
 
 func (s *commitBoundary) Next() (ledger.Input, bool, error) {
-	if s.delivered >= commitInputInterval {
+	if !s.align && (s.stop || s.delivered >= commitInputInterval) {
 		if _, ok := s.follower.Checkpoint(); ok {
 			s.delivered = 0
 			return ledger.Input{}, false, nil
@@ -72,6 +85,16 @@ type loop struct {
 	store    *state.Store
 	follower *ledger.Follower
 	driver   *batch.Driver
+	boundary *commitBoundary
+
+	// chainNext is the highest Settlement nextBatchId the loop has read, 0 before any read.
+	chainNext uint64
+
+	// accepted holds Settlement's accepted entries for consecutive batchIds starting at the next
+	// batch to build, all below chainNext. recheck is set at each (re)start and after an aligned
+	// batch is consumed, so an empty window is refetched only then.
+	accepted []*definition.BatchEntry
+	recheck  bool
 
 	pos   recovery.Position
 	fresh bool
@@ -121,21 +144,23 @@ func (l *loop) build(rdy recovery.Ready) error {
 	if err != nil {
 		return err
 	}
+	boundary := &commitBoundary{follower: follower}
 	driver, err := batch.New(batch.Config{
 		DomainID:     l.cfg.DomainID,
 		ExecutorID:   l.executor,
 		Domain:       l.dom,
 		Store:        rdy.Store,
-		Inputs:       &commitBoundary{follower: follower},
+		Inputs:       boundary,
 		Bundles:      l.bundles,
 		FirstBatchID: rdy.Position.NextBatchID,
 	})
 	if err != nil {
 		return err
 	}
-	l.store, l.follower, l.driver = rdy.Store, follower, driver
+	l.store, l.follower, l.driver, l.boundary = rdy.Store, follower, driver, boundary
 	l.pos, l.fresh = rdy.Position, rdy.Fresh
 	l.pending = nil
+	l.accepted, l.recheck = nil, true
 	return nil
 }
 
@@ -147,6 +172,10 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 	}
 	defer func() { l.store.Close() }()
 
+	if err := l.reportRecovered(); err != nil {
+		return err
+	}
+
 	policy := l.cfg.Retry.WithDefaults()
 	sourceFailures := 0
 	for {
@@ -154,7 +183,64 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 			return nil
 		}
 
-		b, ok, err := l.driver.NextBatch()
+		if l.above() >= l.cfg.MaxPendingBatches {
+			if len(l.pending) > 0 {
+				l.boundary.stop = true
+			} else {
+				n, err := l.cfg.Cursor.NextBatchID(l.cfg.DomainID)
+				if errors.Is(err, recovery.ErrHalted) {
+					return err
+				}
+				if err != nil {
+					sourceFailures++
+					if sourceFailures >= policy.SourceAttempts {
+						return fmt.Errorf("%w: cursor source failed %d times in a row: %w", recovery.ErrSourceUnavailable, sourceFailures, err)
+					}
+					if !sleep(ctx, policy.SourceInterval) {
+						return nil
+					}
+					continue
+				}
+				sourceFailures = 0
+				l.chainNext = n
+				if l.above() >= l.cfg.MaxPendingBatches {
+					if !sleep(ctx, pollInterval) {
+						return nil
+					}
+					continue
+				}
+				l.boundary.stop = false
+			}
+		}
+
+		id := l.pos.NextBatchID + uint64(len(l.pending))
+		e, err := l.acceptedFor(id)
+		if errors.Is(err, recovery.ErrHalted) {
+			return err
+		}
+		if err != nil {
+			sourceFailures++
+			if sourceFailures >= policy.SourceAttempts {
+				return fmt.Errorf("%w: accepted-entry source failed %d times in a row: %w", recovery.ErrSourceUnavailable, sourceFailures, err)
+			}
+			if !sleep(ctx, policy.SourceInterval) {
+				return nil
+			}
+			continue
+		}
+		l.boundary.align = e != nil
+
+		var (
+			b  batch.Batch
+			ok bool
+		)
+		if e != nil {
+			l.follower.LimitReadAhead(e.LastInputSeq, true)
+			b, ok, err = l.driver.NextBatchTo(e.LastInputSeq)
+		} else {
+			l.follower.LimitReadAhead(0, false)
+			b, ok, err = l.driver.NextBatch()
+		}
 		var reorg *ledger.ReorgError
 		switch {
 		case errors.As(err, &reorg):
@@ -179,12 +265,21 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 				return nil
 			}
 			continue
+		case errors.Is(err, batch.ErrMisaligned):
+			return l.misaligned(id, err)
 		case err != nil:
 			return halt(err)
 		}
 		sourceFailures = 0
 
 		if ok {
+			if e != nil {
+				if err := settlement.EntryMatches(e, b.Commitment); err != nil {
+					return l.misaligned(id, err)
+				}
+				l.accepted = l.accepted[1:]
+				l.recheck = true
+			}
 			if l.verify {
 				if err := l.checkAnchor(b); err != nil {
 					return err
@@ -201,6 +296,48 @@ func (l *loop) run(ctx context.Context, rdy recovery.Ready) error {
 			return nil
 		}
 	}
+}
+
+// acceptedFor returns Settlement's accepted entry for batch id, or nil when id is not below
+// Settlement's nextBatchId. It fetches a window of entries only when it holds none for id and
+// either id is below the highest nextBatchId read or recheck is set, which happens at each
+// (re)start and after an aligned batch is consumed.
+func (l *loop) acceptedFor(id uint64) (*definition.BatchEntry, error) {
+	if len(l.accepted) > 0 {
+		return l.accepted[0], nil
+	}
+	if id >= l.chainNext && !l.recheck {
+		return nil, nil
+	}
+	next, entries, err := l.cfg.Cursor.AcceptedEntries(l.cfg.DomainID, id)
+	if err != nil {
+		return nil, err
+	}
+	l.chainNext = next
+	l.accepted = entries
+	l.recheck = false
+	if len(entries) > 0 {
+		return entries[0], nil
+	}
+	if id < next {
+		return nil, fmt.Errorf("runtime: no accepted entry returned for batch %d below nextBatchId %d", id, next)
+	}
+	return nil, nil
+}
+
+// misaligned halts the domain: the rebuilt batch id does not reproduce Settlement's accepted
+// entry, or the input stream cannot end a batch where the entry does.
+func (l *loop) misaligned(id uint64, cause error) error {
+	return halt(fmt.Errorf("batch %d does not reproduce Settlement's accepted entry: %w: stop the executor, remove %s and re-sync; a re-sync that halts here again means this build does not reproduce the accepted batches", id, cause, l.rcfg.Layout.Root))
+}
+
+// above is how many batches, committed or pending, sit above the highest nextBatchId read.
+func (l *loop) above() uint64 {
+	total := l.pos.NextBatchID + uint64(len(l.pending))
+	if total <= l.chainNext {
+		return 0
+	}
+	return total - l.chainNext
 }
 
 // commitStep commits the pending records when the follower is at a safe boundary: it holds no
@@ -236,6 +373,10 @@ func (l *loop) commitStep() error {
 	}
 	records := make([]recovery.BatchRecord, len(l.pending))
 	for i, c := range l.pending {
+		enc, err := c.Encode()
+		if err != nil {
+			return halt(fmt.Errorf("encode commitment of batch %d: %w", c.BatchID, err))
+		}
 		records[i] = recovery.BatchRecord{
 			BatchID:       c.BatchID,
 			Status:        recovery.StatusBuilt,
@@ -244,6 +385,7 @@ func (l *loop) commitStep() error {
 			PreStateRoot:  c.PreStateRoot,
 			PostStateRoot: c.PostStateRoot,
 			DAHash:        c.DAHash,
+			Commitment:    enc,
 		}
 	}
 	// Every recovery.Commit failure is transient. That covers its write failures and its
@@ -348,6 +490,22 @@ func (l *loop) reorg() error {
 	if err := l.build(rdy); err != nil {
 		rdy.Store.Close()
 		return halt(err)
+	}
+	return l.reportRecovered()
+}
+
+// reportRecovered hands OnRecover the commitments of every batch the run holds above the
+// finalized anchor, at the position the loop has just reached.
+func (l *loop) reportRecovered() error {
+	if l.cfg.OnRecover == nil {
+		return nil
+	}
+	cs, err := recovery.Unfinalized(l.rcfg.Layout, l.anchor, l.haveAnchor)
+	if err != nil {
+		return halt(err)
+	}
+	if err := l.cfg.OnRecover(l.pos.NextBatchID, cs); err != nil {
+		return fmt.Errorf("runtime: report recovered batches: %w", err)
 	}
 	return nil
 }

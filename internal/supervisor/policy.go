@@ -54,10 +54,11 @@ const (
 
 // RunEnd is how one worker run ended. The caller never builds one for a run ended by shutdown.
 type RunEnd struct {
-	StartFailed bool // Host.Start failed; Exit, Ran and Progressed are ignored
-	Exit        workerproc.Exit
-	Ran         time.Duration // start to exit
-	Progressed  bool          // workerState.progressed when the run ended
+	StartFailed  bool // Host.Start failed; Exit, Ran and Progressed are ignored
+	Exit         workerproc.Exit
+	Ran          time.Duration // start to exit
+	Progressed   bool          // workerState.progressed when the run ended
+	Inconsistent bool          // the run ended on a consistency fault; HALTED
 }
 
 // Backoff is the restart state carried from one run to the next. The zero value is a fresh
@@ -87,6 +88,9 @@ func (p Policy) Next(b Backoff, end RunEnd) (action Action, wait time.Duration, 
 	}
 
 	if !end.StartFailed {
+		if end.Inconsistent {
+			return ActionHalt, 0, Backoff{Failures: b.Failures, Delay: d}
+		}
 		switch end.Exit.Code {
 		case ipc.ExitHalted:
 			return ActionHalt, 0, Backoff{Failures: b.Failures, Delay: d}

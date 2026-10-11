@@ -1,6 +1,7 @@
 package settlement
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -382,5 +383,76 @@ func TestAssignmentSweptPreviousOrdinal(t *testing.T) {
 	}
 	if want := wantEntries(fx); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Assignment = %+v, want %+v", got, want)
+	}
+}
+
+func TestAssignmentSharedSend(t *testing.T) {
+	fx := znndtest.Load(t)
+	rh := fx.Assignment.ReceiveHeight
+	c0 := fx.Expected.DomainInputCounter
+
+	var atR []znndtest.FixtureProof
+	for _, p := range fx.Proofs {
+		if p.Height == rh {
+			atR = append(atR, p)
+		}
+	}
+	if uint64(len(atR)) != 2+1+uint64(len(fx.Assignment.Entries)) {
+		t.Fatalf("fixture holds %d proofs at height %d, want %d", len(atR), rh, 3+len(fx.Assignment.Entries))
+	}
+	if len(atR[3].Result.Value) == 0 || len(atR[4].Result.Value) == 0 || bytes.Equal(atR[3].Result.Value, atR[4].Result.Value) {
+		t.Fatal("fixture proofs 3 and 4 at the receive height need non-empty, differing values")
+	}
+	tree := trie.NewCompactTree()
+	pathOf := func(key []byte) trie.Path { return trie.Path(types.NewHash(key)) }
+	for i, p := range atR {
+		if len(p.Result.Value) == 0 {
+			continue
+		}
+		v := p.Result.Value
+		if i == 4 {
+			v = atR[3].Result.Value
+		}
+		tree.Insert(pathOf(p.Key), v)
+	}
+	root := tree.Root()
+
+	alt := fx.DetailedMomentum(t, rh)
+	alt.Momentum.StateRoot = root
+	alt.Momentum.Hash = alt.Momentum.ComputeHash()
+
+	synth := *fx
+	synth.Proofs = nil
+	for _, p := range atR {
+		_, value, proof := tree.ProveByPath(pathOf(p.Key))
+		synth.Proofs = append(synth.Proofs, znndtest.FixtureProof{
+			Height: rh,
+			Key:    p.Key,
+			Result: znndtest.Proof{Value: value, Proof: proof, Root: root},
+		})
+	}
+
+	srv := znndtest.NewServer(t, &synth, rh+10)
+	srv.SetMomentum(alt)
+	r := NewReader(znnd.NewClient(srv.URL))
+
+	_, err := r.Assignment(fx.DomainID, rh, alt.Momentum.Hash, c0)
+	mustHaltWith(t, "shared send", err, "share send")
+}
+
+func TestOneInputPerSend(t *testing.T) {
+	e := func(ord uint64, h byte) ledger.AssignmentEntry {
+		return ledger.AssignmentEntry{Ordinal: ord, SourceAccountBlockHash: types.Hash{h}}
+	}
+	if err := oneInputPerSend(10, 1, []ledger.AssignmentEntry{e(0, 1), e(1, 2), e(2, 3)}); err != nil {
+		t.Fatalf("distinct sends: %v", err)
+	}
+	if err := oneInputPerSend(10, 1, nil); err != nil {
+		t.Fatalf("no entries: %v", err)
+	}
+	err := oneInputPerSend(10, 1, []ledger.AssignmentEntry{e(4, 1), e(5, 2), e(6, 1)})
+	mustHalt(t, "shared send", err)
+	if !strings.Contains(err.Error(), "4") || !strings.Contains(err.Error(), "6") {
+		t.Fatalf("err = %v, want it to name ordinals 4 and 6", err)
 	}
 }

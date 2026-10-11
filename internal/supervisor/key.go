@@ -1,10 +1,16 @@
 package supervisor
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"syscall"
+
+	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/wallet"
 )
 
 // maxKeyFileBytes caps how much of a FILE key source LoadKey reads. A submission key is at most
@@ -91,4 +97,48 @@ func loadEnvKey(src KeySource) ([]byte, error) {
 	}
 	os.Unsetenv(src.Name)
 	return []byte(v), nil
+}
+
+// LoadSigner reads the submission key named by src (LoadKey), decodes it as a hex-encoded
+// 32-byte ed25519 seed, and returns its key pair. It fails unless the key pair's address is
+// executor. Every error wraps ErrConfig and names the source, never the key bytes.
+func LoadSigner(src KeySource, executor types.Address) (*wallet.KeyPair, error) {
+	raw, err := LoadKey(src)
+	if err != nil {
+		return nil, err
+	}
+	return signerFromKey(raw, src, executor)
+}
+
+// signerFromKey does LoadSigner's work on raw, LoadKey's result. It clears raw on every path.
+func signerFromKey(raw []byte, src KeySource, executor types.Address) (*wallet.KeyPair, error) {
+	defer clear(raw)
+
+	var source string
+	if src.Kind == "FILE" {
+		source = fmt.Sprintf("path %q", src.Path)
+	} else {
+		source = fmt.Sprintf("variable %s", src.Name)
+	}
+
+	text := bytes.TrimSpace(raw)
+	if len(text) != 2*ed25519.SeedSize {
+		return nil, fmt.Errorf("%w: submissionKeySource %s is not 64 hex characters", ErrConfig, source)
+	}
+	seed := make([]byte, ed25519.SeedSize)
+	defer clear(seed)
+	// The hex error is dropped: it quotes the offending key byte.
+	if _, err := hex.Decode(seed, text); err != nil {
+		return nil, fmt.Errorf("%w: submissionKeySource %s is not 64 hex characters", ErrConfig, source)
+	}
+
+	// The same seed-to-key-pair step as go-zenon's wallet derivation, which wallet does not
+	// export.
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+	addr := types.PubKeyToAddress(pub)
+	if addr != executor {
+		return nil, fmt.Errorf("%w: submissionKeySource %s holds the key of %s, not executorAddress %s", ErrConfig, source, addr, executor)
+	}
+	return &wallet.KeyPair{Public: pub, Private: priv, Address: addr}, nil
 }

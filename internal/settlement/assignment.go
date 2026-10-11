@@ -87,6 +87,10 @@ func (r *Reader) Assignment(domainID uint32, height uint64, hash types.Hash, nex
 		return nil, nil
 	}
 
+	if err := oneInputPerSend(height, domainID, entries); err != nil {
+		return nil, err
+	}
+
 	for i := range entries {
 		e := &entries[i]
 		sh, ok, err := r.c.ConfirmationHeight(e.SourceAccountBlockHash)
@@ -131,6 +135,20 @@ func (r *Reader) Assignment(domainID uint32, height uint64, hash types.Hash, nex
 		return nil, err
 	}
 	return entries, nil
+}
+
+// oneInputPerSend halts when two entries share a source send. With the per-entry check that
+// each ordinal's send was received in this momentum, every input then maps to its own Settlement
+// receive block, so a momentum carries at most as many domain inputs as Settlement receives.
+func oneInputPerSend(height uint64, domainID uint32, entries []ledger.AssignmentEntry) error {
+	seen := make(map[types.Hash]uint64, len(entries))
+	for _, e := range entries {
+		if first, dup := seen[e.SourceAccountBlockHash]; dup {
+			return halted(height, "domain %d ordinals %d and %d share send %s", domainID, first, e.Ordinal, e.SourceAccountBlockHash)
+		}
+		seen[e.SourceAccountBlockHash] = e.Ordinal
+	}
+	return nil
 }
 
 // unchanged re-fetches the momentum at height and returns a plain error unless it passes

@@ -68,12 +68,15 @@ func run(ctx context.Context, conn io.ReadWriter, newPlugin NewPlugin) int {
 		Role:              cfg.Role,
 		STFSpecHash:       cfg.STFSpecHash,
 		ConfirmationDepth: cfg.ConfirmationDepth,
+		MaxPendingBatches: cfg.MaxPendingBatches,
 		Momenta:           client,
 		Assignments:       client,
 		Caps:              client,
 		Anchors:           client,
+		Cursor:            client,
 		Retry:             retry,
 		OnCommit:          client.ReportCommitted,
+		OnRecover:         client.ReportRecovered,
 	})
 	rt.Register(plugin)
 	err = rt.Run(ctx)

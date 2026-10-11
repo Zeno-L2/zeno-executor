@@ -574,9 +574,8 @@ func TestCommitRejectsMalformedPosition(t *testing.T) {
 	defer store.Close()
 
 	for name, pos := range map[string]Position{
-		"zero position":          {},
-		"zero momentum hash":     {MomentumHeight: 1, LastInputSeq: 1, PostStateRoot: types.Hash{1}},
-		"zero root, nonzero seq": {MomentumHeight: 1, MomentumHash: types.Hash{1}, LastInputSeq: 1},
+		"zero position":      {},
+		"zero momentum hash": {MomentumHeight: 1, LastInputSeq: 1, PostStateRoot: types.Hash{1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := Commit(cfg, store, pos, nil, nil); err == nil {
@@ -587,6 +586,70 @@ func TestCommitRejectsMalformedPosition(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCommitAcceptsZeroRootAtNonzeroSeq pins that an empty domain state, whose root is the zero
+// hash, is a committable position at any input sequence.
+func TestCommitAcceptsZeroRootAtNonzeroSeq(t *testing.T) {
+	cfg := testConfig(t, 4)
+	store, err := state.OpenEmpty(cfg.Layout.StateWAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	pos := Position{MomentumHeight: 1, MomentumHash: types.Hash{1}, LastInputSeq: 3}
+	if err := Commit(cfg, store, pos, nil, nil); err != nil {
+		t.Fatalf("Commit rejected a zero root at a non-zero input sequence: %v", err)
+	}
+	if got, ok, err := ReadCursor(cfg.Layout); err != nil || !ok || got != pos {
+		t.Fatalf("ReadCursor = %+v, %v, %v; want %+v", got, ok, err, pos)
+	}
+}
+
+// TestReadCursorRejectsOmittedRoot pins that a cursor file without a postStateRoot field is
+// refused, while the same file with the field present at its zero value is read back.
+func TestReadCursorRejectsOmittedRoot(t *testing.T) {
+	zero := types.Hash{}
+	zeroJSON, err := json.Marshal(zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		body   string
+		wantOK bool
+	}{
+		"field omitted":      {body: `{"lastInputSeq":3,"momentumHeight":1,"momentumHash":` + string(mustMarshal(t, types.Hash{1})) + `}`},
+		"null file":          {body: "null"},
+		"field null":         {body: `{"lastInputSeq":3,"postStateRoot":null,"momentumHeight":1}`},
+		"field present zero": {body: `{"lastInputSeq":3,"postStateRoot":` + string(zeroJSON) + `,"momentumHeight":1}`, wantOK: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig(t, 4)
+			if err := os.WriteFile(cfg.Layout.Cursor, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, ok, err := ReadCursor(cfg.Layout)
+			if tc.wantOK {
+				if err != nil || !ok {
+					t.Fatalf("ReadCursor = ok %v, err %v; want accepted", ok, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ReadCursor accepted %s", tc.body)
+			}
+		})
+	}
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 // TestWriteFileAtomicSyncsDirectory exercises writeFileAtomic's rename-then-sync-directory path

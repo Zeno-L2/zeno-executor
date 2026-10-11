@@ -157,6 +157,24 @@ func TestPolicyNextHaltAndConfigError(t *testing.T) {
 	}
 }
 
+// TestPolicyNextInconsistentHalts: a consistency fault halts whatever exit the worker reached.
+func TestPolicyNextInconsistentHalts(t *testing.T) {
+	exits := map[string]workerproc.Exit{
+		"temp fail": {Code: ipc.ExitTempFail},
+		"exit 0":    {Code: 0},
+		"sigkill":   {Code: -1, Signal: syscall.SIGKILL},
+	}
+	for name, exit := range exits {
+		for _, progressed := range []bool{false, true} {
+			end := RunEnd{Exit: exit, Progressed: progressed, Inconsistent: true}
+			action, wait, _ := Policy{}.Next(Backoff{Failures: 2, Delay: time.Second}, end)
+			if action != ActionHalt || wait != 0 {
+				t.Fatalf("%s progressed=%v: action=%v wait=%v, want ActionHalt/0", name, progressed, action, wait)
+			}
+		}
+	}
+}
+
 // TestPolicyNextExit75NeverCounts sends 100 consecutive exit-75 ends from each of two starting
 // failure counts. Every one restarts, the wait grows and caps, and Failures never changes:
 // exit 75 (ipc.ExitTempFail) is never a counted failure.

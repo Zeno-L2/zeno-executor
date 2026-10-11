@@ -1,15 +1,18 @@
 package znnd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/internal/recovery"
@@ -256,6 +259,173 @@ func TestConfirmationHeightBespoke(t *testing.T) {
 	})
 }
 
+// sendBlock is the JSON the node returns for a send block, with the detail fields the caller adds.
+func sendBlock(hash types.Hash, data []byte, extra string) string {
+	b := &nom.AccountBlock{
+		Hash:                 hash,
+		Height:               7,
+		Amount:               big.NewInt(0),
+		Data:                 data,
+		MomentumAcknowledged: types.HashHeight{Hash: types.Hash{0x0a}, Height: 33},
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw[:len(raw)-1]) + extra + "}"
+}
+
+func TestSendStatusBespoke(t *testing.T) {
+	serve := func(t *testing.T, result func() string) *Client {
+		t.Helper()
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req rpcRequest
+			if err := jsonDecode(r, &req); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, result())
+		}))
+		t.Cleanup(s.Close)
+		return NewClient(s.URL)
+	}
+	want := types.Hash{0x01}
+	data := []byte{1, 2, 3}
+
+	t.Run("null", func(t *testing.T) {
+		c := serve(t, func() string { return "null" })
+		got, err := c.SendStatus(want)
+		if err != nil || got.Block != nil || got.Received || got.ReceiveHeight != 0 {
+			t.Fatalf("SendStatus(null) = %+v, %v; want the zero status", got, err)
+		}
+	})
+
+	t.Run("known without a paired block", func(t *testing.T) {
+		c := serve(t, func() string {
+			return sendBlock(want, data, `,"confirmationDetail":{"momentumHeight":40},"pairedAccountBlock":null`)
+		})
+		got, err := c.SendStatus(want)
+		if err != nil || got.Block == nil || got.Received || got.ReceiveHeight != 0 {
+			t.Fatalf("SendStatus = %+v, %v; want a block and no receive", got, err)
+		}
+		if got.Block.Hash != want || !bytes.Equal(got.Block.Data, data) || got.Block.MomentumAcknowledged.Height != 33 {
+			t.Fatalf("Block = %+v; want hash, data and acknowledged momentum 33", got.Block)
+		}
+	})
+
+	t.Run("paired block unconfirmed", func(t *testing.T) {
+		c := serve(t, func() string {
+			return sendBlock(want, data, `,"confirmationDetail":{"momentumHeight":40},"pairedAccountBlock":{"confirmationDetail":null}`)
+		})
+		got, err := c.SendStatus(want)
+		if err != nil || got.Block == nil || got.Received {
+			t.Fatalf("SendStatus = %+v, %v; want a block and no receive", got, err)
+		}
+	})
+
+	t.Run("received", func(t *testing.T) {
+		c := serve(t, func() string {
+			return sendBlock(want, data, `,"confirmationDetail":{"momentumHeight":40},"pairedAccountBlock":{"confirmationDetail":{"momentumHeight":44}}`)
+		})
+		got, err := c.SendStatus(want)
+		if err != nil || got.Block == nil || !got.Received || got.ReceiveHeight != 44 {
+			t.Fatalf("SendStatus = %+v, %v; want a block received at 44", got, err)
+		}
+	})
+
+	t.Run("null confirmationDetail", func(t *testing.T) {
+		c := serve(t, func() string {
+			return sendBlock(want, data, `,"confirmationDetail":null,"pairedAccountBlock":{"confirmationDetail":{"momentumHeight":44}}`)
+		})
+		got, err := c.SendStatus(want)
+		if err != nil || got.Block != nil || got.Received {
+			t.Fatalf("SendStatus = %+v, %v; want the zero status", got, err)
+		}
+	})
+
+	t.Run("another hash", func(t *testing.T) {
+		c := serve(t, func() string {
+			return sendBlock(types.Hash{0x02}, data, `,"confirmationDetail":{"momentumHeight":40}`)
+		})
+		_, err := c.SendStatus(want)
+		mustPlain(t, "block with another hash", err)
+	})
+}
+
+func TestAccountBlockAtHeightBespoke(t *testing.T) {
+	addr := types.Address{0x01}
+	var params []json.RawMessage
+	serve := func(t *testing.T, result string) *Client {
+		t.Helper()
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req rpcRequest
+			if err := jsonDecode(r, &req); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			if req.Method != "ledger.getAccountBlocksByHeight" {
+				t.Errorf("method = %q, want ledger.getAccountBlocksByHeight", req.Method)
+			}
+			params = params[:0]
+			for _, p := range req.Params {
+				raw, _ := json.Marshal(p)
+				params = append(params, raw)
+			}
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, result)
+		}))
+		t.Cleanup(s.Close)
+		return NewClient(s.URL)
+	}
+	block := func(addr types.Address, height uint64) string {
+		raw, err := json.Marshal(&nom.AccountBlock{Address: addr, Height: height, Amount: big.NewInt(0)})
+		if err != nil {
+			panic(err)
+		}
+		return string(raw)
+	}
+
+	t.Run("request and one block", func(t *testing.T) {
+		c := serve(t, fmt.Sprintf(`{"list":[%s],"count":9}`, block(addr, 7)))
+		b, err := c.AccountBlockAtHeight(addr, 7)
+		if err != nil || b == nil || b.Height != 7 || b.Address != addr {
+			t.Fatalf("AccountBlockAtHeight = %+v, %v; want height 7", b, err)
+		}
+		want := []string{fmt.Sprintf("%q", addr.String()), "7", "1"}
+		if len(params) != 3 {
+			t.Fatalf("params = %s, want %v", params, want)
+		}
+		for i, w := range want {
+			if string(params[i]) != w {
+				t.Fatalf("param %d = %s, want %s", i, params[i], w)
+			}
+		}
+	})
+
+	t.Run("empty list", func(t *testing.T) {
+		c := serve(t, `{"list":[],"count":0}`)
+		b, err := c.AccountBlockAtHeight(addr, 7)
+		if err != nil || b != nil {
+			t.Fatalf("AccountBlockAtHeight(empty) = %+v, %v; want nil, nil", b, err)
+		}
+	})
+
+	t.Run("null entry", func(t *testing.T) {
+		c := serve(t, `{"list":[null]}`)
+		_, err := c.AccountBlockAtHeight(addr, 7)
+		mustPlain(t, "null entry", err)
+	})
+
+	t.Run("wrong height", func(t *testing.T) {
+		c := serve(t, fmt.Sprintf(`{"list":[%s]}`, block(addr, 8)))
+		_, err := c.AccountBlockAtHeight(addr, 7)
+		mustPlain(t, "wrong height", err)
+	})
+
+	t.Run("wrong address", func(t *testing.T) {
+		c := serve(t, fmt.Sprintf(`{"list":[%s]}`, block(types.Address{0x02}, 7)))
+		_, err := c.AccountBlockAtHeight(addr, 7)
+		mustPlain(t, "wrong address", err)
+	})
+}
+
 func TestClientBodyBound(t *testing.T) {
 	fx, srv, c := setup(t)
 
@@ -298,6 +468,21 @@ func TestClientBodyBoundPerMethod(t *testing.T) {
 		"ConfirmationHeight": func() error {
 			_, _, err := c.ConfirmationHeight(fx.Assignment.Entries[0].SourceAccountBlockHash)
 			return err
+		},
+		"SendStatus": func() error {
+			_, err := c.SendStatus(fx.Assignment.Entries[0].SourceAccountBlockHash)
+			return err
+		},
+		"AccountBlockAtHeight": func() error {
+			_, err := c.AccountBlockAtHeight(fx.ExecutorAddress, 1)
+			return err
+		},
+		"RequiredPlasma": func() error {
+			_, err := c.RequiredPlasma(fx.ExecutorAddress, types.SettlementContract, nil)
+			return err
+		},
+		"PublishRawTransaction": func() error {
+			return c.PublishRawTransaction(&nom.AccountBlock{Amount: big.NewInt(0)})
 		},
 	}
 	for name, call := range calls {
@@ -342,4 +527,106 @@ func TestClientBodyReadStopsAtBound(t *testing.T) {
 	if body.n != maxResponseBody+1 {
 		t.Fatalf("read %d bytes, want exactly the bound plus one byte (%d)", body.n, maxResponseBody+1)
 	}
+}
+
+func TestRequiredPlasma(t *testing.T) {
+	from := types.Address{0x01}
+	data := []byte{0xde, 0xad}
+
+	t.Run("request and result", func(t *testing.T) {
+		var gotMethod string
+		var gotParams []map[string]any
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     uint64           `json:"id"`
+				Method string           `json:"method"`
+				Params []map[string]any `json:"params"`
+			}
+			if err := jsonDecode(r, &req); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			gotMethod, gotParams = req.Method, req.Params
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"availablePlasma":50000,"basePlasma":21000,"requiredDifficulty":0}}`, req.ID)
+		}))
+		t.Cleanup(s.Close)
+
+		got, err := NewClient(s.URL).RequiredPlasma(from, types.SettlementContract, data)
+		if err != nil {
+			t.Fatalf("RequiredPlasma: %v", err)
+		}
+		if want := (PlasmaRequirement{AvailablePlasma: 50000, BasePlasma: 21000}); got != want {
+			t.Fatalf("RequiredPlasma = %+v, want %+v", got, want)
+		}
+		if gotMethod != "embedded.plasma.getRequiredPoWForAccountBlock" {
+			t.Fatalf("method = %q", gotMethod)
+		}
+		if len(gotParams) != 1 {
+			t.Fatalf("params = %v, want one object", gotParams)
+		}
+		p := gotParams[0]
+		if len(p) != 4 || p["address"] != from.String() || p["toAddress"] != types.SettlementContract.String() || p["blockType"] != float64(2) || p["data"] != "3q0=" {
+			t.Fatalf("param = %v", p)
+		}
+	})
+
+	t.Run("null result", func(t *testing.T) {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req rpcRequest
+			jsonDecode(r, &req)
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":null}`, req.ID)
+		}))
+		t.Cleanup(s.Close)
+		_, err := NewClient(s.URL).RequiredPlasma(from, types.SettlementContract, data)
+		mustPlain(t, "null result", err)
+	})
+}
+
+func TestPublishRawTransaction(t *testing.T) {
+	b := &nom.AccountBlock{
+		Version:   1,
+		BlockType: nom.BlockTypeUserSend,
+		Height:    1,
+		Address:   types.Address{0x01},
+		ToAddress: types.SettlementContract,
+		Amount:    big.NewInt(0),
+		Data:      []byte{0x01},
+	}
+	b.Hash = b.ComputeHash()
+
+	respond := func(t *testing.T, result string, got **nom.AccountBlock) *Client {
+		t.Helper()
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     uint64              `json:"id"`
+				Method string              `json:"method"`
+				Params []*nom.AccountBlock `json:"params"`
+			}
+			if err := jsonDecode(r, &req); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			if req.Method != "ledger.publishRawTransaction" || len(req.Params) != 1 {
+				t.Errorf("method %q with %d params", req.Method, len(req.Params))
+			} else if got != nil {
+				*got = req.Params[0]
+			}
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,%s}`, req.ID, result)
+		}))
+		t.Cleanup(s.Close)
+		return NewClient(s.URL)
+	}
+
+	t.Run("null result", func(t *testing.T) {
+		var got *nom.AccountBlock
+		if err := respond(t, `"result":null`, &got).PublishRawTransaction(b); err != nil {
+			t.Fatalf("PublishRawTransaction: %v", err)
+		}
+		if got == nil || got.ComputeHash() != b.Hash || got.Amount == nil || got.Amount.Sign() != 0 {
+			t.Fatalf("server decoded %+v", got)
+		}
+	})
+
+	t.Run("rpc error", func(t *testing.T) {
+		err := respond(t, `"error":{"code":-32000,"message":"rejected"}`, nil).PublishRawTransaction(b)
+		mustPlain(t, "rpc error", err)
+	})
 }
