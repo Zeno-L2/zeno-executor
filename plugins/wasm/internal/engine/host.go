@@ -50,7 +50,7 @@ func instantiateHostModule(ctx context.Context, r wazero.Runtime) (api.Module, e
 		WithGoModuleFunction(api.GoModuleFunc(storageRead), []api.ValueType{i32, i32, i32, i32}, []api.ValueType{i64}).
 		Export("storage_read").
 		NewFunctionBuilder().
-		WithGoModuleFunction(api.GoModuleFunc(abortFn), []api.ValueType{i32}, nil).
+		WithGoModuleFunction(api.GoModuleFunc(abortFn), []api.ValueType{i32, i32, i32}, nil).
 		Export("abort").
 		Instantiate(ctx)
 }
@@ -168,8 +168,25 @@ func storageRead(ctx context.Context, mod api.Module, stack []uint64) {
 	stack[0] = api.EncodeI64(int64(l))
 }
 
-// abortFn implements env.abort(code); it never returns.
+// abortFn implements env.abort(code, data_ptr, data_len); it never returns. The charge comes
+// first, so an unaffordable data_len is OUT_OF_GAS before the size check or any memory read.
+// A data_len above codec.MaxReturnData raises the too-large abort without touching memory; a
+// data_len of 0 never reads memory, so any data_ptr is accepted with it.
 func abortFn(ctx context.Context, mod api.Module, stack []uint64) {
-	chargeGas(ctx, mod, module.HostCost(module.HostAbort, 0))
-	panic(&abortError{code: api.DecodeI32(stack[0])})
+	code := api.DecodeI32(stack[0])
+	dataPtr := api.DecodeU32(stack[1])
+	dataLen := api.DecodeU32(stack[2])
+
+	chargeGas(ctx, mod, module.HostCostU32(module.HostAbort, dataLen))
+	if dataLen > codec.MaxReturnData {
+		panic(&abortError{tooLarge: true})
+	}
+	if dataLen == 0 {
+		panic(&abortError{code: code})
+	}
+	view, ok := mod.Memory().Read(dataPtr, dataLen)
+	if !ok {
+		panic(fmt.Errorf("engine: abort: data [%d, %d) out of bounds", dataPtr, uint64(dataPtr)+uint64(dataLen)))
+	}
+	panic(&abortError{code: code, data: append([]byte(nil), view...)})
 }

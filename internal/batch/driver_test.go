@@ -705,6 +705,98 @@ func TestDriverReceiptFields(t *testing.T) {
 		}
 	})
 
+	t.Run("Revert", func(t *testing.T) {
+		src := hashN(1)
+		asset := assetN(1)
+		depositAmt := u256N(500)
+		data := bytes.Repeat([]byte{0x5A}, 40)
+		eff := refundEffects(0, asset, depositAmt)
+		eff.Status = codec.StatusRevert
+		eff.AbortCode = 7
+		eff.ReturnData = data
+		inputs := []ledger.Input{ledgerInput(0, callPayload(t, src, hashN(2), asset, depositAmt))}
+		dom := &fakeDomain{steps: []fakeStep{{effects: eff}}}
+		cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		got, ok, err := d.NextBatch()
+		if err != nil || !ok {
+			t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+		}
+		rec := got.Receipts[0]
+		var wantRet types.Hash
+		copy(wantRet[:], crypto.Hash(data))
+		if rec.ReturnHash != wantRet {
+			t.Fatalf("ReturnHash = %x, want %x", rec.ReturnHash, wantRet)
+		}
+		if rec.StateDiffHash != (types.Hash{}) || rec.EventRoot != (types.Hash{}) {
+			t.Fatalf("StateDiffHash/EventRoot = %x/%x, want zero", rec.StateDiffHash, rec.EventRoot)
+		}
+		if rec.AbortCode != 7 {
+			t.Fatalf("AbortCode = %d, want 7", rec.AbortCode)
+		}
+
+		decoded, err := codec.DecodeBundle(got.Bundle)
+		if err != nil {
+			t.Fatalf("DecodeBundle: %v", err)
+		}
+		if len(decoded) != 1 {
+			t.Fatalf("len(decoded) = %d, want 1", len(decoded))
+		}
+		er, err := codec.DecodeExecutionResult(decoded[0].ExecutionResult)
+		if err != nil {
+			t.Fatalf("DecodeExecutionResult: %v", err)
+		}
+		if !bytes.Equal(er.ReturnData, data) {
+			t.Fatalf("ExecutionResult.ReturnData = %x, want %x", er.ReturnData, data)
+		}
+		if er.PostStateRoot != er.PreStateRoot {
+			t.Fatalf("PostStateRoot %x != PreStateRoot %x on a REVERT", er.PostStateRoot, er.PreStateRoot)
+		}
+	})
+
+	t.Run("ReturnDataOutsideRevert", func(t *testing.T) {
+		asset := assetN(1)
+		depositAmt := u256N(500)
+		eff := refundEffects(0, asset, depositAmt)
+		eff.ReturnData = []byte{0x01}
+		inputs := []ledger.Input{ledgerInput(0, callPayload(t, hashN(1), hashN(2), asset, depositAmt))}
+		dom := &fakeDomain{steps: []fakeStep{{effects: eff}}}
+		cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if _, ok, err := d.NextBatch(); ok || !errors.Is(err, ErrEffectsInvariant) {
+			t.Fatalf("NextBatch: ok=%v err=%v, want ErrEffectsInvariant", ok, err)
+		}
+	})
+
+	t.Run("OversizedRevert", func(t *testing.T) {
+		asset := assetN(1)
+		depositAmt := u256N(500)
+		eff := refundEffects(0, asset, depositAmt)
+		eff.Status = codec.StatusRevert
+		eff.AbortCode = 7
+		eff.ReturnData = make([]byte, codec.MaxReturnData+1)
+		if err := checkNonSuccessInvariant(eff); err != nil {
+			t.Fatalf("checkNonSuccessInvariant = %v, want nil", err)
+		}
+		inputs := []ledger.Input{ledgerInput(0, callPayload(t, hashN(1), hashN(2), asset, depositAmt))}
+		dom := &fakeDomain{steps: []fakeStep{{effects: eff}}}
+		cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+		d, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if _, ok, err := d.NextBatch(); ok || !errors.Is(err, codec.ErrLimitExceeded) {
+			t.Fatalf("NextBatch: ok=%v err=%v, want codec.ErrLimitExceeded", ok, err)
+		}
+	})
+
 	t.Run("Success", func(t *testing.T) {
 		src := hashN(1)
 		contractID := hashN(2)

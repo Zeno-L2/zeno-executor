@@ -6,8 +6,6 @@ import "github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 // only the bounds named inside its own grammar blocks). These are the plugin's own bounds,
 // enforced by the validator, the instrumentation ceiling, and the effects pipeline.
 const (
-	// MaxReturnData bounds ContractEffects.ReturnData (§14.3).
-	MaxReturnData = 4 << 10
 	// MaxExecutionResult bounds the final assembled ExecutionResult.
 	MaxExecutionResult = 32 << 10
 	// MaxResultBlob bounds the ContractEffects blob a contract returns, checked before the

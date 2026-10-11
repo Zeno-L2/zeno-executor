@@ -120,6 +120,26 @@ func TestCeilDiv32(t *testing.T) {
 	}
 }
 
+func TestHostCostU32(t *testing.T) {
+	cases := map[uint32]uint64{
+		0:          1,
+		1:          11,
+		32:         11,
+		33:         21,
+		1<<31 - 31: 1 + 10*(1<<26),
+		1 << 31:    1 + 10*(1<<26),
+		0xFFFFFFFF: 1 + 10*134217728,
+	}
+	for n, want := range cases {
+		if got := HostCostU32(HostAbort, n); got != want {
+			t.Errorf("HostCostU32(HostAbort, %d) = %d, want %d", n, got, want)
+		}
+	}
+	if got := HostCostU32(HostStorageLen, 0xFFFFFFFF); got != 100 {
+		t.Errorf("HostCostU32(HostStorageLen, max) = %d, want 100", got)
+	}
+}
+
 func TestHostAndEffectCosts(t *testing.T) {
 	for _, n := range []int{0, 1, 32, 100} {
 		if got := HostCost(HostStorageLen, n); got != 100 {
@@ -131,6 +151,11 @@ func TestHostAndEffectCosts(t *testing.T) {
 	}
 	if got := HostCost(HostAbort, 0); got != 1 {
 		t.Errorf("HostCost(HostAbort, 0) = %d, want 1", got)
+	}
+	for n, want := range map[int]uint64{1: 11, 32: 11, 33: 21, 4096: 1281, 4097: 1291} {
+		if got := HostCost(HostAbort, n); got != want {
+			t.Errorf("HostCost(HostAbort, %d) = %d, want %d", n, got, want)
+		}
 	}
 
 	if got := EffectCost(Effect{EffectOutboxMessage, 0}); got != 200 {

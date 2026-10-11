@@ -205,7 +205,7 @@ func parseTypes(payload []byte, m *moduleInfo, lim Limits) error {
 var (
 	storageLenSig  = funcSig{params: []byte{0x7F, 0x7F}, results: []byte{0x7E}}
 	storageReadSig = funcSig{params: []byte{0x7F, 0x7F, 0x7F, 0x7F}, results: []byte{0x7E}}
-	abortSig       = funcSig{params: []byte{0x7F}, results: nil}
+	abortSig       = funcSig{params: []byte{0x7F, 0x7F, 0x7F}, results: nil}
 	runSig         = funcSig{params: []byte{0x7F, 0x7F}, results: []byte{0x7E}}
 )
 

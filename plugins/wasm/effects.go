@@ -40,7 +40,10 @@ func (s settlement) settle(out engine.Outcome) (domain.Effects, error) {
 	case engine.Aborted:
 		eff := s.fail(codec.StatusRevert, out.GasUsed)
 		eff.AbortCode = out.AbortCode
+		eff.ReturnData = out.RevertData
 		return eff, nil
+	case engine.AbortTooLarge:
+		return s.fail(codec.StatusResultTooLarge, out.GasUsed), nil
 	case engine.Returned:
 		if out.Ret < 0 {
 			eff := s.fail(codec.StatusRevert, out.GasUsed)
@@ -186,7 +189,7 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	}
 
 	// Step 7: return-data size.
-	if len(eff.ReturnData) > MaxReturnData {
+	if len(eff.ReturnData) > codec.MaxReturnData {
 		return s.fail(codec.StatusResultTooLarge, gasUsed), nil
 	}
 

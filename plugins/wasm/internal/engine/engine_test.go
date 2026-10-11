@@ -83,7 +83,7 @@ func buildModule(imports []string, data *dataSeg, locals, body []byte, pages uin
 		case "abort":
 			if abortIdx == -1 {
 				abortIdx = len(types)
-				types = append(types, encodeFuncType([]byte{0x7F}, nil))
+				types = append(types, encodeFuncType([]byte{0x7F, 0x7F, 0x7F}, nil))
 			}
 		}
 	}

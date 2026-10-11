@@ -44,7 +44,7 @@ func builderWithHostImports(names []string) *builder {
 	sigs := map[string]funcType{
 		"storage_len":  {form: 0x60, params: []byte{0x7F, 0x7F}, results: []byte{0x7E}},
 		"storage_read": {form: 0x60, params: []byte{0x7F, 0x7F, 0x7F, 0x7F}, results: []byte{0x7E}},
-		"abort":        {form: 0x60, params: []byte{0x7F}, results: nil},
+		"abort":        {form: 0x60, params: []byte{0x7F, 0x7F, 0x7F}, results: nil},
 	}
 	b := &builder{}
 	for _, n := range names {
@@ -505,6 +505,17 @@ var rejectionCases = []struct {
 			b := newBuilder()
 			b.types = append(b.types, funcType{form: 0x60, params: []byte{0x7F}, results: []byte{0x7E}})
 			b.imports = []importEntry{{module: "env", name: "storage_len", desc: 0x00, typeIdx: 1}}
+			setRunIndex(b)
+			return b.bytes()
+		}(),
+		want: ErrImportSignature,
+	},
+	{
+		name: "env.abort typed (i32) -> ()",
+		wasm: func() []byte {
+			b := newBuilder()
+			b.types = append(b.types, funcType{form: 0x60, params: []byte{0x7F}, results: nil})
+			b.imports = []importEntry{{module: "env", name: "abort", desc: 0x00, typeIdx: 1}}
 			setRunIndex(b)
 			return b.bytes()
 		}(),

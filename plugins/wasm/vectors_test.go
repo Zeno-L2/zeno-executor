@@ -1006,7 +1006,7 @@ func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "e06cf0ee59e1bceff33ca4977238a2bc64471910e2d4979b3c82b41db0554c89"
+const vectorFileDigest = "c8a5ed07ad64336fd6e415bf14ef2939394d929d0a41dd544c55567c2bda49c6"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {

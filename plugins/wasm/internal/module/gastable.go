@@ -207,9 +207,22 @@ func InitialMemoryCost(pages uint32) uint64 {
 
 // HostCost returns the cost of invoking the named host function fn with a value of
 // valueBytes bytes: base + per_32_bytes * ceilDiv32(valueBytes). valueBytes is ignored
-// where per_32_bytes is 0 (storage_len, abort). A storage_read of an absent key charges
+// where per_32_bytes is 0 (storage_len). A storage_read of an absent key charges
 // base only: callers pass valueBytes = 0, never the -1 ABI sentinel.
 func HostCost(fn HostFn, valueBytes int) uint64 {
+	c := hostFunctionCostOf(fn)
+	return c.Base + c.Per32Bytes*ceilDiv32(valueBytes)
+}
+
+// HostCostU32 is HostCost for an unsigned 32-bit length. It computes in
+// uint64, so the result is identical on every platform whatever the
+// width of int.
+func HostCostU32(fn HostFn, n uint32) uint64 {
+	c := hostFunctionCostOf(fn)
+	return c.Base + c.Per32Bytes*((uint64(n)+31)/32)
+}
+
+func hostFunctionCostOf(fn HostFn) hostFunctionCost {
 	var c hostFunctionCost
 	switch fn {
 	case HostStorageLen:
@@ -221,7 +234,7 @@ func HostCost(fn HostFn, valueBytes int) uint64 {
 	default:
 		panic(fmt.Sprintf("module: unknown host function %d", fn))
 	}
-	return c.Base + c.Per32Bytes*ceilDiv32(valueBytes)
+	return c
 }
 
 // EffectCost returns the cost of charging effect e: base + per_32_bytes * ceilDiv32(e.Bytes)

@@ -246,7 +246,12 @@ func (e *Engine) Run(hc HostContext, codeHash types.Hash, instrumented, frame []
 	case Aborted:
 		var abortErr *abortError
 		errors.As(callErr, &abortErr)
+		if abortErr.tooLarge {
+			out.Kind = AbortTooLarge
+			break
+		}
 		out.AbortCode = abortErr.code
+		out.RevertData = abortErr.data
 	case Returned:
 		if len(results) != 1 {
 			return Outcome{}, fmt.Errorf("engine: run returned %d results, want 1", len(results))

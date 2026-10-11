@@ -684,8 +684,8 @@
     },
     "abort": {
       "base": 1,
-      "per_32_bytes": 0,
-      "note": "minimal fixed cost; halts execution."
+      "per_32_bytes": 10,
+      "note": "total = 1 + 10 * ceil(data_len/32), data_len read as unsigned and charged before the MaxReturnData check; halts execution."
     }
   },
   "post_execution_effect_charges": {

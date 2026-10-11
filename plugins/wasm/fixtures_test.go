@@ -163,7 +163,7 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 
 // runModuleSpec is the ordinary contract shape: run's (i32,i32)->i64 at type index 0, the
 // named env imports declared ahead of it (env.storage_len shares run's type; env.storage_read
-// is (i32,i32,i32,i32)->i64; env.abort is (i32)->()), one memory of pages, the "memory" and
+// is (i32,i32,i32,i32)->i64; env.abort is (i32,i32,i32)->()), one memory of pages, the "memory" and
 // "run" exports with run at function index len(imports), one function carrying locals/body,
 // and data.
 func runModuleSpec(imports []string, pages uint32, locals, body []byte, data []dataSeg) wasmModuleSpec {
@@ -187,7 +187,7 @@ func runModuleSpec(imports []string, pages uint32, locals, body []byte, data []d
 		case "abort":
 			idx, ok := typeIdx["abort"]
 			if !ok {
-				types = append(types, wasmFuncType{Params: []byte{0x7F}, Results: nil})
+				types = append(types, wasmFuncType{Params: []byte{0x7F, 0x7F, 0x7F}, Results: nil})
 				idx = uint32(len(types) - 1)
 				typeIdx["abort"] = idx
 			}
