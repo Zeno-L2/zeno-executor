@@ -2,8 +2,13 @@ package settlement
 
 import (
 	"errors"
+	"math/big"
 	"reflect"
 	"testing"
+
+	"github.com/zenon-network/go-zenon/common/trie"
+	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/internal/recovery"
 	"github.com/digitalSloth/go-executor/internal/znnd"
@@ -181,4 +186,61 @@ func TestCheckNode(t *testing.T) {
 
 	_, _, preSpork := newReader(t, 0)
 	mustPlain(t, "CheckNode before the spork", preSpork.CheckNode(fx.ReadHeight-1))
+}
+
+// TestPillarActive serves proofs from its own tree, which holds Pillar contract records. It
+// builds the View directly at the read height with that tree's root, so no momentum is needed.
+func TestPillarActive(t *testing.T) {
+	fx := znndtest.Load(t)
+	raw := func(name string) []byte {
+		return append(append(append([]byte{0x03}, types.PillarContract.Bytes()...), 0x04), definition.GetPillarInfoKey(name)...)
+	}
+	pillar := func(name string, revoked int64) []byte {
+		data, err := definition.ABIPillars.PackVariable("pillarInfo",
+			name, types.Address{0x01}, types.Address{0x02}, types.Address{0x03}, big.NewInt(1), int64(1), revoked, uint8(0), uint8(0), uint8(0))
+		if err != nil {
+			t.Fatalf("PackVariable: %v", err)
+		}
+		return data
+	}
+	leaves := map[string][]byte{
+		"active":  pillar("active", 0),
+		"revoked": pillar("revoked", 5),
+		"garbage": {0xde, 0xad},
+	}
+	pathOf := func(name string) trie.Path { return trie.Path(types.NewHash(raw(name))) }
+	tree := trie.NewCompactTree()
+	for name, v := range leaves {
+		tree.Insert(pathOf(name), v)
+	}
+	root := tree.Root()
+
+	synth := *fx
+	synth.Proofs = nil
+	for _, name := range []string{"active", "revoked", "garbage", "absent"} {
+		_, value, proof := tree.ProveByPath(pathOf(name))
+		synth.Proofs = append(synth.Proofs, znndtest.FixtureProof{
+			Height: fx.ReadHeight,
+			Key:    raw(name),
+			Result: znndtest.Proof{Value: value, Proof: proof, Root: root},
+		})
+	}
+	if present, _, _ := tree.ProveByPath(pathOf("absent")); present {
+		t.Fatal("the absent name is present in the synthetic tree")
+	}
+
+	srv := znndtest.NewServer(t, &synth, fx.ReadHeight+10)
+	v := &View{Height: fx.ReadHeight, c: znnd.NewClient(srv.URL), root: root}
+
+	if ok, err := v.PillarActive("active"); err != nil || !ok {
+		t.Fatalf("PillarActive(active) = %v, %v; want true", ok, err)
+	}
+	if ok, err := v.PillarActive("revoked"); err != nil || ok {
+		t.Fatalf("PillarActive(revoked) = %v, %v; want false", ok, err)
+	}
+	if ok, err := v.PillarActive("absent"); err != nil || ok {
+		t.Fatalf("PillarActive(absent) = %v, %v; want false with no error", ok, err)
+	}
+	_, err := v.PillarActive("garbage")
+	mustHalt(t, "PillarActive(garbage)", err)
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
@@ -45,7 +46,7 @@ func readPathClient(t *testing.T, fx *znndtest.Fixture, srv *znndtest.Server, de
 
 	zc := znnd.NewClient(srv.URL)
 	src := Sources{Momenta: zc, Anchors: settlement.NewAnchorSource(settlement.NewReader(zc), depth), Assignments: settlement.NewReader(zc), Caps: NewCapCache(settlement.NewReader(zc))}
-	done := runServe(t, sEnd, w, executor, src, &workerState{})
+	done := runServe(t, sEnd, w, executor, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches)})
 
 	client := ipc.NewClient(wEnd, nil)
 	if _, err := client.ReadConfig(); err != nil {
@@ -316,5 +317,34 @@ func TestReadPathTamperedRoot(t *testing.T) {
 			rdy.Store.Close()
 		}
 		t.Fatalf("Boot with a tampered root = %v, want ErrHalted", err)
+	}
+}
+
+func TestAcceptedEntriesEndToEnd(t *testing.T) {
+	const depth = 10
+	fx := znndtest.Load(t)
+	srv := znndtest.NewServer(t, fx, fx.ReadHeight+depth)
+	client := readPathClient(t, fx, srv, depth)
+
+	next, entries, err := client.AcceptedEntries(fx.DomainID, 0)
+	if err != nil {
+		t.Fatalf("AcceptedEntries: %v", err)
+	}
+	if next == 0 || uint64(len(entries)) != next {
+		t.Fatalf("AcceptedEntries = nextBatchId %d with %d entries, want one per batch", next, len(entries))
+	}
+	for _, e := range entries {
+		var w *definition.BatchEntry
+		for i := range fx.Expected.BatchEntries {
+			if x := &fx.Expected.BatchEntries[i]; x.DomainId == fx.DomainID && x.BatchId == e.BatchId {
+				w = x
+			}
+		}
+		if w == nil {
+			t.Fatalf("no fixture entry for batch %d", e.BatchId)
+		}
+		if e.FirstInputSeq != w.FirstInputSeq || e.LastInputSeq != w.LastInputSeq || e.PostStateRoot != w.PostStateRoot || e.InputRoot != w.InputRoot {
+			t.Fatalf("batch %d = %+v, want %+v", e.BatchId, e, w)
+		}
 	}
 }

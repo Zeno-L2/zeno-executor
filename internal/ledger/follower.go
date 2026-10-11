@@ -99,6 +99,32 @@ type Follower struct {
 
 	pendingReorg *ReorgError
 	halted       error
+
+	// limit is the read-ahead limit while limited is set (see LimitReadAhead).
+	limit   uint64
+	limited bool
+	// held is the unprocessed rest of a ranged read that a limit stop left behind.
+	held heldRead
+}
+
+// heldRead is the unprocessed rest of a ranged read: moms is the whole read, next indexes the
+// first unprocessed momentum, lk is the read's linked record.
+type heldRead struct {
+	moms []*nom.DetailedMomentum
+	next int
+	lk   *linked
+}
+
+// LimitReadAhead sets the read-ahead limit when on is true and clears it otherwise. While it is
+// set, a refill stops after the first momentum that leaves an input whose GlobalInputIndex is at
+// or above last buffered, and keeps the rest of that ranged read for the next refill. Clearing
+// it drops that kept rest, so the next refill reads from the first unprocessed height.
+func (f *Follower) LimitReadAhead(last uint64, on bool) {
+	f.limit = last
+	f.limited = on
+	if !on {
+		f.held = heldRead{}
+	}
 }
 
 // New validates cfg and returns a Follower seeded to start at cfg.StartHeight /
@@ -259,7 +285,14 @@ func (e *ReorgError) Error() string {
 // ceiling, or stops on a reorg or a momentum-processing failure. A read failure is returned
 // directly, wrapped, with nothing advanced or latched; every other outcome is recorded into
 // pendingReorg/halted and refill returns nil.
+//
+// A limit stop (see LimitReadAhead) keeps the unprocessed rest of its ranged read in f.held, and
+// the next refill processes it before reading again. Every other return drops it: the held
+// momenta are unprocessed, so nextHeight already names the first of them.
 func (f *Follower) refill() error {
+	held := f.held
+	f.held = heldRead{}
+
 	frontier, err := f.cfg.Source.FrontierHeight()
 	if err != nil {
 		return fmt.Errorf("%w: read frontier height: %w", ErrSourceRead, err)
@@ -278,29 +311,38 @@ func (f *Follower) refill() error {
 	}
 
 	for f.pendingReorg == nil && f.halted == nil && len(f.buf) == 0 && f.nextHeight <= ceiling {
-		remaining := ceiling - f.nextHeight + 1
-		count := remaining
-		if count > rpcMaxCountSize {
-			count = rpcMaxCountSize
-		}
+		var moms []*nom.DetailedMomentum
+		var lk *linked
+		start := 0
+		if held.moms != nil {
+			moms, lk, start = held.moms, held.lk, held.next
+			held = heldRead{}
+		} else {
+			remaining := ceiling - f.nextHeight + 1
+			count := remaining
+			if count > rpcMaxCountSize {
+				count = rpcMaxCountSize
+			}
 
-		moms, err := f.cfg.Source.DetailedMomentumsByHeight(f.nextHeight, count)
-		if err != nil {
-			return fmt.Errorf("%w: read momenta from height %d: %w", ErrSourceRead, f.nextHeight, err)
-		}
-		if len(moms) == 0 {
-			return nil
-		}
+			var err error
+			moms, err = f.cfg.Source.DetailedMomentumsByHeight(f.nextHeight, count)
+			if err != nil {
+				return fmt.Errorf("%w: read momenta from height %d: %w", ErrSourceRead, f.nextHeight, err)
+			}
+			if len(moms) == 0 {
+				return nil
+			}
 
-		lk := &linked{}
-		if len(f.recent) > 0 {
-			lk.low = f.recent[0].Height
-			for _, c := range f.recent {
-				lk.hashes = append(lk.hashes, c.Hash)
+			lk = &linked{}
+			if len(f.recent) > 0 {
+				lk.low = f.recent[0].Height
+				for _, c := range f.recent {
+					lk.hashes = append(lk.hashes, c.Hash)
+				}
 			}
 		}
-		for i, dm := range moms {
-			stop, ceilingExceeded, err := f.processMomentum(dm, ceiling, moms[:i], lk)
+		for i := start; i < len(moms); i++ {
+			stop, ceilingExceeded, err := f.processMomentum(moms[i], ceiling, moms[:i], lk)
 			if err != nil {
 				// A read failure surfaces only with nothing buffered; otherwise the next
 				// refill re-reads this momentum.
@@ -314,6 +356,12 @@ func (f *Follower) refill() error {
 				// asked for. Stop this call without an error, the same as reaching the
 				// ceiling before this momentum was ever read — see Edge cases.
 				return nil
+			}
+			if !stop && f.limited && len(f.buf) > 0 && f.buf[len(f.buf)-1].Ctx.GlobalInputIndex >= f.limit {
+				if i+1 < len(moms) {
+					f.held = heldRead{moms: moms, next: i + 1, lk: lk}
+				}
+				break
 			}
 			if stop || (f.cfg.MaxBufferedInputs > 0 && len(f.buf) >= f.cfg.MaxBufferedInputs) {
 				break
@@ -508,8 +556,8 @@ func (f *Follower) assigned(dm *nom.DetailedMomentum, read []*nom.DetailedMoment
 // linked holds the hashes of the momenta just below one ranged read that this Follower has
 // hash-linked to the read's first momentum: hashes[i] is the hash at height low+i, and the
 // last entry is the parent of the read's first momentum. refill seeds it from the
-// RecentMomenta window when the read starts and drops it when the read ends; each walk
-// extends it downward.
+// RecentMomenta window when the read starts and drops it when the read ends, or keeps it with
+// the held tail of the read; each walk extends it downward.
 type linked struct {
 	low    uint64
 	hashes []types.Hash

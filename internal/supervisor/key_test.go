@@ -1,6 +1,8 @@
 package supervisor
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,6 +10,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/wallet"
 )
 
 const keyContent = "s3cr3t-key-material-do-not-log-me"
@@ -223,6 +228,106 @@ func TestLoadKeyKMSAndUnknown(t *testing.T) {
 			}
 			if !errors.Is(err, ErrConfig) {
 				t.Fatalf("LoadKey error = %v, want wrapping ErrConfig", err)
+			}
+		})
+	}
+}
+
+// testSeed is a fixed 32-byte ed25519 seed in hex.
+var testSeed = strings.Repeat("ab", 32)
+
+func seedAddress(t *testing.T, seedHex string) types.Address {
+	t.Helper()
+	seed, err := hex.DecodeString(seedHex)
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	return types.PubKeyToAddress(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey))
+}
+
+func TestLoadSigner(t *testing.T) {
+	want := seedAddress(t, testSeed)
+	msg := []byte("message")
+
+	check := func(t *testing.T, kp *wallet.KeyPair, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("LoadSigner: %v", err)
+		}
+		if kp.Address != want {
+			t.Fatalf("Address = %s, want %s", kp.Address, want)
+		}
+		if ok, err := wallet.VerifySignature(kp.Public, msg, kp.Sign(msg)); !ok || err != nil {
+			t.Fatalf("VerifySignature = %v, %v", ok, err)
+		}
+	}
+
+	t.Run("FILE", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "key")
+		writeFile(t, path, testSeed+"\n")
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatalf("Chmod: %v", err)
+		}
+		kp, err := LoadSigner(KeySource{Kind: "FILE", Path: path}, want)
+		check(t, kp, err)
+	})
+
+	t.Run("ENV", func(t *testing.T) {
+		t.Setenv("TEST_SIGNER_KEY", "  "+testSeed+"  ")
+		kp, err := LoadSigner(KeySource{Kind: "ENV", Name: "TEST_SIGNER_KEY"}, want)
+		check(t, kp, err)
+	})
+
+	t.Run("upper case", func(t *testing.T) {
+		t.Setenv("TEST_SIGNER_KEY", strings.ToUpper(strings.Repeat("ab", 32)))
+		kp, err := LoadSigner(KeySource{Kind: "ENV", Name: "TEST_SIGNER_KEY"}, want)
+		check(t, kp, err)
+	})
+}
+
+func TestLoadSignerRejected(t *testing.T) {
+	executor := seedAddress(t, testSeed)
+	otherSeed := strings.Repeat("cd", 32)
+	cases := map[string]string{
+		"63 characters":     testSeed[:63],
+		"65 characters":     testSeed + "a",
+		"0x prefix":         "0x" + testSeed,
+		"non-hex character": testSeed[:63] + "g",
+		"whitespace only":   "   ",
+		"another address":   otherSeed,
+		"inner whitespace":  testSeed[:30] + " " + testSeed[31:],
+	}
+	for name, key := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TEST_SIGNER_KEY", key)
+			_, err := LoadSigner(KeySource{Kind: "ENV", Name: "TEST_SIGNER_KEY"}, executor)
+			if !errors.Is(err, ErrConfig) {
+				t.Fatalf("LoadSigner = %v, want ErrConfig", err)
+			}
+			msg := err.Error()
+			if trimmed := strings.TrimSpace(key); (trimmed != "" && strings.Contains(msg, trimmed)) || strings.Contains(msg, "invalid byte") {
+				t.Fatalf("error holds key material: %q", msg)
+			}
+		})
+	}
+}
+
+func TestSignerFromKeyClearsRaw(t *testing.T) {
+	executor := seedAddress(t, testSeed)
+	src := KeySource{Kind: "ENV", Name: "K"}
+	cases := map[string]string{
+		"success":           testSeed,
+		"another address":   strings.Repeat("cd", 32),
+		"non-hex character": testSeed[:63] + "g",
+	}
+	for name, key := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw := []byte(key)
+			signerFromKey(raw, src, executor)
+			for i, c := range raw {
+				if c != 0 {
+					t.Fatalf("raw[%d] = %#x, want 0", i, c)
+				}
 			}
 		})
 	}

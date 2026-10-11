@@ -92,10 +92,20 @@ func (r *Reader) CheckNode(confirmationDepth uint64) error {
 	return err
 }
 
+// pillarInfoVariableName is go-zenon's ABI variable name for a pillar record, which go-zenon
+// does not export.
+const pillarInfoVariableName = "pillarInfo"
+
 // read returns the proven value stored under key in Settlement storage, or nil when the key is
 // proven absent.
 func (v *View) read(key []byte) ([]byte, error) {
-	raw := append(append(append([]byte{0x03}, types.SettlementContract.Bytes()...), 0x04), key...)
+	return v.readAt(types.SettlementContract, key)
+}
+
+// readAt returns the proven value stored under key in contract's storage, or nil when the key
+// is proven absent.
+func (v *View) readAt(contract types.Address, key []byte) ([]byte, error) {
+	raw := append(append(append([]byte{0x03}, contract.Bytes()...), 0x04), key...)
 	p, err := v.c.Proof(v.Height, raw)
 	if err != nil {
 		return nil, err
@@ -252,6 +262,20 @@ func (v *View) ExecutorSetMember(pillarName string) (*definition.ExecutorSetMemb
 		return nil, false, err
 	}
 	return m, true, nil
+}
+
+// PillarActive reports whether the pillar is registered and not revoked, from the Pillar
+// contract's storage. A value that does not decode is an error wrapping recovery.ErrHalted.
+func (v *View) PillarActive(name string) (bool, error) {
+	value, err := v.readAt(types.PillarContract, definition.GetPillarInfoKey(name))
+	if err != nil || value == nil {
+		return false, err
+	}
+	p := new(definition.PillarInfo)
+	if err := definition.ABIPillars.UnpackVariable(p, pillarInfoVariableName, value); err != nil {
+		return false, halted(v.Height, "proven %s value does not decode: %v", pillarInfoVariableName, err)
+	}
+	return p.IsActive(), nil
 }
 
 // OutboxProcessed reports whether the outbox message was relayed. Settlement stores the single

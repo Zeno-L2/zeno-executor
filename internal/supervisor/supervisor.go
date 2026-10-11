@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/zenon-network/go-zenon/wallet"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc"
@@ -46,37 +49,52 @@ type WorkerStatus struct {
 	LastExit      string // see exitString and the runOnce kill paths
 	ServedHeight  uint64
 	LastCommitted *codec.BatchCommitment // a copy; nil until the first valid Committed
+	SubmitError   string                 // why the domain's submission stalled; empty when it has not
+	RejectError   string                 // set once Settlement has rejected the domain's next batch rejectAlert times in a row; empty otherwise
 }
 
 // Supervisor starts and supervises one worker process per configured domain.
 type Supervisor struct {
 	cfg    Config
-	key    []byte // held for signing later; never logged, formatted or serialised
+	key    *wallet.KeyPair // signs send blocks; never logged, formatted or serialised
 	src    Sources
 	policy Policy // WithDefaults applied in New
 
 	mu    sync.Mutex // guards every slot's state, pid, restarts, lastExit
 	slots []*slot    // config order
+	sub   *submitter // set by New
 }
 
 // slot is one configured worker's supervision state.
 type slot struct {
 	w        WorkerConfig
-	st       *workerState // one per slot for the Supervisor's lifetime; highWater, servedHeight, lastCommitted carry across runs
+	st       *workerState // one per slot for the Supervisor's lifetime; highWater, servedHeight, lastCommitted, commitments carry across runs
 	state    State
 	pid      int
 	restarts int
 	lastExit string
 }
 
+// redactEndpoint returns the scheme and host of a znnd endpoint, dropping any userinfo, path and
+// query that can carry credentials. It returns a placeholder when the endpoint does not parse.
+func redactEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return "<invalid endpoint>"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 // New constructs a Supervisor for cfg. cfg must come from LoadConfig; New does not re-validate
 // it.
-func New(cfg Config, key []byte, src Sources, policy Policy) *Supervisor {
+func New(cfg Config, key *wallet.KeyPair, src Sources, policy Policy) *Supervisor {
 	slots := make([]*slot, len(cfg.Workers))
 	for i, w := range cfg.Workers {
-		slots[i] = &slot{w: w, st: &workerState{}, state: StateStopped}
+		slots[i] = &slot{w: w, st: &workerState{maxHeld: heldCap(cfg.MaxPendingBatches), endpoint: redactEndpoint(cfg.ZnndEndpoint), halt: make(chan struct{})}, state: StateStopped}
 	}
-	return &Supervisor{cfg: cfg, key: key, src: src, policy: policy.WithDefaults(), slots: slots}
+	s := &Supervisor{cfg: cfg, key: key, src: src, policy: policy.WithDefaults(), slots: slots}
+	s.sub = newSubmitter(s)
+	return s
 }
 
 // Run acquires the executor's single-instance lease, prepares every worker's storage directory
@@ -105,6 +123,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return fmt.Errorf("supervisor: %w", err)
 	}
 	defer held.Release()
+
+	if s.src.Node != nil {
+		lg, err := openSendLog(filepath.Join(supDir, s.cfg.ExecutorAddress.String()+".submissions.jsonl"))
+		if err != nil {
+			return fmt.Errorf("supervisor: %w", err)
+		}
+		defer lg.Close()
+		s.sub.resume(lg, lg.accepted, lg.unreadable)
+	}
 
 	host := workerproc.NewHost()
 	limits, uids, reason := host.Enforcement()
@@ -140,6 +167,14 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}(sl)
 	}
 
+	if s.src.Node != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sub.run(ctx)
+		}()
+	}
+
 	<-ctx.Done()
 	wg.Wait()
 	return nil
@@ -160,6 +195,8 @@ func (s *Supervisor) Status() []WorkerStatus {
 			lastCommitted = &cc
 		}
 		served := sl.st.servedHeight
+		submitError := sl.st.submitError
+		rejectError := sl.st.rejectError
 		sl.st.mu.Unlock()
 
 		out[i] = WorkerStatus{
@@ -170,7 +207,29 @@ func (s *Supervisor) Status() []WorkerStatus {
 			LastExit:      sl.lastExit,
 			ServedHeight:  served,
 			LastCommitted: lastCommitted,
+			SubmitError:   submitError,
+			RejectError:   rejectError,
 		}
+	}
+	return out
+}
+
+// SubmitterStatus reports the latest send and why submission needs the operator, if it does. It
+// is safe to call at any time.
+func (s *Supervisor) SubmitterStatus() SubmitterStatus {
+	var out SubmitterStatus
+	s.sub.mu.Lock()
+	lg := s.sub.log
+	out.Error = s.sub.logText
+	if out.Error == "" {
+		out.Error = s.sub.alertText
+	}
+	if out.Error == "" {
+		out.Error = s.sub.plasmaText
+	}
+	s.sub.mu.Unlock()
+	if r, ok := lg.Last(); ok {
+		out.Last = &r
 	}
 	return out
 }
@@ -215,6 +274,10 @@ func (s *Supervisor) supervise(ctx context.Context, host *workerproc.Host, sl *s
 		action, wait, next := s.policy.Next(backoff, end)
 		backoff = next
 
+		if s.haltOnFault(sl) {
+			return
+		}
+
 		switch action {
 		case ActionRestart:
 			s.mu.Lock()
@@ -230,6 +293,10 @@ func (s *Supervisor) supervise(ctx context.Context, host *workerproc.Host, sl *s
 				sl.state = StateStopped
 				s.mu.Unlock()
 				return
+			case <-sl.st.halt:
+				t.Stop()
+				s.haltOnFault(sl)
+				return
 			case <-t.C:
 			}
 
@@ -237,6 +304,9 @@ func (s *Supervisor) supervise(ctx context.Context, host *workerproc.Host, sl *s
 			s.mu.Lock()
 			sl.state = StateHalted
 			s.mu.Unlock()
+			if s.haltOnFault(sl) {
+				return
+			}
 			log.Printf("supervisor: domain %d HALTED: worker halted (%s)", sl.w.DomainID, lastExit)
 			return
 
@@ -244,6 +314,9 @@ func (s *Supervisor) supervise(ctx context.Context, host *workerproc.Host, sl *s
 			s.mu.Lock()
 			sl.state = StateConfigError
 			s.mu.Unlock()
+			if s.haltOnFault(sl) {
+				return
+			}
 			log.Printf("supervisor: domain %d CONFIG_ERROR: worker rejected its configuration (%s)", sl.w.DomainID, lastExit)
 			return
 
@@ -251,10 +324,30 @@ func (s *Supervisor) supervise(ctx context.Context, host *workerproc.Host, sl *s
 			s.mu.Lock()
 			sl.state = StateHalted
 			s.mu.Unlock()
+			if s.haltOnFault(sl) {
+				return
+			}
 			log.Printf("supervisor: domain %d HALTED: crash loop after %d failures without progress (last: %s)", sl.w.DomainID, backoff.Failures, lastExit)
 			return
 		}
 	}
+}
+
+// haltOnFault sets sl HALTED with its consistency fault as LastExit, and logs it, when
+// sl.st.fault is set. It reports whether it did. The caller holds no lock.
+func (s *Supervisor) haltOnFault(sl *slot) bool {
+	sl.st.mu.Lock()
+	fault := sl.st.fault
+	sl.st.mu.Unlock()
+	if fault == "" {
+		return false
+	}
+	s.mu.Lock()
+	sl.state = StateHalted
+	sl.lastExit = fault
+	s.mu.Unlock()
+	log.Printf("supervisor: domain %d HALTED: %s", sl.w.DomainID, fault)
+	return true
 }
 
 // runOnce starts and supervises one attempt at running sl's worker, to completion. shutdown is
@@ -322,6 +415,8 @@ func (s *Supervisor) runOnce(ctx context.Context, host *workerproc.Host, sl *slo
 	serveErrCh := serveErr // set to nil once its one value has been received
 	serveArrived := false
 
+	haltCh := st.halt // set to nil once it fires
+
 	liveness := time.NewTimer(s.policy.Liveness)
 	defer liveness.Stop()
 
@@ -338,8 +433,22 @@ loop:
 				killReason = "malformed message: " + err.Error()
 				_ = p.Signal(syscall.SIGKILL)
 			}
+			if err != nil && errors.Is(err, ErrInconsistent) && killReason == "" {
+				log.Printf("supervisor: domain %d %v", w.DomainID, err)
+				killReason = err.Error()
+				_ = p.Signal(syscall.SIGKILL)
+			}
 			// A nil error, or one arriving after a kill reason is already set, changes nothing:
 			// keep waiting for the exit. Liveness still applies.
+
+		case <-haltCh:
+			haltCh = nil
+			if killReason == "" {
+				st.mu.Lock()
+				killReason = st.fault
+				st.mu.Unlock()
+				_ = p.Signal(syscall.SIGKILL)
+			}
 
 		case <-liveness.C:
 			st.mu.Lock()
@@ -398,15 +507,20 @@ loop:
 	if lastExit == "" {
 		lastExit = exitString(exit)
 	}
+
+	st.mu.Lock()
+	progressed, fault := st.progressed, st.fault
+	st.mu.Unlock()
+
+	// A consistency fault halts the domain whatever exit the worker reached.
+	if fault != "" {
+		lastExit = fault
+	}
 	s.mu.Lock()
 	sl.lastExit = lastExit
 	s.mu.Unlock()
 
-	st.mu.Lock()
-	progressed := st.progressed
-	st.mu.Unlock()
-
-	return RunEnd{Exit: exit, Ran: time.Since(started), Progressed: progressed}, shutdown
+	return RunEnd{Exit: exit, Ran: time.Since(started), Progressed: progressed, Inconsistent: fault != ""}, shutdown
 }
 
 // exitString describes how a worker run ended, for LastExit. A killReason that actually landed

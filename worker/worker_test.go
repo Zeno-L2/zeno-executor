@@ -13,6 +13,7 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
@@ -91,6 +92,7 @@ func validWorkerConfig(storagePath string) ipc.WorkerConfig {
 		Role:              "EXECUTOR",
 		NetworkName:       "test",
 		StoragePath:       storagePath,
+		MaxPendingBatches: 8,
 	}
 }
 
@@ -129,6 +131,10 @@ type fakeSupervisor struct {
 	mu        sync.Mutex
 	requests  []ipc.MomentaRequest
 	committed []codec.BatchCommitment
+	retracts  []uint64
+	// committedAtRetract[i] is len(committed) when retracts[i] arrived.
+	committedAtRetract []int
+	recovered          []codec.BatchCommitment
 
 	layout recovery.Layout
 	done   chan struct{}
@@ -204,9 +210,22 @@ func (f *fakeSupervisor) run() {
 			if err := ipc.WriteMessage(f.conn, f.anchor()); err != nil {
 				return
 			}
+		case ipc.AcceptedRequest:
+			if err := ipc.WriteMessage(f.conn, ipc.Accepted{}); err != nil {
+				return
+			}
 		case ipc.Committed:
 			f.mu.Lock()
 			f.committed = append(f.committed, v.Commitment)
+			f.mu.Unlock()
+		case ipc.Retract:
+			f.mu.Lock()
+			f.retracts = append(f.retracts, v.FromBatchID)
+			f.committedAtRetract = append(f.committedAtRetract, len(f.committed))
+			f.mu.Unlock()
+		case ipc.Recovered:
+			f.mu.Lock()
+			f.recovered = append(f.recovered, v.Commitment)
 			f.mu.Unlock()
 		default:
 			return
@@ -267,6 +286,15 @@ type noAnchor struct{}
 
 func (noAnchor) FinalizedAnchor(uint32) (recovery.Anchor, bool, error) {
 	return recovery.Anchor{}, false, nil
+}
+
+// noCursor reports a nextBatchId of 0 for every domain.
+type noCursor struct{}
+
+func (noCursor) NextBatchID(uint32) (uint64, error) { return 0, nil }
+
+func (noCursor) AcceptedEntries(uint32, uint64) (uint64, []*definition.BatchEntry, error) {
+	return 0, nil, nil
 }
 
 // --- polling helpers ---
@@ -517,6 +545,13 @@ func TestStagedFrontierCommitsThreeBatches(t *testing.T) {
 	if len(records) != 3 {
 		t.Fatalf("%d batch records, want 3", len(records))
 	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.retracts) == 0 || fake.retracts[0] != 0 || fake.committedAtRetract[0] != 0 {
+		t.Fatalf("retracts = %v, committed before the first retract = %v, want Retract{0} before any Committed",
+			fake.retracts, fake.committedAtRetract)
+	}
 }
 
 // --- equivalence: split worker run vs. one in-process runtime.Run ---
@@ -608,6 +643,8 @@ func TestEquivalence(t *testing.T) {
 		Assignments:       refSrc,
 		Caps:              ledgertest.Caps{},
 		Anchors:           noAnchor{},
+		MaxPendingBatches: 1 << 30,
+		Cursor:            noCursor{},
 		Retry:             retry,
 	}
 	rt := runtime.New(refCfg)

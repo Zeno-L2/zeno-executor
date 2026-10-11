@@ -20,6 +20,7 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
+	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
 	"github.com/digitalSloth/go-executor/internal/lease"
 	"github.com/digitalSloth/go-executor/internal/ledger"
@@ -145,6 +146,7 @@ func supervisorConfig(storage string, workers ...WorkerConfig) Config {
 		ExecutorAddress:   types.Address{0x42},
 		NetworkName:       "test",
 		ConfirmationDepth: 2,
+		MaxPendingBatches: defaultMaxPendingBatches,
 		StoragePath:       storage,
 		Workers:           workers,
 	}
@@ -171,7 +173,7 @@ var shrunkPolicy = Policy{BackoffMin: 10 * time.Millisecond, BackoffMax: 50 * ti
 // both) returns at once instead of blocking.
 func startSupervisor(t *testing.T, cfg Config, src Sources, policy Policy) (*Supervisor, context.CancelFunc, <-chan error) {
 	t.Helper()
-	sup := New(cfg, []byte("test-key"), src, policy)
+	sup := New(cfg, nil, src, policy)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -559,7 +561,7 @@ func TestSecondSupervisorFailsOnLease(t *testing.T) {
 	waitFor(t, 30*time.Second, "worker 1 RUNNING", func() bool { return statusFor(supA, 1).State == StateRunning })
 	pidA := statusFor(supA, 1).PID
 
-	supB := New(cfg, []byte("test-key"), src, shrunkPolicy)
+	supB := New(cfg, nil, src, shrunkPolicy)
 	ctxB, cancelB := context.WithCancel(context.Background())
 	defer cancelB()
 
@@ -619,7 +621,7 @@ func TestReadyGatesWorkerStart(t *testing.T) {
 		}
 
 		// The lease is held during the wait, so a second supervisor fails fast.
-		other := New(cfg, []byte("test-key"), chainSources(chain, frontier), shrunkPolicy)
+		other := New(cfg, nil, chainSources(chain, frontier), shrunkPolicy)
 		errOther := make(chan error, 1)
 		go func() { errOther <- other.Run(context.Background()) }()
 		select {
@@ -791,4 +793,499 @@ func TestWorkerAccessChecks(t *testing.T) {
 			t.Fatalf("err = %v, want ErrConfig naming %s", accessErr, keyPath)
 		}
 	})
+}
+
+// --- commitment hand-off ---
+
+func slotFor(sup *Supervisor, id uint32) *slot {
+	for _, sl := range sup.slots {
+		if sl.w.DomainID == id {
+			return sl
+		}
+	}
+	return nil
+}
+
+func heldCommitments(sup *Supervisor, id uint32) map[uint64]codec.BatchCommitment {
+	st := slotFor(sup, id).st
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make(map[uint64]codec.BatchCommitment, len(st.commitments))
+	for k, v := range st.commitments {
+		out[k] = v
+	}
+	return out
+}
+
+// firstPhaseCommitments runs a supervisor over fresh storage until every domain's cursor is at
+// height 4 with a held batch ending at the cursor's LastInputSeq, copies each domain's held
+// commitments, and shuts the supervisor down.
+func firstPhaseCommitments(t *testing.T, ids ...uint32) (string, []*nom.DetailedMomentum, *atomic.Uint64, map[uint32]map[uint64]codec.BatchCommitment) {
+	t.Helper()
+	storage := openTempDir(t)
+	chain := buildChain(t, 12, func(uint64, byte) string { return "" })
+	frontier := newFrontier(6)
+	src := chainSources(chain, frontier)
+	var workers []WorkerConfig
+	for _, id := range ids {
+		workers = append(workers, workerConfig(id, workerBinary, 1<<30, 1))
+	}
+	sup, cancel, done := startSupervisor(t, supervisorConfig(storage, workers...), src, shrunkPolicy)
+
+	waitFor(t, 30*time.Second, "every cursor at height 4 with its last batch held", func() bool {
+		for _, id := range ids {
+			pos, ok := readCursor(storage, id)
+			if !ok || pos.MomentumHeight != 4 {
+				return false
+			}
+			held := false
+			for _, c := range heldCommitments(sup, id) {
+				held = held || c.LastInputSeq == pos.LastInputSeq
+			}
+			if !held {
+				return false
+			}
+		}
+		return true
+	})
+	copies := map[uint32]map[uint64]codec.BatchCommitment{}
+	for _, id := range ids {
+		copies[id] = heldCommitments(sup, id)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("first Run = %v, want nil", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatalf("first Run did not return")
+	}
+	return storage, chain, frontier, copies
+}
+
+func TestSupervisorRestartRecoversCommitments(t *testing.T) {
+	storage, chain, frontier, copies := firstPhaseCommitments(t, 1)
+
+	src := chainSources(chain, frontier)
+	sup, _, _ := startSupervisor(t, supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1)), src, shrunkPolicy)
+
+	waitFor(t, 30*time.Second, "the held commitments refilled from the worker's boot report", func() bool {
+		return reflect.DeepEqual(heldCommitments(sup, 1), copies[1])
+	})
+	st := slotFor(sup, 1).st
+	st.mu.Lock()
+	progressed := st.progressed
+	st.mu.Unlock()
+	if progressed {
+		t.Fatalf("progressed = true after a boot re-report, want false")
+	}
+}
+
+func TestConsistencyFaultHaltsOnlyThatDomain(t *testing.T) {
+	storage, chain, frontier, copies := firstPhaseCommitments(t, 1, 2)
+
+	src := chainSources(chain, frontier)
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1))
+	sup := New(cfg, nil, src, shrunkPolicy)
+
+	flipped := map[uint64]codec.BatchCommitment{}
+	for k, v := range copies[1] {
+		flipped[k] = v
+	}
+	b0, ok := flipped[0]
+	if !ok {
+		t.Fatalf("domain 1 holds no batch 0: %v", copies[1])
+	}
+	b0.DAHash[0] ^= 0xff
+	flipped[0] = b0
+	st1 := slotFor(sup, 1).st
+	st1.mu.Lock()
+	st1.commitments = flipped
+	st1.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- sup.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(60 * time.Second):
+			t.Fatalf("supervisor did not shut down in time")
+		}
+	})
+
+	waitFor(t, 30*time.Second, "domain 1 HALTED", func() bool { return statusFor(sup, 1).State == StateHalted })
+	// Proves an absence over several times the shrunk BackoffMax: a HALTED domain is never
+	// restarted.
+	time.Sleep(5 * 50 * time.Millisecond)
+
+	s1 := statusFor(sup, 1)
+	if s1.State != StateHalted || s1.Restarts != 0 ||
+		!strings.Contains(s1.LastExit, "consistency fault") || !strings.Contains(s1.LastExit, "batch 0") {
+		t.Fatalf("domain 1 status = %+v, want HALTED, 0 restarts and a consistency fault on batch 0", s1)
+	}
+	if got := heldCommitments(sup, 1)[0]; !reflect.DeepEqual(got, b0) {
+		t.Fatalf("held batch 0 = %+v, want the flipped one %+v", got, b0)
+	}
+	s2 := statusFor(sup, 2)
+	if s2.State != StateRunning || s2.Restarts != 0 {
+		t.Fatalf("domain 2 status = %+v, want RUNNING with 0 restarts", s2)
+	}
+}
+
+// --- supervisor-originated halts ---
+
+var haltErr = fmt.Errorf("%w: domain 1 test halt", ErrInconsistent)
+
+func TestHaltDomainRecordsOnce(t *testing.T) {
+	cfg := supervisorConfig(openTempDir(t), workerConfig(1, workerBinary, 1<<30, 1))
+	st := New(cfg, nil, Sources{}, Policy{}).slots[0].st
+
+	if !haltDomain(st, haltErr) {
+		t.Fatalf("haltDomain = false, want true")
+	}
+	if st.fault != haltErr.Error() {
+		t.Fatalf("fault = %q, want %q", st.fault, haltErr.Error())
+	}
+	select {
+	case <-st.halt:
+	default:
+		t.Fatalf("halt is open after a recorded fault")
+	}
+	if haltDomain(st, fmt.Errorf("%w: second", ErrInconsistent)) {
+		t.Fatalf("second haltDomain = true, want false")
+	}
+	if st.fault != haltErr.Error() {
+		t.Fatalf("fault = %q after a second call, want %q", st.fault, haltErr.Error())
+	}
+
+	st2 := New(cfg, nil, Sources{}, Policy{}).slots[0].st
+	st2.fault = "serve fault"
+	if haltDomain(st2, haltErr) {
+		t.Fatalf("haltDomain over a serve fault = true, want false")
+	}
+	if st2.fault != "serve fault" {
+		t.Fatalf("fault = %q, want the serve fault kept", st2.fault)
+	}
+	select {
+	case <-st2.halt:
+		t.Fatalf("halt closed without a recorded fault")
+	default:
+	}
+}
+
+func TestHaltDomainHaltsRunningDomain(t *testing.T) {
+	storage := openTempDir(t)
+	chain := buildChain(t, 4, func(uint64, byte) string { return "" })
+	frontier := newFrontier(4)
+	src := chainSources(chain, frontier)
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1))
+	sup, _, _ := startSupervisor(t, cfg, src, shrunkPolicy)
+
+	waitFor(t, 30*time.Second, "both cursors at height 2 and both RUNNING", func() bool {
+		for _, id := range []uint32{1, 2} {
+			p, ok := readCursor(storage, id)
+			if !ok || p.MomentumHeight < 2 || statusFor(sup, id).State != StateRunning {
+				return false
+			}
+		}
+		return true
+	})
+	if !haltDomain(slotFor(sup, 1).st, haltErr) {
+		t.Fatalf("haltDomain = false, want true")
+	}
+	waitFor(t, 30*time.Second, "domain 1 HALTED", func() bool { return statusFor(sup, 1).State == StateHalted })
+	// Proves an absence over several times the shrunk BackoffMax: a HALTED domain is never
+	// restarted.
+	time.Sleep(5 * 50 * time.Millisecond)
+
+	s1 := statusFor(sup, 1)
+	if s1.State != StateHalted || s1.Restarts != 0 || s1.PID != 0 || s1.LastExit != haltErr.Error() {
+		t.Fatalf("domain 1 status = %+v, want HALTED, 0 restarts, PID 0, LastExit %q", s1, haltErr.Error())
+	}
+	s2 := statusFor(sup, 2)
+	if s2.State != StateRunning || s2.Restarts != 0 {
+		t.Fatalf("domain 2 status = %+v, want RUNNING with 0 restarts", s2)
+	}
+}
+
+func TestHaltDomainDuringBackoff(t *testing.T) {
+	storage := openTempDir(t)
+	chain := buildChain(t, 4, func(uint64, byte) string { return "" })
+	frontier := newFrontier(4)
+	src := chainSources(chain, frontier)
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1))
+
+	domainDir := filepath.Join(storage, "1")
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	held, err := lease.Acquire(filepath.Join(domainDir, "worker.lock"))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	t.Cleanup(func() { _ = held.Release() })
+
+	sup, _, _ := startSupervisor(t, cfg, src, Policy{BackoffMin: time.Minute, BackoffMax: time.Minute})
+	waitFor(t, 30*time.Second, "domain 1 BACKOFF", func() bool { return statusFor(sup, 1).State == StateBackoff })
+
+	if !haltDomain(slotFor(sup, 1).st, haltErr) {
+		t.Fatalf("haltDomain = false, want true")
+	}
+	waitFor(t, 10*time.Second, "domain 1 HALTED", func() bool { return statusFor(sup, 1).State == StateHalted })
+	if s := statusFor(sup, 1); s.Restarts != 0 || s.LastExit != haltErr.Error() {
+		t.Fatalf("domain 1 status = %+v, want 0 restarts and LastExit %q", s, haltErr.Error())
+	}
+}
+
+func TestFaultAfterRunHalts(t *testing.T) {
+	const preset = "supervisor: consistency fault: test"
+	cases := []struct {
+		name   string
+		policy Policy
+	}{
+		{"crash loop", Policy{BackoffMin: 10 * time.Millisecond, BackoffMax: 50 * time.Millisecond, CrashLoopLimit: 1}},
+		{"restart", Policy{BackoffMin: time.Minute, BackoffMax: time.Minute}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := filepath.Join(openTempDir(t), "worker")
+			if err := os.WriteFile(bin, []byte("not an executable\n"), 0o755); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			storage := openTempDir(t)
+			chain := buildChain(t, 4, func(uint64, byte) string { return "" })
+			src := chainSources(chain, newFrontier(4))
+			sup := New(supervisorConfig(storage, workerConfig(1, bin, 1<<30, 1)), nil, src, tc.policy)
+			st := slotFor(sup, 1).st
+			st.mu.Lock()
+			st.fault = preset
+			st.mu.Unlock()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				done <- sup.Run(ctx)
+				close(done)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(60 * time.Second):
+					t.Fatalf("supervisor did not shut down in time")
+				}
+			})
+
+			waitFor(t, 10*time.Second, "domain 1 HALTED", func() bool { return statusFor(sup, 1).State == StateHalted })
+			if s := statusFor(sup, 1); s.Restarts != 0 || s.LastExit != preset {
+				t.Fatalf("domain 1 status = %+v, want 0 restarts and LastExit %q", s, preset)
+			}
+		})
+	}
+}
+
+func TestStatusReportsSubmitError(t *testing.T) {
+	cfg := supervisorConfig(t.TempDir(), workerConfig(1, "/bin/true", 1<<30, 1), workerConfig(2, "/bin/true", 1<<30, 1))
+	sup := New(cfg, nil, Sources{}, shrunkPolicy)
+	st := sup.slots[1].st
+	st.mu.Lock()
+	st.submitError = "stalled"
+	st.rejectError = "rejected"
+	st.mu.Unlock()
+
+	got := sup.Status()
+	if got[0].SubmitError != "" || got[1].SubmitError != "stalled" {
+		t.Fatalf("SubmitError = %q, %q; want none for domain 1 and %q for domain 2", got[0].SubmitError, got[1].SubmitError, "stalled")
+	}
+	if got[0].RejectError != "" || got[1].RejectError != "rejected" {
+		t.Fatalf("RejectError = %q, %q; want none for domain 1 and %q for domain 2", got[0].RejectError, got[1].RejectError, "rejected")
+	}
+}
+
+func TestSubmitterStatus(t *testing.T) {
+	cfg := supervisorConfig(t.TempDir(), workerConfig(1, "/bin/true", 1<<30, 1))
+	sup := New(cfg, nil, Sources{}, shrunkPolicy)
+
+	if got := sup.SubmitterStatus(); got.Last != nil || got.Error != "" {
+		t.Fatalf("SubmitterStatus before any send = %+v, want empty", got)
+	}
+
+	r := SendRecord{DomainID: 1, BatchID: 4, Hash: types.Hash{0x01}}
+	if err := sup.sub.log.Sent(r); err != nil {
+		t.Fatal(err)
+	}
+	got := sup.SubmitterStatus()
+	if got.Last == nil || *got.Last != r {
+		t.Fatalf("Last = %+v, want %+v", got.Last, r)
+	}
+	got.Last.BatchID = 99
+	if again := sup.SubmitterStatus(); again.Last.BatchID != 4 {
+		t.Fatalf("Last changed through the returned copy: %+v", again.Last)
+	}
+
+	sup.sub.mu.Lock()
+	sup.sub.plasmaText = "no plasma"
+	sup.sub.mu.Unlock()
+	if got := sup.SubmitterStatus().Error; got != "no plasma" {
+		t.Fatalf("Error = %q, want the plasma text", got)
+	}
+	sup.sub.mu.Lock()
+	sup.sub.alertText = "unconfirmed"
+	sup.sub.mu.Unlock()
+	if got := sup.SubmitterStatus().Error; got != "unconfirmed" {
+		t.Fatalf("Error = %q, want the alert text to win over the plasma text", got)
+	}
+	sup.sub.mu.Lock()
+	sup.sub.logText = "disk full"
+	sup.sub.mu.Unlock()
+	if got := sup.SubmitterStatus().Error; got != "disk full" {
+		t.Fatalf("Error = %q, want the log text to win over the alert text", got)
+	}
+}
+
+// --- submission log wiring ---
+
+// logRun is a supervisor whose Ready counts its calls and returns false, so Run returns once it
+// has opened the submission log.
+type logRun struct {
+	sup   *Supervisor
+	dir   string
+	path  string
+	ready *int32
+}
+
+func newLogRun(t *testing.T, withNode bool) logRun {
+	t.Helper()
+	storage := t.TempDir()
+	cfg := supervisorConfig(storage, workerConfig(1, "/bin/true", 1<<30, 1))
+	var ready int32
+	src := Sources{Ready: func(context.Context) bool { atomic.AddInt32(&ready, 1); return false }}
+	if withNode {
+		src.Node = newSendNodeFake()
+	}
+	dir := filepath.Join(storage, "supervisor")
+	return logRun{
+		sup:   New(cfg, testKeyPair(t), src, shrunkPolicy),
+		dir:   dir,
+		path:  filepath.Join(dir, cfg.ExecutorAddress.String()+".submissions.jsonl"),
+		ready: &ready,
+	}
+}
+
+func (r logRun) writeLog(t *testing.T, content string) {
+	t.Helper()
+	if err := os.MkdirAll(r.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r.path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunOpensTheSubmissionLog(t *testing.T) {
+	b2, b3 := logRec(1, 2, 0x02), logRec(1, 3, 0x03)
+
+	t.Run("an existing log", func(t *testing.T) {
+		r := newLogRun(t, true)
+		r.writeLog(t, logLines(b2, logResolved(b2, OutcomeAccepted), b3))
+		if err := r.sup.Run(context.Background()); err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+		if last := r.sup.SubmitterStatus().Last; last == nil || *last != b3 {
+			t.Fatalf("Last = %+v, want %+v", last, b3)
+		}
+		if r.sup.sub.pending == nil || r.sup.sub.pending.unreadable != nil {
+			t.Fatalf("pending = %+v, want the readable send", r.sup.sub.pending)
+		}
+		st := r.sup.slots[0].st
+		st.mu.Lock()
+		next := st.chainNext
+		st.mu.Unlock()
+		if next != 3 {
+			t.Fatalf("chainNext = %d, want 3", next)
+		}
+	})
+
+	t.Run("no file beforehand", func(t *testing.T) {
+		r := newLogRun(t, true)
+		if err := r.sup.Run(context.Background()); err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+		fi, err := os.Stat(r.path)
+		if err != nil || fi.Size() != 0 || fi.Mode().Perm() != 0o600 {
+			t.Fatalf("log = %v, %v; want an empty file with mode 0600", fi, err)
+		}
+	})
+
+	t.Run("an unreadable last send", func(t *testing.T) {
+		r := newLogRun(t, true)
+		h := types.Hash{0x0f}
+		r.writeLog(t, fmt.Sprintf(`{"version":2,"domainId":1,"batchId":3,"hash":"%s"}`+"\n", h))
+		if err := r.sup.Run(context.Background()); err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+		if last := r.sup.SubmitterStatus().Last; last == nil || last.Hash != h {
+			t.Fatalf("Last = %+v, want hash %s", last, h)
+		}
+		if p := r.sup.sub.pending; p == nil || p.unreadable == nil || !strings.Contains(p.unreadable.Error(), "log-format version 2") {
+			t.Fatalf("pending = %+v, want an unreadable send", p)
+		}
+	})
+}
+
+func TestRunFailsOnADamagedSubmissionLog(t *testing.T) {
+	r := newLogRun(t, true)
+	r.writeLog(t, "not json\n")
+	err := r.sup.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), r.path) || !strings.Contains(err.Error(), "line 1") {
+		t.Fatalf("Run = %v, want an error naming %s and line 1", err, r.path)
+	}
+	if !strings.HasPrefix(err.Error(), "supervisor: ") {
+		t.Fatalf("Run = %v, want the supervisor prefix", err)
+	}
+	if n := atomic.LoadInt32(r.ready); n != 0 {
+		t.Fatalf("Ready was called %d times", n)
+	}
+	if st := r.sup.Status()[0].State; st != StateStopped {
+		t.Fatalf("State = %s, want %s", st, StateStopped)
+	}
+}
+
+func TestRunWithoutNodeOpensNoLog(t *testing.T) {
+	r := newLogRun(t, false)
+	if err := r.sup.Run(context.Background()); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if _, err := os.Stat(r.path); !os.IsNotExist(err) {
+		t.Fatalf("log file: %v, want none", err)
+	}
+}
+
+func TestRunWithTheLeaseHeldOpensNoLog(t *testing.T) {
+	r := newLogRun(t, true)
+	if err := os.MkdirAll(r.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	held, err := lease.Acquire(filepath.Join(r.dir, r.sup.cfg.ExecutorAddress.String()+".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { held.Release() })
+
+	err = r.sup.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "is held by another process") {
+		t.Fatalf("Run = %v, want the lease error", err)
+	}
+	if n := atomic.LoadInt32(r.ready); n != 0 {
+		t.Fatalf("Ready was called %d times", n)
+	}
+	if _, err := os.Stat(r.path); !os.IsNotExist(err) {
+		t.Fatalf("log file: %v, want none", err)
+	}
 }

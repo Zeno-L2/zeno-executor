@@ -35,7 +35,7 @@ func run() int {
 		return exitStatus(err)
 	}
 
-	key, err := supervisor.LoadKey(cfg.SubmissionKeySource)
+	key, err := supervisor.LoadSigner(cfg.SubmissionKeySource, cfg.ExecutorAddress)
 	if err != nil {
 		log.Printf("executor: %v", err)
 		return exitStatus(err)
@@ -56,6 +56,7 @@ func run() int {
 		Assignments: reader,
 		Caps:        supervisor.NewCapCache(reader),
 		Ready:       ready,
+		Node:        client,
 	}
 	sup := supervisor.New(cfg, key, sources, supervisor.Policy{})
 	err = sup.Run(ctx)

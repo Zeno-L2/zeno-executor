@@ -25,6 +25,12 @@ var ErrConfig = errors.New("supervisor: invalid configuration")
 // roleExecutor is the only worker role this package implements (EXECUTOR §17).
 const roleExecutor = "EXECUTOR"
 
+// defaultMaxPendingBatches is the maxPendingBatches an absent field takes.
+const defaultMaxPendingBatches = 8
+
+// maxPendingBatchesMax is the largest accepted maxPendingBatches.
+const maxPendingBatchesMax = 64
+
 // cpuLimitMin is the smallest cpuLimit the kernel's cpu.max accepts: workerproc_linux.go writes
 // a fixed 100000us period, and the kernel rejects a quota under 1000us, i.e. under 0.01 CPUs.
 const cpuLimitMin = 0.01
@@ -39,10 +45,12 @@ const cpuLimitMax = 1024.0
 type Config struct {
 	ExecutorAddress     types.Address  `json:"executorAddress"`
 	NetworkName         string         `json:"networkName"`
+	PillarName          string         `json:"pillarName"`
 	ZnndEndpoint        string         `json:"znndEndpoint"`
 	ConfirmationDepth   uint64         `json:"confirmationDepth"`
 	StoragePath         string         `json:"storagePath"`
 	SubmissionKeySource KeySource      `json:"submissionKeySource"`
+	MaxPendingBatches   uint64         `json:"maxPendingBatches"`
 	Workers             []WorkerConfig `json:"workers"`
 }
 
@@ -80,7 +88,7 @@ func LoadConfig(path string) (Config, error) {
 
 	dec := json.NewDecoder(f)
 	dec.DisallowUnknownFields()
-	var cfg Config
+	cfg := Config{MaxPendingBatches: defaultMaxPendingBatches}
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("%w: %w", ErrConfig, err)
 	}
@@ -100,11 +108,17 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.NetworkName == "" {
 		return Config{}, fmt.Errorf("%w: networkName is required", ErrConfig)
 	}
+	if cfg.PillarName == "" {
+		return Config{}, fmt.Errorf("%w: pillarName is required", ErrConfig)
+	}
 	if u, err := url.Parse(cfg.ZnndEndpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return Config{}, fmt.Errorf("%w: znndEndpoint %q is not an absolute http or https URL", ErrConfig, cfg.ZnndEndpoint)
 	}
 	if cfg.ConfirmationDepth < 1 || cfg.ConfirmationDepth > recovery.MaxConfirmationDepth {
 		return Config{}, fmt.Errorf("%w: confirmationDepth %d is outside [1, %d]", ErrConfig, cfg.ConfirmationDepth, recovery.MaxConfirmationDepth)
+	}
+	if cfg.MaxPendingBatches < 1 || cfg.MaxPendingBatches > maxPendingBatchesMax {
+		return Config{}, fmt.Errorf("%w: maxPendingBatches %d is outside [1, %d]", ErrConfig, cfg.MaxPendingBatches, maxPendingBatchesMax)
 	}
 	if !filepath.IsAbs(cfg.StoragePath) {
 		return Config{}, fmt.Errorf("%w: storagePath %q is not absolute", ErrConfig, cfg.StoragePath)
@@ -165,8 +179,8 @@ func LoadConfig(path string) (Config, error) {
 }
 
 // workerConfig is the channel Config frame for w: w's DomainID, STFSpecHash and Role, plus c's
-// ExecutorAddress, NetworkName, ConfirmationDepth and StoragePath. The supervisor sends this to
-// the worker over its channel before serving any request.
+// ExecutorAddress, NetworkName, ConfirmationDepth, StoragePath and MaxPendingBatches. The
+// supervisor sends this to the worker over its channel before serving any request.
 func (c Config) workerConfig(w WorkerConfig) ipc.WorkerConfig {
 	return ipc.WorkerConfig{
 		DomainID:          w.DomainID,
@@ -176,5 +190,6 @@ func (c Config) workerConfig(w WorkerConfig) ipc.WorkerConfig {
 		Role:              w.Role,
 		NetworkName:       c.NetworkName,
 		StoragePath:       c.StoragePath,
+		MaxPendingBatches: c.MaxPendingBatches,
 	}
 }

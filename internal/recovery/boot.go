@@ -395,6 +395,38 @@ func checkBundles(cfg Config, anchor Anchor, haveAnchor bool) error {
 	return nil
 }
 
+// resyncRemedy is the operator remedy every Unfinalized halt ends with. It is formatted with
+// the domain directory.
+const resyncRemedy = "stop the executor, remove %s and re-sync"
+
+// Unfinalized returns the stored commitment of every batch record above the
+// anchor, ascending by batchId.
+func Unfinalized(l Layout, anchor Anchor, haveAnchor bool) ([]codec.BatchCommitment, error) {
+	records, err := ListBatchRecords(l)
+	if err != nil {
+		return nil, err
+	}
+	var out []codec.BatchCommitment
+	for _, rec := range records {
+		if haveAnchor && rec.LastInputSeq <= anchor.LastInputSeq {
+			continue
+		}
+		if len(rec.Commitment) == 0 {
+			return nil, halted("batch record %d has no stored commitment: "+resyncRemedy, rec.BatchID, l.Root)
+		}
+		c, err := codec.DecodeBatchCommitment(rec.Commitment)
+		if err != nil {
+			return nil, halted("batch record %d: decode stored commitment: %v: "+resyncRemedy, rec.BatchID, err, l.Root)
+		}
+		if c.BatchID != rec.BatchID || c.FirstInputSeq != rec.FirstInputSeq || c.LastInputSeq != rec.LastInputSeq ||
+			c.PreStateRoot != rec.PreStateRoot || c.PostStateRoot != rec.PostStateRoot || c.DAHash != rec.DAHash {
+			return nil, halted("batch record %d: stored commitment disagrees with the record: "+resyncRemedy, rec.BatchID, l.Root)
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
 // Reconcile runs RECONCILE_FINALIZED_ROOT for one position and reports whether the caller must
 // still verify the anchor's root against re-derived state. It branches on fresh before any
 // sequence comparison: a fresh Position is the zero Position, and globalInputIndex starts at 0,

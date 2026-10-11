@@ -11,6 +11,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
@@ -27,16 +28,22 @@ const (
 	TypeSourceError       Type = 0x06 // S→W
 	TypeAssignment        Type = 0x07 // S→W
 	TypeCap               Type = 0x08 // S→W
+	TypeCursor            Type = 0x09 // S→W
+	TypeAccepted          Type = 0x0A // S→W
 	TypeFrontierRequest   Type = 0x81 // W→S
 	TypeMomentaRequest    Type = 0x82 // W→S
 	TypeAnchorRequest     Type = 0x83 // W→S
 	TypeCommitted         Type = 0x84 // W→S
 	TypeAssignmentRequest Type = 0x85 // W→S
 	TypeCapRequest        Type = 0x86 // W→S
+	TypeRetract           Type = 0x87 // W→S
+	TypeRecovered         Type = 0x88 // W→S
+	TypeCursorRequest     Type = 0x89 // W→S
+	TypeAcceptedRequest   Type = 0x8A // W→S
 )
 
-// Side names the sender of a frame. Supervisor sends 0x01-0x08 and is read with MaxFrame;
-// Worker sends 0x81-0x86 and is read with MaxWorkerFrame.
+// Side names the sender of a frame. Supervisor sends 0x01-0x0A and is read with MaxFrame;
+// Worker sends 0x81-0x8A and is read with MaxWorkerFrame.
 type Side uint8
 
 const (
@@ -45,14 +52,15 @@ const (
 )
 
 const (
-	MaxMomentaCount   = 1024 // internal/ledger/follower.go:18 (rpcMaxCountSize, unexported there)
-	MaxSourceErrorLen = 4096 // the supervisor truncates a source error's text to this
-	maxRoleLen        = 64
-	maxNetworkNameLen = 256
-	maxStoragePathLen = 4096
+	MaxAcceptedEntries = 64   // entries in one Accepted reply; Settlement caps a batch at 64 inputs
+	MaxMomentaCount    = 1024 // internal/ledger/follower.go:18 (rpcMaxCountSize, unexported there)
+	MaxSourceErrorLen  = 4096 // the supervisor truncates a source error's text to this
+	maxRoleLen         = 64
+	maxNetworkNameLen  = 256
+	maxStoragePathLen  = 4096
 )
 
-// Message is implemented by exactly the fourteen types below, all with value receivers.
+// Message is implemented by exactly the twenty types below, all with value receivers.
 type Message interface{ Type() Type }
 
 type WorkerConfig struct {
@@ -63,6 +71,7 @@ type WorkerConfig struct {
 	Role              string
 	NetworkName       string
 	StoragePath       string
+	MaxPendingBatches uint64
 }
 
 func (WorkerConfig) Type() Type { return TypeConfig }
@@ -101,6 +110,29 @@ type Cap struct{ Amounts []codec.U256 }
 func (CapRequest) Type() Type { return TypeCapRequest }
 func (Cap) Type() Type        { return TypeCap }
 
+// CursorRequest asks for Settlement's nextBatchId for the worker's domain.
+type CursorRequest struct{}
+
+// Cursor carries the supervisor's highest observed nextBatchId for the domain.
+type Cursor struct{ NextBatchID uint64 }
+
+func (CursorRequest) Type() Type { return TypeCursorRequest }
+func (Cursor) Type() Type        { return TypeCursor }
+
+// AcceptedRequest asks for Settlement's accepted entries for the worker's domain, from FromBatchID
+// upward.
+type AcceptedRequest struct{ FromBatchID uint64 }
+
+// Accepted carries each entry's BatchId and the fields settlement.EntryMatches compares; every
+// other BatchEntry field decodes as its zero value.
+type Accepted struct {
+	NextBatchID uint64
+	Entries     []*definition.BatchEntry
+}
+
+func (AcceptedRequest) Type() Type { return TypeAcceptedRequest }
+func (Accepted) Type() Type        { return TypeAccepted }
+
 func (Frontier) Type() Type { return TypeFrontier }
 func (Momentum) Type() Type { return TypeMomentum }
 func (RangeEnd) Type() Type { return TypeRangeEnd }
@@ -125,10 +157,19 @@ type MomentaRequest struct{ Height, Count uint64 }
 type AnchorRequest struct{}
 type Committed struct{ Commitment codec.BatchCommitment }
 
+// Retract tells the supervisor the worker holds no batch at or above FromBatchID.
+type Retract struct{ FromBatchID uint64 }
+
+// Recovered re-reports a batch the worker committed earlier and holds above its finalized
+// anchor.
+type Recovered struct{ Commitment codec.BatchCommitment }
+
 func (FrontierRequest) Type() Type { return TypeFrontierRequest }
 func (MomentaRequest) Type() Type  { return TypeMomentaRequest }
 func (AnchorRequest) Type() Type   { return TypeAnchorRequest }
 func (Committed) Type() Type       { return TypeCommitted }
+func (Retract) Type() Type         { return TypeRetract }
+func (Recovered) Type() Type       { return TypeRecovered }
 
 // --- payload reader/writer, shared with momentum.go ---
 
@@ -229,9 +270,9 @@ func (r *preader) end() error {
 
 func sideOfType(t Type) (Side, bool) {
 	switch t {
-	case TypeConfig, TypeFrontier, TypeMomentum, TypeRangeEnd, TypeAnchor, TypeSourceError, TypeAssignment, TypeCap:
+	case TypeConfig, TypeFrontier, TypeMomentum, TypeRangeEnd, TypeAnchor, TypeSourceError, TypeAssignment, TypeCap, TypeCursor, TypeAccepted:
 		return Supervisor, true
-	case TypeFrontierRequest, TypeMomentaRequest, TypeAnchorRequest, TypeCommitted, TypeAssignmentRequest, TypeCapRequest:
+	case TypeFrontierRequest, TypeMomentaRequest, TypeAnchorRequest, TypeCommitted, TypeAssignmentRequest, TypeCapRequest, TypeRetract, TypeRecovered, TypeCursorRequest, TypeAcceptedRequest:
 		return Worker, true
 	default:
 		return 0, false
@@ -279,6 +320,10 @@ func Encode(m Message) ([]byte, error) {
 		payload = nil
 	case Committed:
 		payload, err = v.Commitment.Encode()
+	case Retract:
+		payload = encodeRetract(v)
+	case Recovered:
+		payload, err = v.Commitment.Encode()
 	case AssignmentRequest:
 		payload, err = encodeAssignmentRequest(v)
 	case Assignment:
@@ -287,6 +332,14 @@ func Encode(m Message) ([]byte, error) {
 		payload, err = encodeCapRequest(v)
 	case Cap:
 		payload, err = encodeCap(v)
+	case CursorRequest:
+		payload = nil
+	case Cursor:
+		payload = encodeCursor(v)
+	case AcceptedRequest:
+		payload = encodeAcceptedRequest(v)
+	case Accepted:
+		payload, err = encodeAccepted(v)
 	default:
 		return nil, fmt.Errorf("ipc: encode: unhandled message type %T", m)
 	}
@@ -351,6 +404,10 @@ func decodePayload(t Type, payload []byte) (Message, error) {
 		return decodeAnchorRequest(payload)
 	case TypeCommitted:
 		return decodeCommitted(payload)
+	case TypeRetract:
+		return decodeRetract(payload)
+	case TypeRecovered:
+		return decodeRecovered(payload)
 	case TypeAssignmentRequest:
 		return decodeAssignmentRequest(payload)
 	case TypeAssignment:
@@ -359,6 +416,14 @@ func decodePayload(t Type, payload []byte) (Message, error) {
 		return decodeCapRequest(payload)
 	case TypeCap:
 		return decodeCap(payload)
+	case TypeCursorRequest:
+		return decodeCursorRequest(payload)
+	case TypeCursor:
+		return decodeCursor(payload)
+	case TypeAcceptedRequest:
+		return decodeAcceptedRequest(payload)
+	case TypeAccepted:
+		return decodeAccepted(payload)
 	default:
 		return nil, fmt.Errorf("ipc: unknown type %#x", byte(t))
 	}
@@ -384,6 +449,7 @@ func encodeConfig(c WorkerConfig) ([]byte, error) {
 	w.str16(c.Role)
 	w.str16(c.NetworkName)
 	w.str16(c.StoragePath)
+	w.u64(c.MaxPendingBatches)
 	return w.buf, nil
 }
 
@@ -418,6 +484,10 @@ func decodeConfig(p []byte) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxPending, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
 	if err := r.end(); err != nil {
 		return nil, err
 	}
@@ -428,6 +498,7 @@ func decodeConfig(p []byte) (Message, error) {
 	c.Role = role
 	c.NetworkName = network
 	c.StoragePath = storage
+	c.MaxPendingBatches = maxPending
 	return c, nil
 }
 
@@ -449,6 +520,26 @@ func decodeFrontier(p []byte) (Message, error) {
 		return nil, err
 	}
 	return Frontier{Height: h}, nil
+}
+
+// --- Retract ---
+
+func encodeRetract(m Retract) []byte {
+	w := &pwriter{}
+	w.u64(m.FromBatchID)
+	return w.buf
+}
+
+func decodeRetract(p []byte) (Message, error) {
+	r := newPReader(p)
+	id, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.end(); err != nil {
+		return nil, err
+	}
+	return Retract{FromBatchID: id}, nil
 }
 
 // --- Momentum ---
@@ -757,6 +848,145 @@ func decodeAnchorRequest(p []byte) (Message, error) {
 	return AnchorRequest{}, nil
 }
 
+// --- CursorRequest and Cursor ---
+
+func decodeCursorRequest(p []byte) (Message, error) {
+	if err := newPReader(p).end(); err != nil {
+		return nil, err
+	}
+	return CursorRequest{}, nil
+}
+
+func encodeCursor(m Cursor) []byte {
+	w := &pwriter{}
+	w.u64(m.NextBatchID)
+	return w.buf
+}
+
+func decodeCursor(p []byte) (Message, error) {
+	r := newPReader(p)
+	n, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.end(); err != nil {
+		return nil, err
+	}
+	return Cursor{NextBatchID: n}, nil
+}
+
+// --- AcceptedRequest and Accepted ---
+
+func encodeAcceptedRequest(m AcceptedRequest) []byte {
+	w := &pwriter{}
+	w.u64(m.FromBatchID)
+	return w.buf
+}
+
+func decodeAcceptedRequest(p []byte) (Message, error) {
+	r := newPReader(p)
+	from, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.end(); err != nil {
+		return nil, err
+	}
+	return AcceptedRequest{FromBatchID: from}, nil
+}
+
+func encodeAccepted(m Accepted) ([]byte, error) {
+	if len(m.Entries) > MaxAcceptedEntries {
+		return nil, fmt.Errorf("%d entries exceed %d", len(m.Entries), MaxAcceptedEntries)
+	}
+	w := &pwriter{}
+	w.u64(m.NextBatchID)
+	w.u32(uint32(len(m.Entries)))
+	for i, e := range m.Entries {
+		if e == nil {
+			return nil, fmt.Errorf("entry %d is nil", i)
+		}
+		w.u64(e.BatchId)
+		w.u16(e.ProtocolVersion)
+		w.u64(e.FirstInputSeq)
+		w.u64(e.LastInputSeq)
+		for _, h := range []types.Hash{e.PreStateRoot, e.PostStateRoot, e.InputRoot, e.ReceiptRoot, e.EventRoot, e.OutboxRoot, e.DaHash} {
+			w.raw(h[:])
+		}
+		w.u8(e.DaMode)
+		w.u32(uint32(len(e.AssetFlowSummary)))
+		w.raw(e.AssetFlowSummary)
+		w.u32(uint32(len(e.ProofData)))
+		w.raw(e.ProofData)
+	}
+	return w.buf, nil
+}
+
+func decodeAccepted(p []byte) (Message, error) {
+	r := newPReader(p)
+	next, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	count, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	if count > MaxAcceptedEntries {
+		return nil, errPayload
+	}
+	entries := make([]*definition.BatchEntry, 0, count)
+	for i := uint32(0); i < count; i++ {
+		e := &definition.BatchEntry{}
+		if e.BatchId, err = r.u64(); err != nil {
+			return nil, err
+		}
+		if e.ProtocolVersion, err = r.u16(); err != nil {
+			return nil, err
+		}
+		if e.FirstInputSeq, err = r.u64(); err != nil {
+			return nil, err
+		}
+		if e.LastInputSeq, err = r.u64(); err != nil {
+			return nil, err
+		}
+		for _, h := range []*types.Hash{&e.PreStateRoot, &e.PostStateRoot, &e.InputRoot, &e.ReceiptRoot, &e.EventRoot, &e.OutboxRoot, &e.DaHash} {
+			b, err := r.fixed(len(h))
+			if err != nil {
+				return nil, err
+			}
+			copy(h[:], b)
+		}
+		if e.DaMode, err = r.u8(); err != nil {
+			return nil, err
+		}
+		if e.AssetFlowSummary, err = r.lengthPrefixed(); err != nil {
+			return nil, err
+		}
+		if e.ProofData, err = r.lengthPrefixed(); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	if err := r.end(); err != nil {
+		return nil, err
+	}
+	return Accepted{NextBatchID: next, Entries: entries}, nil
+}
+
+// lengthPrefixed reads a u32 length and that many bytes, copied out of the payload.
+func (r *preader) lengthPrefixed() ([]byte, error) {
+	n, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	b, err := r.fixed(int(n))
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte{}, b...), nil
+}
+
 // --- MomentaRequest ---
 
 func encodeMomentaRequest(m MomentaRequest) ([]byte, error) {
@@ -799,4 +1029,14 @@ func decodeCommitted(p []byte) (Message, error) {
 		return nil, err
 	}
 	return Committed{Commitment: c}, nil
+}
+
+// --- Recovered ---
+
+func decodeRecovered(p []byte) (Message, error) {
+	c, err := codec.DecodeBatchCommitment(p)
+	if err != nil {
+		return nil, err
+	}
+	return Recovered{Commitment: c}, nil
 }

@@ -41,6 +41,7 @@ func baseConfig(storage, binary string) map[string]any {
 	return map[string]any{
 		"executorAddress":   types.Address{0x01}.String(),
 		"networkName":       "devnet",
+		"pillarName":        "dev1",
 		"znndEndpoint":      "http://127.0.0.1:35997",
 		"confirmationDepth": float64(10),
 		"storagePath":       storage,
@@ -97,6 +98,9 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 	if cfg.NetworkName != "devnet" {
 		t.Errorf("NetworkName = %q, want devnet", cfg.NetworkName)
+	}
+	if cfg.PillarName != "dev1" {
+		t.Errorf("PillarName = %q, want dev1", cfg.PillarName)
 	}
 	if cfg.ZnndEndpoint != "http://127.0.0.1:35997" {
 		t.Errorf("ZnndEndpoint = %q, want http://127.0.0.1:35997", cfg.ZnndEndpoint)
@@ -159,6 +163,36 @@ func TestLoadConfigCPULimitBoundaries(t *testing.T) {
 	}
 }
 
+// TestLoadConfigMaxPendingBatches confirms an absent field takes the default and the range is
+// [1, 64].
+func TestLoadConfigMaxPendingBatches(t *testing.T) {
+	storage := t.TempDir()
+	binary := validBinary(t)
+
+	cfg, err := LoadConfig(writeConfig(t, baseConfig(storage, binary)))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MaxPendingBatches != 8 {
+		t.Fatalf("MaxPendingBatches = %d, want the default 8", cfg.MaxPendingBatches)
+	}
+
+	for _, tc := range []struct {
+		n    float64
+		fail bool
+	}{{0, true}, {1, false}, {64, false}, {65, true}} {
+		m := baseConfig(storage, binary)
+		m["maxPendingBatches"] = tc.n
+		cfg, err := LoadConfig(writeConfig(t, m))
+		switch {
+		case tc.fail && (err == nil || !errors.Is(err, ErrConfig) || !strings.Contains(err.Error(), "maxPendingBatches")):
+			t.Errorf("maxPendingBatches %v: err = %v, want ErrConfig naming the field", tc.n, err)
+		case !tc.fail && (err != nil || cfg.MaxPendingBatches != uint64(tc.n)):
+			t.Errorf("maxPendingBatches %v: cfg %d, err %v, want it accepted", tc.n, cfg.MaxPendingBatches, err)
+		}
+	}
+}
+
 // TestLoadConfigBinaryMustBeAbsolute uses a relative path that resolves, from the test's working
 // directory, to a real executable file: that way the rejection can only come from the
 // absolute-path check itself, never from os.Stat failing to find the file. A relative path built
@@ -201,6 +235,7 @@ func TestConfigWorkerConfig(t *testing.T) {
 		ExecutorAddress:   types.Address{0x01},
 		NetworkName:       "devnet",
 		ConfirmationDepth: 10,
+		MaxPendingBatches: 5,
 		StoragePath:       "/var/lib/executor",
 	}
 	w := WorkerConfig{
@@ -220,6 +255,7 @@ func TestConfigWorkerConfig(t *testing.T) {
 		Role:              "EXECUTOR",
 		NetworkName:       "devnet",
 		StoragePath:       "/var/lib/executor",
+		MaxPendingBatches: 5,
 	}
 	if got != want {
 		t.Fatalf("workerConfig = %+v, want %+v", got, want)
@@ -257,6 +293,8 @@ func TestLoadConfigInvalid(t *testing.T) {
 		}},
 		{name: "executorAddress missing", mutate: func(m map[string]any) { delete(m, "executorAddress") }},
 		{name: "executorAddress non-bech32", mutate: func(m map[string]any) { m["executorAddress"] = "not-an-address" }},
+		{name: "pillarName missing", mutate: func(m map[string]any) { delete(m, "pillarName") }},
+		{name: "pillarName empty", mutate: func(m map[string]any) { m["pillarName"] = "" }},
 		{name: "networkName empty", mutate: func(m map[string]any) { m["networkName"] = "" }},
 		{name: "networkName 257 bytes", mutate: func(m map[string]any) { m["networkName"] = strings.Repeat("a", 257) }},
 		{name: "znndEndpoint missing", mutate: func(m map[string]any) { delete(m, "znndEndpoint") }},

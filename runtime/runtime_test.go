@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -205,6 +206,8 @@ func validConfig(t *testing.T, src testSource) Config {
 		Assignments:       src,
 		Caps:              ledgertest.Caps{0x80},
 		Anchors:           noAnchor{},
+		MaxPendingBatches: 1 << 30,
+		Cursor:            &fakeCursor{},
 		Retry:             recovery.RetryPolicy{SourceAttempts: 2, SourceInterval: time.Millisecond, AwaitDAAttempts: 1, AwaitDAInterval: time.Millisecond},
 	}
 }
@@ -267,6 +270,8 @@ func TestConfigValidation(t *testing.T) {
 		"nil assignment source":    func(c *Config) { c.Assignments = nil },
 		"nil cap source":           func(c *Config) { c.Caps = nil },
 		"nil anchor source":        func(c *Config) { c.Anchors = nil },
+		"nil cursor source":        func(c *Config) { c.Cursor = nil },
+		"zero max pending batches": func(c *Config) { c.MaxPendingBatches = 0 },
 	}
 	if err := validConfig(t, src).validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -1714,10 +1719,219 @@ func TestOnCommitReportsDurableCommitments(t *testing.T) {
 		if c.DomainID != 1 {
 			t.Fatalf("commitment %d DomainID = %d, want 1", i, c.DomainID)
 		}
+		enc, err := c.Encode()
+		if err != nil {
+			t.Fatalf("commitment %d Encode: %v", i, err)
+		}
+		if !bytes.Equal(r.Commitment, enc) {
+			t.Fatalf("record %d Commitment = %x, want the encoded reported commitment %x", i, r.Commitment, enc)
+		}
 		if c.ExecutorID != (types.Address{0x42}) {
 			t.Fatalf("commitment %d ExecutorID = %v, want {0x42}", i, c.ExecutorID)
 		}
 	}
+}
+
+// --- OnRecover ---
+
+// recoverEvent is one OnCommit or OnRecover call, in call order.
+type recoverEvent struct {
+	recovered bool
+	next      uint64 // OnRecover: the reported nextBatchID
+	cs        []codec.BatchCommitment
+}
+
+type eventLog struct {
+	mu     sync.Mutex
+	events []recoverEvent
+}
+
+func (e *eventLog) attach(cfg *Config) {
+	cfg.OnCommit = func(c []codec.BatchCommitment) error {
+		e.mu.Lock()
+		e.events = append(e.events, recoverEvent{cs: c})
+		e.mu.Unlock()
+		return nil
+	}
+	cfg.OnRecover = func(next uint64, cs []codec.BatchCommitment) error {
+		e.mu.Lock()
+		e.events = append(e.events, recoverEvent{recovered: true, next: next, cs: cs})
+		e.mu.Unlock()
+		return nil
+	}
+}
+
+func (e *eventLog) snapshot() []recoverEvent {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]recoverEvent(nil), e.events...)
+}
+
+func encodedAll(t *testing.T, cs []codec.BatchCommitment) [][]byte {
+	t.Helper()
+	out := make([][]byte, len(cs))
+	for i, c := range cs {
+		enc, err := c.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		out[i] = enc
+	}
+	return out
+}
+
+func TestOnRecoverReportsUnfinalizedBatches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fresh then restart", func(t *testing.T) {
+		t.Parallel()
+		src := &chainSource{}
+		cfg := validConfig(t, src)
+		var log eventLog
+		log.attach(&cfg)
+
+		chain := buildChain(t, 10, 0)
+		l := startRun(t, cfg, src, scriptDomain{})
+		l.step(chain, 4)
+		l.step(chain, 8)
+		l.step(chain, 12)
+		if err := l.stop(); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		first := log.snapshot()
+		if !first[0].recovered || first[0].next != 0 || len(first[0].cs) != 0 {
+			t.Fatalf("first event = %+v, want OnRecover(0, empty)", first[0])
+		}
+		var committed []codec.BatchCommitment
+		for _, ev := range first {
+			if !ev.recovered {
+				committed = append(committed, ev.cs...)
+			}
+		}
+		if len(committed) < 2 {
+			t.Fatalf("%d committed batches, want at least 2", len(committed))
+		}
+		pos, _ := cursorAt(t, cfg)
+
+		var second eventLog
+		second.attach(&cfg)
+		l = startRun(t, cfg, src, scriptDomain{})
+		l.settle()
+		if err := l.stop(); err != nil {
+			t.Fatalf("second Run: %v", err)
+		}
+		evs := second.snapshot()
+		if len(evs) == 0 || !evs[0].recovered {
+			t.Fatalf("second run events = %+v, want a boot OnRecover first", evs)
+		}
+		if evs[0].next != pos.NextBatchID {
+			t.Fatalf("OnRecover nextBatchID = %d, want %d", evs[0].next, pos.NextBatchID)
+		}
+		if !reflect.DeepEqual(encodedAll(t, evs[0].cs), encodedAll(t, committed)) {
+			t.Fatalf("recovered commitments differ from the committed ones")
+		}
+
+		// An anchor at the first batch's LastInputSeq limits the report to the later batches.
+		anchorSeq := committed[0].LastInputSeq
+		cfg.Anchors = fixedAnchor{recovery.Anchor{LastInputSeq: anchorSeq, PostStateRoot: rootAtIndex(t, cfg, anchorSeq)}, true}
+		var third eventLog
+		third.attach(&cfg)
+		l = startRun(t, cfg, src, scriptDomain{})
+		l.settle()
+		if err := l.stop(); err != nil {
+			t.Fatalf("third Run: %v", err)
+		}
+		evs = third.snapshot()
+		if len(evs) == 0 || !evs[0].recovered {
+			t.Fatalf("third run events = %+v, want a boot OnRecover first", evs)
+		}
+		if !reflect.DeepEqual(encodedAll(t, evs[0].cs), encodedAll(t, committed[1:])) {
+			t.Fatalf("anchored report = %d commitments, want the %d later ones", len(evs[0].cs), len(committed)-1)
+		}
+	})
+
+	a := buildShape(1, 12, saltFrom(1<<62, 0), dense)
+	b := buildShape(1, 16, saltFrom(9, 1), func(h uint64) int {
+		if h >= 9 {
+			return 2
+		}
+		return 1
+	})
+
+	t.Run("in-loop rollback sends OnRecover before the next commit", func(t *testing.T) {
+		t.Parallel()
+		src := &chainSource{}
+		cfg := validConfig(t, src)
+		var log eventLog
+		log.attach(&cfg)
+		l := startRun(t, cfg, src, scriptDomain{})
+		l.step(a, 4)
+		l.step(a, 8)
+		l.step(a, 12)
+		l.settle() // the cursor moves before OnCommit runs; wait for the loop to finish the commit
+		pre, _ := cursorAt(t, cfg)
+		preLen := len(log.snapshot())
+		l.step(b, 18)
+		if err := l.stop(); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		evs := log.snapshot()
+		commitAt := -1
+		for i := preLen; i < len(evs); i++ {
+			if !evs[i].recovered {
+				commitAt = i
+				break
+			}
+		}
+		if commitAt < 0 {
+			t.Fatalf("no OnCommit after the reorg")
+		}
+		if commitAt == preLen {
+			t.Fatalf("no OnRecover between the reorg and the next OnCommit")
+		}
+		rec := evs[commitAt-1]
+		if rec.next >= pre.NextBatchID {
+			t.Fatalf("OnRecover nextBatchID = %d, want below %d", rec.next, pre.NextBatchID)
+		}
+		if got := evs[commitAt].cs[0].BatchID; got != rec.next {
+			t.Fatalf("first OnCommit batchId = %d, want the OnRecover nextBatchID %d", got, rec.next)
+		}
+	})
+
+	t.Run("boot rollback sends one OnRecover before any commit", func(t *testing.T) {
+		t.Parallel()
+		src := &chainSource{}
+		cfg := validConfig(t, src)
+		l := startRun(t, cfg, src, scriptDomain{})
+		l.step(a, 4)
+		l.step(a, 8)
+		l.step(a, 12)
+		if err := l.stop(); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		pre, _ := cursorAt(t, cfg)
+
+		var log eventLog
+		log.attach(&cfg)
+		src.set(b, 18)
+		l = startRun(t, cfg, src, scriptDomain{})
+		l.waitFor("cursor past the pre-reorg height", func() bool {
+			pos, ok := cursorAt(t, cfg)
+			return ok && pos.MomentumHeight > pre.MomentumHeight
+		})
+		if err := l.stop(); err != nil {
+			t.Fatalf("second Run: %v", err)
+		}
+		evs := log.snapshot()
+		if len(evs) < 2 || !evs[0].recovered || evs[0].next >= pre.NextBatchID {
+			t.Fatalf("events = %+v, want a boot OnRecover below %d first", evs, pre.NextBatchID)
+		}
+		for i, ev := range evs[1:] {
+			if ev.recovered {
+				t.Fatalf("event %d is a second OnRecover, want one boot call before every OnCommit", i+1)
+			}
+		}
+	})
 }
 
 // --- transient vs. halted local failures ---

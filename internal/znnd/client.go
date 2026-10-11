@@ -221,3 +221,109 @@ func (c *Client) ConfirmationHeight(hash types.Hash) (height uint64, ok bool, er
 	}
 	return b.ConfirmationDetail.MomentumHeight, true, nil
 }
+
+// SendStatus is what the node's momentum store holds for a send block.
+type SendStatus struct {
+	Block         *nom.AccountBlock // the send as a momentum holds it; nil when no momentum does
+	Received      bool              // its paired receive is in a momentum
+	ReceiveHeight uint64            // that momentum's height; 0 unless Received
+}
+
+// SendStatus reads ledger.getAccountBlockByHash for hash and its pairedAccountBlock. The zero
+// SendStatus means the node has no such block.
+func (c *Client) SendStatus(hash types.Hash) (SendStatus, error) {
+	raw, err := c.call("ledger.getAccountBlockByHash", hash)
+	if err != nil || raw == nil {
+		return SendStatus{}, err
+	}
+	// nom.AccountBlock has a custom UnmarshalJSON, so embedding it in a struct that adds the
+	// RPC's detail fields would decode nothing but the block. The result is decoded twice instead.
+	b := new(nom.AccountBlock)
+	if err := json.Unmarshal(raw, b); err != nil {
+		return SendStatus{}, fmt.Errorf("znnd: ledger.getAccountBlockByHash: decode result: %w", err)
+	}
+	var d struct {
+		Hash               types.Hash `json:"hash"`
+		ConfirmationDetail *struct {
+			MomentumHeight uint64 `json:"momentumHeight"`
+		} `json:"confirmationDetail"`
+		PairedAccountBlock *struct {
+			ConfirmationDetail *struct {
+				MomentumHeight uint64 `json:"momentumHeight"`
+			} `json:"confirmationDetail"`
+		} `json:"pairedAccountBlock"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return SendStatus{}, fmt.Errorf("znnd: ledger.getAccountBlockByHash: decode result: %w", err)
+	}
+	if d.Hash != hash {
+		return SendStatus{}, fmt.Errorf("znnd: ledger.getAccountBlockByHash: node returned block %s for %s", d.Hash, hash)
+	}
+	if d.ConfirmationDetail == nil {
+		return SendStatus{}, nil
+	}
+	s := SendStatus{Block: b}
+	if p := d.PairedAccountBlock; p != nil && p.ConfirmationDetail != nil {
+		s.Received = true
+		s.ReceiveHeight = p.ConfirmationDetail.MomentumHeight
+	}
+	return s, nil
+}
+
+// AccountBlockAtHeight returns addr's block at height from the node's account chain, unconfirmed
+// blocks included (ledger.getAccountBlocksByHeight with count 1), or nil, nil when the node has
+// none.
+func (c *Client) AccountBlockAtHeight(addr types.Address, height uint64) (*nom.AccountBlock, error) {
+	var res struct {
+		List []*nom.AccountBlock `json:"list"`
+	}
+	raw, err := c.call("ledger.getAccountBlocksByHeight", addr, height, 1)
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, fmt.Errorf("znnd: ledger.getAccountBlocksByHeight: decode result: %w", err)
+	}
+	if len(res.List) == 0 {
+		return nil, nil
+	}
+	b := res.List[0]
+	if b == nil {
+		return nil, fmt.Errorf("znnd: ledger.getAccountBlocksByHeight: node returned a null block for %s at height %d", addr, height)
+	}
+	if b.Height != height || b.Address != addr {
+		return nil, fmt.Errorf("znnd: ledger.getAccountBlocksByHeight: node returned height %d of %s for height %d of %s", b.Height, b.Address, height, addr)
+	}
+	return b, nil
+}
+
+// PlasmaRequirement is the part of the embedded.plasma.getRequiredPoWForAccountBlock result
+// a fused-plasma send needs.
+type PlasmaRequirement struct {
+	AvailablePlasma uint64 `json:"availablePlasma"`
+	BasePlasma      uint64 `json:"basePlasma"`
+}
+
+// RequiredPlasma returns the base plasma a user send from from to to carrying data needs, and
+// the plasma from has available (embedded.plasma.getRequiredPoWForAccountBlock).
+func (c *Client) RequiredPlasma(from, to types.Address, data []byte) (PlasmaRequirement, error) {
+	param := struct {
+		Address   types.Address `json:"address"`
+		BlockType uint64        `json:"blockType"`
+		ToAddress types.Address `json:"toAddress"`
+		Data      []byte        `json:"data"`
+	}{from, nom.BlockTypeUserSend, to, data}
+	var r PlasmaRequirement
+	if err := c.callInto(&r, "embedded.plasma.getRequiredPoWForAccountBlock", param); err != nil {
+		return PlasmaRequirement{}, err
+	}
+	return r, nil
+}
+
+// PublishRawTransaction hands a signed account block to the node
+// (ledger.publishRawTransaction). A nil error means the node inserted it into its own account
+// pool; the block is not yet confirmed.
+func (c *Client) PublishRawTransaction(b *nom.AccountBlock) error {
+	_, err := c.call("ledger.publishRawTransaction", b)
+	return err
+}

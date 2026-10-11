@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
@@ -54,6 +55,10 @@ type Config struct {
 	// (SPEC §4.3). It has no default: §17 makes every field required and validated, and the
 	// depth is the parameter that bounds how deep a reorg may be before it is an L1 fault.
 	ConfirmationDepth uint64
+	// MaxPendingBatches is how many batches the run lets sit above Settlement's nextBatchId,
+	// committed or pending, before it stops sealing and waits for the cursor to advance. It
+	// must be at least 1.
+	MaxPendingBatches uint64
 
 	// Wired by the binary, not by the operator's configuration file.
 	Momenta ledger.MomentumSource
@@ -65,12 +70,31 @@ type Config struct {
 	// recovery.ErrSourceUnavailable, and a restart re-derives from the last commit.
 	Caps    ledger.CapSource
 	Anchors recovery.AnchorSource
+	// Cursor answers Settlement's nextBatchId and accepted entries for DomainID. An error
+	// wrapping recovery.ErrHalted halts Run; any other error is retried as a source outage.
+	Cursor CursorSource
 	// Retry is the bounded-retry schedule; the zero value is the production one.
 	Retry recovery.RetryPolicy
 	// OnCommit, when set, is called on the loop goroutine after every successful
 	// recovery.Commit, with that commit's batch commitments in batch order. The cursor already
 	// covers them. An error ends Run with that error, unhalted, and the batches stay committed.
 	OnCommit func([]codec.BatchCommitment) error
+	// OnRecover, when set, is called on the loop goroutine each time the run reaches a durable
+	// position: once after boot, and again after every rollback the loop performs. nextBatchID
+	// is that position's NextBatchID (0 when fresh). unfinalized is recovery.Unfinalized at that
+	// position. An error ends Run with that error, unhalted.
+	OnRecover func(nextBatchID uint64, unfinalized []codec.BatchCommitment) error
+}
+
+// CursorSource returns Settlement's nextBatchId for a domain at the confirmed height. An error
+// wrapping recovery.ErrHalted halts Run; any other error is retried as a source outage.
+type CursorSource interface {
+	NextBatchID(domainID uint32) (uint64, error)
+	// AcceptedEntries returns the observed nextBatchId and Settlement's accepted entries for
+	// consecutive batchIds from `from`, each below that nextBatchId, at most ipc.MaxAcceptedEntries.
+	// The list is empty only when from is at or above nextBatchId. An error wrapping
+	// recovery.ErrHalted halts Run; any other error is retried as a source outage.
+	AcceptedEntries(domainID uint32, from uint64) (uint64, []*definition.BatchEntry, error)
 }
 
 func (c Config) validate() error {
@@ -104,6 +128,12 @@ func (c Config) validate() error {
 	if c.Anchors == nil {
 		return fmt.Errorf("%w: anchor source is required", ErrConfig)
 	}
+	if c.Cursor == nil {
+		return fmt.Errorf("%w: cursor source is required", ErrConfig)
+	}
+	if c.MaxPendingBatches < 1 {
+		return fmt.Errorf("%w: maxPendingBatches must be at least 1", ErrConfig)
+	}
 	return nil
 }
 
@@ -133,8 +163,8 @@ func (r *Runtime) Register(d domain.Domain) {
 // already held by another process returns an error wrapping ErrLocked before boot.
 // Configuration errors wrap ErrConfig. Consistency faults wrap recovery.ErrHalted. A source
 // still unavailable after its retry budget wraps recovery.ErrSourceUnavailable, and so does a
-// withdrawal-cap outage. Any other error, such as a failed batch commit or an OnCommit error, is
-// transient.
+// withdrawal-cap outage. Any other error, such as a failed batch commit, an OnCommit error or an
+// OnRecover error, is transient.
 func (r *Runtime) Run(ctx context.Context) error {
 	if err := r.cfg.validate(); err != nil {
 		return err

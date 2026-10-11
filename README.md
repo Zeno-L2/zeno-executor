@@ -54,10 +54,12 @@ listed below. `docker/executor.json` is a complete example.
 
 | Field | Type | Notes |
 |---|---|---|
-| `executorAddress` | Zenon address | Required; identifies this executor instance and names the supervisor's own lease file. |
+| `executorAddress` | Zenon address | Required; identifies this executor instance and names the supervisor's own lease file and submission log. |
 | `networkName` | string | Required. |
+| `pillarName` | string | Required, non-empty; the pillar whose executor-set member is this executor. |
 | `znndEndpoint` | URL | Required; the znnd JSON-RPC endpoint, an absolute `http` or `https` URL. The supervisor reads momenta and Settlement state from it, and the workers never see it. |
 | `confirmationDepth` | integer | Required; 1 to 1023. |
+| `maxPendingBatches` | integer | Optional, default 8; 1 to 64. A worker stops sealing batches once this many sit above Settlement's `nextBatchId`, committed or pending, and resumes as the chain accepts them. |
 | `storagePath` | absolute path | Required; see "On-disk layout" below. |
 | `submissionKeySource` | object | Required; see "Submission key" below. |
 | `workers` | array | Required, non-empty; one entry per domain. |
@@ -83,9 +85,14 @@ listed below. `docker/executor.json` is a complete example.
   there is the non-dumpable flag and, as root, the separate worker uid, not the value being gone.
 - `KMS`: not implemented; naming it is a configuration error.
 
+The key is the 32-byte ed25519 seed as 64 hex characters, with no `0x` prefix; surrounding
+whitespace is trimmed. For a go-zenon wallet account it is `KeyPair.Private.Seed()`, not a
+mnemonic or a BIP-39 seed. A seed whose address is not `executorAddress` fails boot with exit
+status 78.
+
 No worker ever receives the key, its source kind, or its path or variable name: a worker's
 channel `Config` frame carries only its `domainId`, the executor address, its `stfSpecHash`,
-`confirmationDepth`, `role`, `networkName` and `storagePath`.
+`confirmationDepth`, `role`, `networkName`, `storagePath` and `maxPendingBatches`.
 
 ### Isolation
 
@@ -109,20 +116,109 @@ A worker's exit status, from `internal/ipc/exit.go`, drives the supervisor's res
 | 78 (`ipc.ExitConfig`) | the worker rejected its configuration | CONFIG_ERROR; never restarted. |
 | killed by a signal | a liveness timeout, a malformed frame, an OOM kill, or (during shutdown) the supervisor's own SIGTERM/SIGKILL | Same bucket as 0/1/2, except during the supervisor's own shutdown, when the worker simply stops. |
 
+A worker that reports a batch whose commitment differs from the one the supervisor already holds
+for that batchId, without retracting it first, is a consistency fault for that domain: it is
+killed and HALTED, never restarted, and its last exit reads "consistency fault". Other domains
+continue.
+
 The supervisor itself exits 0 on a clean shutdown, 1 on any other failure to run, and 78
 (`ipc.ExitConfig`) on an invalid configuration or submission key.
+
+### Submission
+
+The supervisor submits each domain's batches from the executor address, one unresolved send at a
+time across all domains. It checks each batch against Settlement at the confirmed height first. A
+contradiction halts that domain as a consistency fault, as does a worker retracting a batch
+Settlement already accepted.
+
+It confirms each send by reading Settlement once the receive is `confirmationDepth` momenta deep.
+A rejected batch, or a send the node no longer knows, is retried without limit under the restart
+backoff and never halts the domain. After 5 consecutive rejections of the same batch, the
+supervisor logs an error and raises an error status for that domain, and keeps retrying. The count
+and the status clear when Settlement accepts the batch, when Settlement's `nextBatchId` moves
+past it, or when the executor restarts. A `nextBatchId` read lower than an earlier one comes from
+a lagging node or a reorg deeper than `confirmationDepth`: it clears nothing and is logged as a warning, and each read of `nextBatchId` that
+is higher than the highest seen raises the observed value. A send the node no longer knows neither counts as a
+rejection nor clears the count.
+
+Before each send, the supervisor reads at the confirmed height Settlement's submit pause, global
+and for the domain, and the standing of `pillarName`: its executor-set member must name
+`executorAddress` with status active, and the pillar must be registered and not revoked. When a
+check fails, or the read fails, it logs a warning, sends nothing for that domain and checks again
+on its next pass; it never halts the domain. A domain whose record status is `PAUSED` still has
+its batches submitted. These reads trail the chain by `confirmationDepth` momenta, and
+behind a load-balanced endpoint they can trail by more than the batch read does, so a pause set
+at the frontier can still let a send through; Settlement rejects it, and the send costs plasma.
+
+A send not received after `confirmationDepth` x 10 momenta raises an error status and is never
+replaced automatically. Insufficient plasma raises an error status and retries.
+
+When a lagging node or a reorg deeper than `confirmationDepth` keeps Settlement's `nextBatchId`
+below the supervisor's observed value, that domain stops submitting and raises an error status after
+`confirmationDepth` x 10 momenta. The remedy is to check the node, then restart the executor. After a
+reorg like that, move the submission log files aside before restarting, because a restart reads the
+observed value back from them.
+
+The supervisor records each send in its submission log before publishing it, and the send's outcome once it is known, one JSON object per line, each written and fsynced before it goes on. At boot, once the node is reachable, a send with no outcome is followed to its outcome before anything is sent for any domain, so a restart follows that send instead of forgetting it. As in a running process, a lagging node can still make the send look dropped; the supervisor then rebuilds the batch, and Settlement accepts at most one copy. This holds for a domain that is no longer configured too: the supervisor records the outcome, logs it as a warning naming the domain, and sends nothing for that domain. A "dropped" outcome read from a lagging node may then be wrong, and nothing acts on it. While the node is unreachable, the supervisor retries and sends nothing. A send recorded as abandoned, because its domain halted first, is not followed again. At boot, each domain's observed `nextBatchId` starts one above its latest batch recorded as accepted, so a lagging node cannot make the supervisor send an accepted batch again.
+
+Each line starts with a log-format version (`"version":1` for this release) and names the send by plain fields: domain, batch, account height, block hash, data hash and outcome. The log does not store the batch commitment; the supervisor reads it from the send's block. Across an upgrade:
+
+- A release that changes the batch commitment encoding still follows a send left with no outcome by an older release. It reads the outcome from Settlement's `nextBatchId`, skips only the comparison with Settlement's accepted entry, and logs one INFO line naming the send.
+- A line with a log-format version this release does not know, as after a downgrade, or a line whose fields it cannot read, is never followed. When that line is the send left with no outcome, the supervisor halts the send's domain with an error naming the send and records the send as abandoned; for a domain that is no longer configured, it logs a warning instead. Restarting the executor clears the halt. The supervisor may then send that batch a second time; Settlement accepts at most one of the two, and the other costs plasma.
+- Fields a release does not know are ignored, so a newer release can add fields without changing the log-format version.
+
+A crash in the middle of a write leaves an incomplete last line, which the supervisor drops at boot with a warning. A line that is not a JSON object with a log-format version and a block hash stops the supervisor at boot with an error naming the file and the line. Moving the file and its `.1` file aside starts a new log, and the supervisor then forgets a send that had no outcome: it may send that batch a second time, Settlement accepts at most one of the two, and the other costs plasma. If the supervisor cannot write or sync the log, it logs an error, raises an error status and sends nothing more until the executor restarts.
+
+Each send adds about 500 bytes. Once the log reaches 16 MiB, the supervisor renames it to `<file>.1` before the next send, replacing any older one, and starts a new file. It reads both files at boot.
+
+The log is named after `executorAddress`. Changing `executorAddress` starts a new, empty log; the old one stays on disk at `<storagePath>/supervisor/<old executorAddress>.submissions.jsonl`, with its `.1` file, and the supervisor no longer reads it.
 
 ### On-disk layout
 
 ```
-<storagePath>/supervisor/<executorAddress>.lock   # the supervisor's own lease
-<storagePath>/<domainId>/worker.lock               # that domain's per-worker lock
-<storagePath>/<domainId>/...                        # its recovery state and wasm-code/
+<storagePath>/supervisor/<executorAddress>.lock                  # the supervisor's own lease
+<storagePath>/supervisor/<executorAddress>.submissions.jsonl     # the submission log (created with mode 0600)
+<storagePath>/supervisor/<executorAddress>.submissions.jsonl.1   # the previous submission log, once rotated
+<storagePath>/<domainId>/worker.lock                             # that domain's per-worker lock
+<storagePath>/<domainId>/...                                     # its recovery state and wasm-code/
 ```
 
 An older `<storagePath>/<executorAddress>.lock` or `<storagePath>/wasm-code/` from before
 workers moved into their own processes is ignored under the new layout: `mv` the code store
 into the domain directory it now belongs under, or let the worker re-sync it.
+
+Every existing data directory with at least one batch record halts on its first boot under
+this build. No earlier build submitted, so no domain has a finalized batch and every record is above
+the anchor, and records written by an earlier build carry no stored commitment. The worker
+exits HALTED, naming the batchId and the domain directory. The remedy for every domain on
+upgrade: stop the executor, remove that domain's directory and re-sync.
+
+While a worker rebuilds batches below Settlement's `nextBatchId`, it closes each one exactly at the
+accepted entry's input range and checks it against that entry: the protocol version, the input
+range, the six roots, the data-availability hash and mode, the asset flow summary and the proof
+data. A re-sync from an empty domain directory therefore reproduces the accepted batches and
+continues past them. While it rebuilds, the worker reads ahead only to the end of the batch it is
+rebuilding, so it commits after every accepted batch that ends at the domain's last input in its
+momentum. A history this executor built therefore commits during a re-sync as often as it did when
+it was first built.
+
+Accepted batches that never end at the domain's last input in a momentum, such as batches built by a
+different executor, stay uncommitted in memory until one does or the rebuild passes `nextBatchId`.
+Each costs about 2 KB, about 190 MB per 100,000 batches. The domain's state log in its directory
+also grows on disk through that stretch, because only a commit truncates it. A crash during that
+stretch repeats the rebuild from the last commit.
+
+A rebuilt batch that differs from its accepted entry, or an input stream that cannot end a batch
+where the entry does, halts the domain: the worker exits HALTED, naming the batchId and the domain
+directory, and the supervisor does not restart it. The usual cause is a domain directory whose
+batches are not the accepted ones. The remedy: stop the executor, remove that domain's directory and
+re-sync. If a re-sync from an empty directory halts the same way, this worker binary and its
+`stfSpecHash` do not reproduce the accepted batches, and re-syncing cannot fix it.
+
+A domain directory written by an earlier build can also hold more unsubmitted batches than the
+supervisor now accepts (`maxPendingBatches` plus 2,048). Its worker is killed at every boot until
+the domain is HALTED as a crash loop. The remedy is the same: stop the executor, remove that
+domain's directory and re-sync.
 
 ## Docker
 
@@ -130,21 +226,25 @@ The build context expects a sibling checkout of `../go-zenon` (see "Dependency o
 below); `docker-compose.yml` and `docker/compose.test.yml` both pass it in as the `go-zenon`
 additional build context.
 
-Before the first `docker compose up`, set the submission key the example configuration expects,
-keeping the value out of shell history and off the command line:
+Before the first `docker compose up`, set the submission key the example configuration expects:
 
 ```
-read -rs EXECUTOR_KEY
-export EXECUTOR_KEY
+export EXECUTOR_KEY=bd2b1f4b42334f923064f466ed5590379498585b2dd4e42152db0e5ddbe2023e
 ```
+
+This is the seed of devnet account index 3 (path `m/44'/73404'/3'` of the devnet mnemonic
+committed in go-zenon's `docker/devnet/README.md`), the `executorAddress` in
+`docker/executor.json`. It is public and for the devnet only, never for any other network.
+
+For any real key, read it into the variable without echo (`read -rs EXECUTOR_KEY; export
+EXECUTOR_KEY`) or use a secret file (`FILE` source). Never put a real seed on a command line,
+where it lands in shell history and process listings.
 
 `docker-compose.yml` passes it to the container as a Compose secret, a file Compose creates
 inside the container, rather than a bind mount from the host: on Docker Desktop, a 0400
 root-owned key bind-mounted read-only was still readable by a separated worker uid — the bind
 mount's permission bits did not carry through its VM's file-sharing layer, silently, with no
-error from the supervisor's own checks. The Compose secret does not go through that layer. The
-key's content is a placeholder until submission signing exists; nothing in this environment
-reads it for anything but the file checks `LoadKey` and `checkKeyNotWorkerReadable` apply to it.
+error from the supervisor's own checks. The Compose secret does not go through that layer.
 
 Commands:
 
@@ -160,7 +260,31 @@ No worker starts, because this environment runs no znnd.
 
 The elevated privileges above (`privileged: true`, `cgroup: private`) are for this local
 environment only, to let the supervisor delegate a cgroup and separate worker uids inside the
-container; linking the environment to a real go-zenon devnet is later work.
+container. To run the executor against a real go-zenon devnet, see "Devnet integration test"
+below.
+
+## Devnet integration test
+
+`scripts/devnet-test.sh` runs the executor against a real go-zenon devnet and checks that Settlement accepts its batches. It needs Docker, Go 1.23 and the sibling `../go-zenon` checkout on a branch with the devnet build that go-zenon's `docker/devnet/README.md` describes. Run it as a non-root user, one run at a time:
+
+```
+./scripts/devnet-test.sh
+```
+
+The script wipes its own go-zenon devnet, starts its five znnd nodes (not the explorer) and runs `go test -tags devnet ./internal/devnet/`. The test builds `cmd/executor` and `cmd/worker-wasm` without the tag, so it runs the binaries a deployment runs, against `http://127.0.0.1:35997`. In order, it:
+
+1. waits for the Settlement contract to activate at momentum 50, then, as the devnet's network admin (dev address index 1), registers domain 1 with the best-effort data-availability mode, configures ZNN as its asset, registers dev address index 3 as the executor of pillar `dev1`, and fuses QSR so that dev address index 3 has plasma;
+2. deposits into domain 1, starts the executor, stops it while its first send is unresolved and restarts it, then checks that the restarted executor follows that send to acceptance without sending again, that Settlement's entry equals the commitment the executor signed, and that the pillar and executor-set reads succeed on the real chain;
+3. sets domain 1's submit pause, deposits again and sets the domain's status to `PAUSED`, checks that nothing is sent while the pause holds, then clears the pause and checks that the batch is accepted while the domain is still `PAUSED`;
+4. stops the executor, removes domain 1's directory, restarts it and deposits again, then checks that the rebuilt batch records for batches 0, 1 and 2 match Settlement's accepted entries and that Settlement accepts the next batch.
+
+The devnet domain runs no contract code, so every state root is the empty-state zero root. The test does not cover a state-root change, an inactive pillar, the global pause or rejection retries.
+
+A run takes about 22 minutes (measured: 1342 seconds for the test), most of it waiting for momenta; the first run also builds the devnet image. On success the script wipes the devnet. On failure it leaves the devnet running, and the test keeps its directory, whose path it logs, with the executor logs, the configuration and the storage directory holding the submission log. The next run of the script wipes a devnet it left running.
+
+The script runs the devnet as the Docker Compose project `go-executor-devnet`, so its wipes never remove the volumes of a devnet started with go-zenon's `make devnet-up`. Both devnets use the same container names and ports, so stop that devnet before running the script. `docker compose -f ../go-zenon/docker-compose.yml -p go-executor-devnet down -v` stops and wipes the script's devnet by hand.
+
+`go test ./...` never runs this test and never needs Docker: every file in `internal/devnet` requires the `devnet` build tag.
 
 ## CI
 
@@ -174,9 +298,10 @@ reason, since the `/proc` and ptrace attempts they exercise are Linux-only.
 
 ## Dependency on go-zenon
 
-This module requires `github.com/zenon-network/go-zenon` and imports only its
-consensus-frozen packages (`common/trie`'s path-native API, `common/types`) — never the
-reverse.
+This module requires `github.com/zenon-network/go-zenon`. The module imports these go-zenon
+packages: `common/trie` (its path-native API), `common/types`, `common/crypto`, `chain/nom`,
+`vm/embedded/definition`, `wallet` and `dp`, and the devnet integration test also imports
+`vm/constants`; go-zenon never imports this module.
 
 Development happens on personal forks before the two repos move under the `zenon-network`
 GitHub org, so `go.mod` currently `replace`s the canonical path with a sibling checkout of the

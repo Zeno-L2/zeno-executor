@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
@@ -479,6 +480,9 @@ func TestChannelFailures(t *testing.T) {
 				if err := c.ReportCommitted([]codec.BatchCommitment{{}}); !errors.Is(err, ErrChannel) {
 					t.Errorf("ReportCommitted after break: err = %v", err)
 				}
+				if err := c.ReportRecovered(3, nil); !errors.Is(err, ErrChannel) {
+					t.Errorf("ReportRecovered after break: err = %v", err)
+				}
 				if _, err := c.ReadConfig(); !errors.Is(err, ErrChannel) {
 					t.Errorf("ReadConfig after break: err = %v", err)
 				}
@@ -523,4 +527,215 @@ func TestReportCommitted(t *testing.T) {
 	if recvd[0].Commitment.BatchID != 1 || recvd[1].Commitment.BatchID != 2 {
 		t.Fatalf("received = %+v", recvd)
 	}
+}
+
+func TestReportRecovered(t *testing.T) {
+	c1 := validCommitment()
+	c1.BatchID = 4
+	c2 := validCommitment()
+	c2.BatchID = 5
+
+	cases := []struct {
+		name string
+		cs   []codec.BatchCommitment
+	}{
+		{"commitments", []codec.BatchCommitment{c1, c2}},
+		{"empty", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := net.Pipe()
+			defer a.Close()
+			defer b.Close()
+			c := NewClient(a, nil)
+
+			got := make(chan []Message, 1)
+			go func() {
+				var recvd []Message
+				for i := 0; i < 1+len(tc.cs); i++ {
+					recvd = append(recvd, recvFrom(t, b, Worker))
+				}
+				got <- recvd
+			}()
+
+			if err := c.ReportRecovered(4, tc.cs); err != nil {
+				t.Fatalf("ReportRecovered: %v", err)
+			}
+			// Closing the writer ends the reader at EOF if ReportRecovered wrote fewer frames
+			// than expected, so a missing frame fails instead of blocking.
+			a.Close()
+			recvd := <-got
+			if r, ok := recvd[0].(Retract); !ok || r.FromBatchID != 4 {
+				t.Fatalf("first frame = %#v, want Retract{4}", recvd[0])
+			}
+			for i, cm := range tc.cs {
+				r, ok := recvd[i+1].(Recovered)
+				if !ok || r.Commitment.BatchID != cm.BatchID {
+					t.Fatalf("frame %d = %#v, want Recovered batch %d", i+1, recvd[i+1], cm.BatchID)
+				}
+			}
+		})
+	}
+}
+
+func TestClientNextBatchID(t *testing.T) {
+	t.Run("reply", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		go func() {
+			if m := recvFrom(t, b, Worker); m != (CursorRequest{}) {
+				t.Errorf("request = %#v, want CursorRequest", m)
+			}
+			sendFrom(t, b, Cursor{NextBatchID: 9})
+		}()
+		n, err := c.NextBatchID(1)
+		if err != nil || n != 9 {
+			t.Fatalf("NextBatchID = %d, %v, want 9, nil", n, err)
+		}
+	})
+
+	for _, kind := range []struct {
+		name   string
+		kind   SourceErrorKind
+		halted bool
+	}{{"halted", SourceHalted, true}, {"unavailable", SourceUnavailable, false}} {
+		t.Run(kind.name, func(t *testing.T) {
+			c, b := readyClient(t)
+			defer b.Close()
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, SourceError{Kind: kind.kind, Message: "x"})
+			}()
+			_, err := c.NextBatchID(1)
+			if errors.Is(err, recovery.ErrHalted) != kind.halted || errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want halted=%v and not a channel failure", err, kind.halted)
+			}
+			if c.Broken() != nil {
+				t.Fatalf("Broken() = %v, want nil", c.Broken())
+			}
+		})
+	}
+
+	t.Run("wrong domain", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		if _, err := c.NextBatchID(2); err == nil {
+			t.Fatalf("want an error")
+		}
+		if c.Broken() != nil {
+			t.Fatalf("Broken() = %v, want nil", c.Broken())
+		}
+	})
+
+	t.Run("unexpected reply", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		go func() {
+			recvFrom(t, b, Worker)
+			sendFrom(t, b, Frontier{Height: 1})
+		}()
+		if _, err := c.NextBatchID(1); !errors.Is(err, ErrChannel) {
+			t.Fatalf("err = %v, want ErrChannel", err)
+		}
+	})
+}
+
+func TestClientAcceptedEntries(t *testing.T) {
+	t.Run("reply", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		go func() {
+			if m := recvFrom(t, b, Worker); m != (AcceptedRequest{FromBatchID: 5}) {
+				t.Errorf("request = %#v, want AcceptedRequest{5}", m)
+			}
+			sendFrom(t, b, Accepted{NextBatchID: 8, Entries: []*definition.BatchEntry{acceptedEntry(5, 0), acceptedEntry(6, 3), acceptedEntry(7, 0)}})
+		}()
+		next, entries, err := c.AcceptedEntries(1, 5)
+		if err != nil || next != 8 || len(entries) != 3 || entries[2].BatchId != 7 {
+			t.Fatalf("AcceptedEntries = %d, %d entries, %v, want 8, 3 entries ending at batch 7, nil", next, len(entries), err)
+		}
+	})
+
+	t.Run("empty at nextBatchId", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		go func() {
+			recvFrom(t, b, Worker)
+			sendFrom(t, b, Accepted{NextBatchID: 5})
+		}()
+		next, entries, err := c.AcceptedEntries(1, 5)
+		if err != nil || next != 5 || len(entries) != 0 {
+			t.Fatalf("AcceptedEntries = %d, %d entries, %v, want 5, none, nil", next, len(entries), err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		reply Accepted
+	}{
+		{"gap in batchIds", Accepted{NextBatchID: 9, Entries: []*definition.BatchEntry{acceptedEntry(5, 0), acceptedEntry(7, 0)}}},
+		{"first batchId not from", Accepted{NextBatchID: 9, Entries: []*definition.BatchEntry{acceptedEntry(6, 0)}}},
+		{"batchId at nextBatchId", Accepted{NextBatchID: 6, Entries: []*definition.BatchEntry{acceptedEntry(5, 0), acceptedEntry(6, 0)}}},
+		{"empty below nextBatchId", Accepted{NextBatchID: 9}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, b := readyClient(t)
+			defer b.Close()
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, tc.reply)
+			}()
+			if _, _, err := c.AcceptedEntries(1, 5); !errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want ErrChannel", err)
+			}
+			if c.Broken() == nil {
+				t.Fatalf("Broken() = nil, want the channel broken")
+			}
+		})
+	}
+
+	for _, kind := range []struct {
+		name   string
+		kind   SourceErrorKind
+		halted bool
+	}{{"halted", SourceHalted, true}, {"unavailable", SourceUnavailable, false}} {
+		t.Run(kind.name, func(t *testing.T) {
+			c, b := readyClient(t)
+			defer b.Close()
+			go func() {
+				recvFrom(t, b, Worker)
+				sendFrom(t, b, SourceError{Kind: kind.kind, Message: "x"})
+			}()
+			_, _, err := c.AcceptedEntries(1, 0)
+			if errors.Is(err, recovery.ErrHalted) != kind.halted || errors.Is(err, ErrChannel) {
+				t.Fatalf("err = %v, want halted=%v and not a channel failure", err, kind.halted)
+			}
+			if c.Broken() != nil {
+				t.Fatalf("Broken() = %v, want nil", c.Broken())
+			}
+		})
+	}
+
+	t.Run("wrong domain", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		if _, _, err := c.AcceptedEntries(2, 0); err == nil {
+			t.Fatalf("want an error")
+		}
+		if c.Broken() != nil {
+			t.Fatalf("Broken() = %v, want nil", c.Broken())
+		}
+	})
+
+	t.Run("unexpected reply", func(t *testing.T) {
+		c, b := readyClient(t)
+		defer b.Close()
+		go func() {
+			recvFrom(t, b, Worker)
+			sendFrom(t, b, Frontier{Height: 1})
+		}()
+		if _, _, err := c.AcceptedEntries(1, 0); !errors.Is(err, ErrChannel) {
+			t.Fatalf("err = %v, want ErrChannel", err)
+		}
+	})
 }

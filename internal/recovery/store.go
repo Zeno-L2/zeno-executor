@@ -129,29 +129,44 @@ type Position struct {
 }
 
 // ReadCursor returns the committed position. ok is false when no position has been committed.
+//
+// A zero post-state root is a valid value (an empty domain state hashes to the zero root), so a
+// zero value cannot mark a torn file. Commit always writes the postStateRoot field, so a cursor
+// file without it, or with it null, is rejected.
 func ReadCursor(l Layout) (Position, bool, error) {
-	var pos Position
-	found, err := readJSON(l.Cursor, &pos)
+	data, err := os.ReadFile(l.Cursor)
+	if errors.Is(err, os.ErrNotExist) {
+		return Position{}, false, nil
+	}
 	if err != nil {
 		return Position{}, false, fmt.Errorf("recovery: read cursor: %w", err)
 	}
-	return pos, found, nil
+	var pos Position
+	if err := json.Unmarshal(data, &pos); err != nil {
+		return Position{}, false, fmt.Errorf("recovery: read cursor: decode %s: %w", filepath.Base(l.Cursor), err)
+	}
+	var present struct {
+		PostStateRoot *json.RawMessage `json:"postStateRoot"`
+	}
+	if err := json.Unmarshal(data, &present); err != nil || present.PostStateRoot == nil {
+		return Position{}, false, fmt.Errorf("recovery: read cursor: %s has no postStateRoot field", filepath.Base(l.Cursor))
+	}
+	return pos, true, nil
 }
 
 // validatePosition rejects a Position that cannot be a committed one: JSON decodes null, {} and
 // any object with omitted fields into the zero Position without error, so a torn or truncated
 // cursor file reads back as a value indistinguishable from genesis unless checked here. It is
 // run before pos drives any destructive call, and before Commit writes pos as the cursor, so a
-// malformed value is never mistaken for a valid position on either side of the file.
+// malformed value is never mistaken for a valid position on either side of the file. A zero
+// post-state root is legitimate at any input sequence: an empty domain state has the zero hash
+// as its root, so it is not checked here.
 func validatePosition(pos Position) error {
 	if pos.MomentumHeight == 0 {
 		return errors.New("momentum height is 0")
 	}
 	if pos.MomentumHash == (types.Hash{}) {
 		return errors.New("momentum hash is zero")
-	}
-	if pos.LastInputSeq != 0 && pos.PostStateRoot == (types.Hash{}) {
-		return errors.New("post-state root is zero for a non-zero input sequence")
 	}
 	return nil
 }
@@ -171,6 +186,9 @@ type BatchRecord struct {
 	PreStateRoot  types.Hash `json:"preStateRoot"`
 	PostStateRoot types.Hash `json:"postStateRoot"`
 	DAHash        types.Hash `json:"daHash"`
+	// Commitment is codec.BatchCommitment.Encode() of the batch. It is omitted when empty, so
+	// adding it needs no format version or migration.
+	Commitment []byte `json:"commitment,omitempty"`
 }
 
 func batchPath(l Layout, id uint64) string {
