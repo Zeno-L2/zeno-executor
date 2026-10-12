@@ -244,3 +244,48 @@ func TestPillarActive(t *testing.T) {
 	_, err := v.PillarActive("garbage")
 	mustHalt(t, "PillarActive(garbage)", err)
 }
+
+// TestReleaseQueueMeta serves proofs from its own tree, as
+// TestPillarActive does.
+func TestReleaseQueueMeta(t *testing.T) {
+	fx := znndtest.Load(t)
+	raw := func(domainID uint32) []byte {
+		return append(append(append([]byte{0x03}, types.SettlementContract.Bytes()...), 0x04), definition.ReleaseQueueMetaKey(domainID)...)
+	}
+	meta, err := definition.ABISettlement.PackVariable(definition.ReleaseQueueMetaVariableName, uint64(2), uint64(5))
+	if err != nil {
+		t.Fatalf("PackVariable: %v", err)
+	}
+	const present, absent, garbage = 1, 2, 3
+	leaves := map[uint32][]byte{present: meta, garbage: {0xde, 0xad}}
+	pathOf := func(d uint32) trie.Path { return trie.Path(types.NewHash(raw(d))) }
+	tree := trie.NewCompactTree()
+	for d, v := range leaves {
+		tree.Insert(pathOf(d), v)
+	}
+	root := tree.Root()
+
+	synth := *fx
+	synth.Proofs = nil
+	for _, d := range []uint32{present, absent, garbage} {
+		_, value, proof := tree.ProveByPath(pathOf(d))
+		synth.Proofs = append(synth.Proofs, znndtest.FixtureProof{
+			Height: fx.ReadHeight,
+			Key:    raw(d),
+			Result: znndtest.Proof{Value: value, Proof: proof, Root: root},
+		})
+	}
+	srv := znndtest.NewServer(t, &synth, fx.ReadHeight+10)
+	v := &View{Height: fx.ReadHeight, c: znnd.NewClient(srv.URL), root: root}
+
+	m, err := v.ReleaseQueueMeta(present)
+	if err != nil || m.DomainId != present || m.Head != 2 || m.Tail != 5 {
+		t.Fatalf("ReleaseQueueMeta(present) = %+v, %v; want domain 1, head 2, tail 5", m, err)
+	}
+	m, err = v.ReleaseQueueMeta(absent)
+	if err != nil || m.DomainId != absent || m.Head != 0 || m.Tail != 0 {
+		t.Fatalf("ReleaseQueueMeta(absent) = %+v, %v; want zeros with domain 2", m, err)
+	}
+	_, err = v.ReleaseQueueMeta(garbage)
+	mustHalt(t, "ReleaseQueueMeta(garbage)", err)
+}

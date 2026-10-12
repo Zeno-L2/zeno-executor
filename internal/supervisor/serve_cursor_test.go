@@ -29,6 +29,9 @@ type chainFake struct {
 	entries  map[uint64]*definition.BatchEntry
 	entryErr error
 	reads    int
+	// entryBlock, when set, holds every AcceptedEntry read after it is
+	// counted until the channel is closed.
+	entryBlock chan struct{}
 	// acceptedMax records the max of every AcceptedEntries read.
 	acceptedMax []int
 }
@@ -60,8 +63,14 @@ func (c *chainFake) sources() Sources {
 			},
 			entry: func(_ uint32, id uint64) (*definition.BatchEntry, error) {
 				c.mu.Lock()
-				defer c.mu.Unlock()
 				c.reads++
+				block := c.entryBlock
+				c.mu.Unlock()
+				if block != nil {
+					<-block
+				}
+				c.mu.Lock()
+				defer c.mu.Unlock()
 				if c.entryErr != nil {
 					return nil, c.entryErr
 				}
@@ -132,7 +141,7 @@ func newCursorHarness(t *testing.T) *cursorHarness {
 		t:     t,
 		chain: &chainFake{entries: map[uint64]*definition.BatchEntry{}},
 		wEnd:  wEnd,
-		st:    &workerState{maxHeld: heldCap(defaultMaxPendingBatches), endpoint: "http://znnd.test"},
+		st:    &workerState{maxHeld: heldCap(defaultMaxPendingBatches), endpoint: "http://znnd.test", withdrawals: testStore(t, 1)},
 		w:     WorkerConfig{DomainID: 1},
 		exec:  types.Address{0x09},
 	}
@@ -156,6 +165,11 @@ func (h *cursorHarness) commitment(id, lastSeq uint64) codec.BatchCommitment {
 
 func (h *cursorHarness) send(m ipc.Message) {
 	h.t.Helper()
+	switch m.(type) {
+	case ipc.Committed, ipc.Recovered:
+		writeHandOff(h.t, h.wEnd, m)
+		return
+	}
 	if err := ipc.WriteMessage(h.wEnd, m); err != nil {
 		h.t.Fatalf("WriteMessage: %v", err)
 	}
@@ -441,13 +455,14 @@ func TestServeOwedComparison(t *testing.T) {
 		h.chain.set(func(ch *chainFake) { ch.next = 3; ch.entryErr = errors.New("node down"); ch.entries[2] = e })
 		h.cursor()
 		h.send(ipc.Committed{Commitment: c})
-		h.waitReads(1)
+		// The tip check and the hand-off each make one failing read.
+		h.waitReads(2)
 		// The next request frame retries the read.
 		h.chain.set(func(ch *chainFake) { ch.entryErr = nil })
 		h.send(ipc.FrontierRequest{})
 		h.wantFault("owed comparison")
-		if n := h.chain.readCount(); n != 2 {
-			t.Fatalf("entry reads = %d, want 2", n)
+		if n := h.chain.readCount(); n != 3 {
+			t.Fatalf("entry reads = %d, want 3", n)
 		}
 	})
 
@@ -461,12 +476,15 @@ func TestServeOwedComparison(t *testing.T) {
 		})
 		h.cursor()
 		h.send(ipc.Recovered{Commitment: c})
-		h.waitReads(1)
+		h.waitReads(2)
 		h.chain.set(func(ch *chainFake) { ch.entryErr = nil })
 		h.sync()
+		if v, ok := h.st.withdrawals.Lookup(2); !ok || !v {
+			t.Fatalf("batch 2 stored (verified, ok) = (%v, %v), want a verified file", v, ok)
+		}
 		h.sync()
-		if n := h.chain.readCount(); n != 2 {
-			t.Fatalf("entry reads = %d, want 2", n)
+		if n := h.chain.readCount(); n != 3 {
+			t.Fatalf("entry reads = %d, want 3", n)
 		}
 		h.finish()
 	})
@@ -539,7 +557,7 @@ func TestServeLaggingRead(t *testing.T) {
 		h.chain.set(func(ch *chainFake) { ch.next = 5; ch.entryErr = errors.New("node down") })
 		h.cursor()
 		h.send(ipc.Recovered{Commitment: c})
-		h.waitReads(1)
+		h.waitReads(2)
 		h.chain.set(func(ch *chainFake) { ch.next = 3 })
 		// The lagging CursorRequest's own retry also fails.
 		if got := h.cursor(); got != 5 {
@@ -700,7 +718,7 @@ func TestServeAcceptedSourceError(t *testing.T) {
 		h.chain.set(func(ch *chainFake) { ch.next = 3; ch.entryErr = errors.New("node down"); ch.entries[2] = e })
 		h.cursor()
 		h.send(ipc.Committed{Commitment: c})
-		h.waitReads(1)
+		h.waitReads(2)
 		h.chain.set(func(ch *chainFake) { ch.entryErr = nil })
 		h.send(ipc.AcceptedRequest{FromBatchID: 0})
 		h.wantFault("owed comparison before an accepted reply")

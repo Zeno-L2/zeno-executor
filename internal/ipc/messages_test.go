@@ -56,7 +56,43 @@ type msgCase struct {
 	msg  Message
 }
 
+// withdrawalMessage returns the encoding of a kind 1 outbox message for
+// the given indexes. The fixtures panic on an encode error because
+// validTable has no *testing.T.
+func withdrawalMessage(input uint64, outbox uint32) []byte {
+	enc, err := codec.OutboxMessage{
+		SourceContract: types.Hash{0x04},
+		InputIndex:     input,
+		OutboxIndex:    outbox,
+		Target:         codec.L1Withdrawal{RecipientL1: types.Address{0x01}, Asset: codec.AssetIDFromZTS(types.ZnnTokenStandard), Amount: codec.U256{31: 9}},
+	}.Encode()
+	if err != nil {
+		panic(err)
+	}
+	return enc
+}
+
+// withdrawalFixture returns a kind 1 message and its one-step proof
+// from a two-leaf tree.
+func withdrawalFixture() (msg, proof []byte) {
+	msg = withdrawalMessage(3, 0)
+	other := withdrawalMessage(3, 1)
+	return msg, codec.MerkleProofs([][]byte{msg, other})[0]
+}
+
+// proofOf returns a proof with count steps whose side byte is side.
+func proofOf(count uint32, side byte) []byte {
+	w := &pwriter{}
+	w.u32(count)
+	for i := uint32(0); i < count; i++ {
+		w.u8(side)
+		w.raw(make([]byte, 32))
+	}
+	return w.buf
+}
+
 func validTable() []msgCase {
+	wMsg, wProof := withdrawalFixture()
 	return []msgCase{
 		{"config", Supervisor, WorkerConfig{
 			DomainID:          7,
@@ -93,6 +129,8 @@ func validTable() []msgCase {
 		{"acceptedRequest", Worker, AcceptedRequest{FromBatchID: 6}},
 		{"accepted", Supervisor, Accepted{NextBatchID: 9, Entries: []*definition.BatchEntry{acceptedEntry(6, 0), acceptedEntry(7, 100)}}},
 		{"acceptedEmpty", Supervisor, Accepted{NextBatchID: 9}},
+		{"withdrawal", Worker, Withdrawal{BatchID: 3, Message: wMsg, Proof: wProof}},
+		{"withdrawalsEnd", Worker, WithdrawalsEnd{BatchID: 3}},
 	}
 }
 
@@ -292,7 +330,7 @@ func handEncodeSourceError(t *testing.T, s SourceError) []byte {
 func TestUnknownTypes(t *testing.T) {
 	known := map[byte]bool{
 		0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x05: true, 0x06: true, 0x07: true, 0x08: true, 0x09: true,
-		0x81: true, 0x82: true, 0x83: true, 0x84: true, 0x85: true, 0x86: true, 0x87: true, 0x88: true, 0x89: true,
+		0x81: true, 0x82: true, 0x83: true, 0x84: true, 0x85: true, 0x86: true, 0x87: true, 0x88: true, 0x89: true, 0x8A: true, 0x8B: true, 0x8C: true,
 	}
 	for b := 0; b <= 0xff; b++ {
 		if known[byte(b)] {
@@ -781,6 +819,83 @@ func TestAcceptedIsReadOnlyFromItsSide(t *testing.T) {
 		}
 		if _, err := ReadMessage(bytes.NewReader(enc), c.bad); !errors.Is(err, ErrMalformed) {
 			t.Fatalf("%T from the other side: err = %v, want ErrMalformed", c.m, err)
+		}
+	}
+}
+
+// handEncodeWithdrawal builds a Withdrawal frame bypassing Encode's
+// checks.
+func handEncodeWithdrawal(t *testing.T, id uint64, msg, proof []byte) []byte {
+	t.Helper()
+	w := &pwriter{}
+	w.u64(id)
+	w.raw(msg)
+	w.raw(proof)
+	frame, err := assembleFrame(TypeWithdrawal, w.buf, MaxWorkerFrame)
+	if err != nil {
+		t.Fatalf("assembleFrame: %v", err)
+	}
+	return frame
+}
+
+func TestWithdrawalRejects(t *testing.T) {
+	msg, proof := withdrawalFixture()
+
+	kind0, err := codec.OutboxMessage{
+		SourceContract: types.Hash{0x04},
+		Target:         codec.L2Delivery{TargetContract: types.Hash{0x09}},
+		Payload:        make([]byte, 52),
+	}.Encode()
+	if err != nil {
+		t.Fatalf("encode kind 0 message: %v", err)
+	}
+	if len(kind0) != withdrawalMessageLen {
+		t.Fatalf("kind 0 fixture is %d bytes, want %d", len(kind0), withdrawalMessageLen)
+	}
+	undecodable := append([]byte{}, msg...)
+	undecodable[44] = 7 // the kind byte
+
+	cases := []struct {
+		name  string
+		msg   []byte
+		proof []byte
+	}{
+		{"kind 0 message", kind0, proofOf(0, 0)},
+		{"undecodable message", undecodable, proofOf(0, 0)},
+		{"proof count 33", msg, proofOf(33, 0)},
+		{"proof length", msg, append(append([]byte{}, proof...), 0)},
+		{"proof side 2", msg, proofOf(1, 2)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Encode(Withdrawal{BatchID: 1, Message: tc.msg, Proof: tc.proof}); err == nil {
+				t.Fatal("Encode accepted it")
+			}
+			frame := handEncodeWithdrawal(t, 1, tc.msg, tc.proof)
+			if _, err := ReadMessage(bytes.NewReader(frame), Worker); !errors.Is(err, ErrMalformed) {
+				t.Fatalf("ReadMessage: err = %v, want ErrMalformed", err)
+			}
+		})
+	}
+}
+
+func TestWithdrawalProofBounds(t *testing.T) {
+	msg, _ := withdrawalFixture()
+	for _, count := range []uint32{0, 32} {
+		frame, err := Encode(Withdrawal{BatchID: 1, Message: msg, Proof: proofOf(count, 1)})
+		if err != nil {
+			t.Fatalf("count %d: Encode: %v", count, err)
+		}
+		if count == 32 {
+			if got := len(frame) - 4; got != 1202 {
+				t.Fatalf("count 32: length field = %d, want 1202", got)
+			}
+			if len(frame) != 1206 {
+				t.Fatalf("count 32: frame = %d bytes, want 1206", len(frame))
+			}
+		}
+		if _, err := ReadMessage(bytes.NewReader(frame), Worker); err != nil {
+			t.Fatalf("count %d: ReadMessage: %v", count, err)
 		}
 	}
 }

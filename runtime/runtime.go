@@ -17,6 +17,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/lease"
 	"github.com/digitalSloth/go-executor/internal/ledger"
@@ -77,14 +78,26 @@ type Config struct {
 	Retry recovery.RetryPolicy
 	// OnCommit, when set, is called on the loop goroutine after every successful
 	// recovery.Commit, with that commit's batch commitments in batch order. The cursor already
-	// covers them. An error ends Run with that error, unhalted, and the batches stay committed.
-	OnCommit func([]codec.BatchCommitment) error
+	// covers them. The callback calls withdrawals once per batch, in
+	// order, and holds one result at a time. An error from withdrawals
+	// halts Run. Any other error ends Run with that error, unhalted, and
+	// the batches stay committed.
+	OnCommit func(cs []codec.BatchCommitment, withdrawals Withdrawals) error
 	// OnRecover, when set, is called on the loop goroutine each time the run reaches a durable
 	// position: once after boot, and again after every rollback the loop performs. nextBatchID
 	// is that position's NextBatchID (0 when fresh). unfinalized is recovery.Unfinalized at that
-	// position. An error ends Run with that error, unhalted.
-	OnRecover func(nextBatchID uint64, unfinalized []codec.BatchCommitment) error
+	// position. The callback calls withdrawals once per batch, in order,
+	// and holds one result at a time. An error from withdrawals halts Run.
+	// Any other error ends Run with that error, unhalted.
+	OnRecover func(nextBatchID uint64, unfinalized []codec.BatchCommitment, withdrawals Withdrawals) error
 }
+
+// Withdrawals returns one batch's L1 withdrawals with their proofs,
+// rebuilt from the batch's stored bundle, strictly ascending by
+// (inputIndex, outboxIndex). An error wraps recovery.ErrHalted. It is
+// an alias so that a method with this signature fits the OnCommit and
+// OnRecover fields without a conversion.
+type Withdrawals = func(codec.BatchCommitment) ([]batch.Withdrawal, error)
 
 // CursorSource returns Settlement's nextBatchId for a domain at the confirmed height. An error
 // wrapping recovery.ErrHalted halts Run; any other error is retried as a source outage.
@@ -163,8 +176,9 @@ func (r *Runtime) Register(d domain.Domain) {
 // already held by another process returns an error wrapping ErrLocked before boot.
 // Configuration errors wrap ErrConfig. Consistency faults wrap recovery.ErrHalted. A source
 // still unavailable after its retry budget wraps recovery.ErrSourceUnavailable, and so does a
-// withdrawal-cap outage. Any other error, such as a failed batch commit, an OnCommit error or an
-// OnRecover error, is transient.
+// withdrawal-cap outage. An OnCommit or OnRecover error is transient
+// unless it wraps recovery.ErrHalted, as a withdrawals rebuild failure
+// does. Any other error, such as a failed batch commit, is transient.
 func (r *Runtime) Run(ctx context.Context) error {
 	if err := r.cfg.validate(); err != nil {
 		return err

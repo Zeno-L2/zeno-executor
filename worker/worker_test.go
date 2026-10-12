@@ -135,6 +135,9 @@ type fakeSupervisor struct {
 	// committedAtRetract[i] is len(committed) when retracts[i] arrived.
 	committedAtRetract []int
 	recovered          []codec.BatchCommitment
+	// reports holds every Committed, Recovered, Withdrawal and
+	// WithdrawalsEnd frame in arrival order.
+	reports []ipc.Message
 
 	layout recovery.Layout
 	done   chan struct{}
@@ -217,6 +220,7 @@ func (f *fakeSupervisor) run() {
 		case ipc.Committed:
 			f.mu.Lock()
 			f.committed = append(f.committed, v.Commitment)
+			f.reports = append(f.reports, v)
 			f.mu.Unlock()
 		case ipc.Retract:
 			f.mu.Lock()
@@ -226,6 +230,11 @@ func (f *fakeSupervisor) run() {
 		case ipc.Recovered:
 			f.mu.Lock()
 			f.recovered = append(f.recovered, v.Commitment)
+			f.reports = append(f.reports, v)
+			f.mu.Unlock()
+		case ipc.Withdrawal, ipc.WithdrawalsEnd:
+			f.mu.Lock()
+			f.reports = append(f.reports, v)
 			f.mu.Unlock()
 		default:
 			return
@@ -551,6 +560,43 @@ func TestStagedFrontierCommitsThreeBatches(t *testing.T) {
 	if len(fake.retracts) == 0 || fake.retracts[0] != 0 || fake.committedAtRetract[0] != 0 {
 		t.Fatalf("retracts = %v, committed before the first retract = %v, want Retract{0} before any Committed",
 			fake.retracts, fake.committedAtRetract)
+	}
+
+	// Each report for batch B is followed by its Withdrawal frames, then
+	// WithdrawalsEnd{B}, before the next report.
+	var open *uint64
+	ends := 0
+	for i, m := range fake.reports {
+		switch v := m.(type) {
+		case ipc.Committed:
+			if open != nil {
+				t.Fatalf("frame %d: Committed %d while batch %d has no WithdrawalsEnd", i, v.Commitment.BatchID, *open)
+			}
+			id := v.Commitment.BatchID
+			open = &id
+		case ipc.Recovered:
+			if open != nil {
+				t.Fatalf("frame %d: Recovered %d while batch %d has no WithdrawalsEnd", i, v.Commitment.BatchID, *open)
+			}
+			id := v.Commitment.BatchID
+			open = &id
+		case ipc.Withdrawal:
+			if open == nil || v.BatchID != *open {
+				t.Fatalf("frame %d: Withdrawal for batch %d outside its hand-off (open %v)", i, v.BatchID, open)
+			}
+		case ipc.WithdrawalsEnd:
+			if open == nil || v.BatchID != *open {
+				t.Fatalf("frame %d: WithdrawalsEnd %d outside its hand-off (open %v)", i, v.BatchID, open)
+			}
+			open = nil
+			ends++
+		}
+	}
+	if open != nil {
+		t.Fatalf("batch %d has no WithdrawalsEnd", *open)
+	}
+	if ends < 3 {
+		t.Fatalf("%d WithdrawalsEnd frames, want at least 3", ends)
 	}
 }
 

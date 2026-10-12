@@ -51,6 +51,7 @@ type WorkerStatus struct {
 	LastCommitted *codec.BatchCommitment // a copy; nil until the first valid Committed
 	SubmitError   string                 // why the domain's submission stalled; empty when it has not
 	RejectError   string                 // set once Settlement has rejected the domain's next batch rejectAlert times in a row; empty otherwise
+	RelayError    string                 // set once Settlement has rejected the relay of one withdrawal rejectAlert times in a row; empty otherwise
 }
 
 // Supervisor starts and supervises one worker process per configured domain.
@@ -75,6 +76,21 @@ type slot struct {
 	lastExit string
 }
 
+// redactEndpointErr returns err's text with the request URL of a failed call to the raw znnd
+// endpoint replaced by the endpoint's scheme and host, so userinfo, path and query never reach the log.
+func redactEndpointErr(raw string, err error) string {
+	msg := err.Error()
+	red := redactEndpoint(raw)
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.URL != "" {
+		msg = strings.ReplaceAll(msg, uerr.URL, red)
+	}
+	if raw != "" {
+		msg = strings.ReplaceAll(msg, raw, red)
+	}
+	return msg
+}
+
 // redactEndpoint returns the scheme and host of a znnd endpoint, dropping any userinfo, path and
 // query that can carry credentials. It returns a placeholder when the endpoint does not parse.
 func redactEndpoint(endpoint string) string {
@@ -90,7 +106,8 @@ func redactEndpoint(endpoint string) string {
 func New(cfg Config, key *wallet.KeyPair, src Sources, policy Policy) *Supervisor {
 	slots := make([]*slot, len(cfg.Workers))
 	for i, w := range cfg.Workers {
-		slots[i] = &slot{w: w, st: &workerState{maxHeld: heldCap(cfg.MaxPendingBatches), endpoint: redactEndpoint(cfg.ZnndEndpoint), halt: make(chan struct{})}, state: StateStopped}
+		slots[i] = &slot{w: w, st: &workerState{maxHeld: heldCap(cfg.MaxPendingBatches), endpoint: redactEndpoint(cfg.ZnndEndpoint), rawURL: cfg.ZnndEndpoint, halt: make(chan struct{}),
+			verify: verifyRetry{base: unverifiedRetryInterval, max: unverifiedRetryMax, timeout: unverifiedReadTimeout, delay: unverifiedRetryInterval}}, state: StateStopped}
 	}
 	s := &Supervisor{cfg: cfg, key: key, src: src, policy: policy.WithDefaults(), slots: slots}
 	s.sub = newSubmitter(s)
@@ -131,6 +148,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 		defer lg.Close()
 		s.sub.resume(lg, lg.accepted, lg.unreadable)
+	}
+
+	for _, sl := range s.slots {
+		dir := filepath.Join(supDir, s.cfg.ExecutorAddress.String()+".withdrawals", strconv.FormatUint(uint64(sl.w.DomainID), 10))
+		store, err := openWithdrawalStore(dir, sl.w.DomainID)
+		if err != nil {
+			return fmt.Errorf("supervisor: %w", err)
+		}
+		sl.st.withdrawals = store
 	}
 
 	host := workerproc.NewHost()
@@ -197,6 +223,7 @@ func (s *Supervisor) Status() []WorkerStatus {
 		served := sl.st.servedHeight
 		submitError := sl.st.submitError
 		rejectError := sl.st.rejectError
+		relayError := sl.st.relayError
 		sl.st.mu.Unlock()
 
 		out[i] = WorkerStatus{
@@ -209,6 +236,7 @@ func (s *Supervisor) Status() []WorkerStatus {
 			LastCommitted: lastCommitted,
 			SubmitError:   submitError,
 			RejectError:   rejectError,
+			RelayError:    relayError,
 		}
 	}
 	return out
@@ -434,6 +462,11 @@ loop:
 				_ = p.Signal(syscall.SIGKILL)
 			}
 			if err != nil && errors.Is(err, ErrInconsistent) && killReason == "" {
+				log.Printf("supervisor: domain %d %v", w.DomainID, err)
+				killReason = err.Error()
+				_ = p.Signal(syscall.SIGKILL)
+			}
+			if err != nil && errors.Is(err, ErrWithdrawalStore) && killReason == "" {
 				log.Printf("supervisor: domain %d %v", w.DomainID, err)
 				killReason = err.Error()
 				_ = p.Signal(syscall.SIGKILL)

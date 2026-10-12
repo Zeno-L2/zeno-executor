@@ -179,6 +179,106 @@ func gates(v gateReader, height uint64, domainID uint32, pillarName string) (Gat
 	return g, nil
 }
 
+// RelayQuery names the batch and the outbox ids a Relay read checks.
+type RelayQuery struct {
+	BatchID uint64
+	IDs     []types.Hash // read in order, stopping at the first that is not processed
+}
+
+// RelayState is what a domain's relay and release sends check, read in
+// one view at the confirmed height.
+type RelayState struct {
+	Height    uint64                 // the confirmed height read
+	Paused    bool                   // RelayPaused is set in the global or the domain's PauseState
+	QueueLen  uint64                 // withdrawals waiting in the domain's release queue (Tail - Head)
+	Entry     *definition.BatchEntry // the queried batch's entry; nil when the query is nil or its batch is not below nextBatchId
+	Processed int                    // how many of the queried IDs, from the first, are processed, whatever Entry is; 0 when the query is nil
+}
+
+// Relay reads what the domain's relay and release sends check, at the
+// confirmed height. q may be nil.
+func (a AnchorSource) Relay(domainID uint32, q *RelayQuery) (RelayState, error) {
+	h, err := a.r.ConfirmedHeight(a.depth)
+	if err != nil {
+		return RelayState{}, err
+	}
+	v, err := a.r.At(h)
+	if err != nil {
+		return RelayState{}, err
+	}
+	return relay(v, h, domainID, q)
+}
+
+// relayReader is the part of a View relay reads.
+type relayReader interface {
+	batchReader
+	GlobalPauseState() (definition.PauseState, error)
+	DomainPauseState(domainID uint32) (definition.PauseState, error)
+	ReleaseQueueMeta(domainID uint32) (*definition.ReleaseQueueMeta, error)
+	OutboxProcessed(outboxID types.Hash) (bool, error)
+}
+
+// relay reads the global pause, the domain's pause and the release
+// queue
+// cursors, then with a query the cursor, the batch's entry when it is
+// below nextBatchId, and the processed flags up to the first that is
+// not set, all from v. A missing entry below nextBatchId and a queue
+// head above its tail are errors wrapping recovery.ErrHalted. Read
+// errors return unchanged.
+func relay(v relayReader, height uint64, domainID uint32, q *RelayQuery) (RelayState, error) {
+	global, err := v.GlobalPauseState()
+	if err != nil {
+		return RelayState{}, err
+	}
+	domain, err := v.DomainPauseState(domainID)
+	if err != nil {
+		return RelayState{}, err
+	}
+	meta, err := v.ReleaseQueueMeta(domainID)
+	if err != nil {
+		return RelayState{}, err
+	}
+	if meta.Tail < meta.Head {
+		return RelayState{}, halted(height, "domain %d release queue head %d is above its tail %d", domainID, meta.Head, meta.Tail)
+	}
+	rs := RelayState{
+		Height:   height,
+		Paused:   global.RelayPaused || domain.RelayPaused,
+		QueueLen: meta.Tail - meta.Head,
+	}
+	if q == nil {
+		return rs, nil
+	}
+
+	cur, err := v.InputSequenceCursor(domainID)
+	if err != nil {
+		return RelayState{}, err
+	}
+	if q.BatchID < cur.NextBatchId {
+		e, ok, err := v.BatchEntry(domainID, q.BatchID)
+		if err != nil {
+			return RelayState{}, err
+		}
+		if !ok {
+			return RelayState{}, halted(height, "domain %d batch %d is below nextBatchId %d but has no entry", domainID, q.BatchID, cur.NextBatchId)
+		}
+		rs.Entry = e
+	}
+	// The outcome of a relay needs the flags even when a reorg has removed
+	// the batch, so they are read whether or not the entry was.
+	for _, id := range q.IDs {
+		done, err := v.OutboxProcessed(id)
+		if err != nil {
+			return RelayState{}, err
+		}
+		if !done {
+			break
+		}
+		rs.Processed++
+	}
+	return rs, nil
+}
+
 // batchReader is the part of a View settled, acceptedEntry and tip read.
 type batchReader interface {
 	InputSequenceCursor(domainID uint32) (*definition.InputSequenceCursor, error)

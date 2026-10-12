@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/url"
 	"reflect"
-	"strings"
 	"sync"
 	"time"
 
@@ -51,17 +49,19 @@ const (
 	OutcomeRejected   Outcome = "rejected"
 	OutcomeDropped    Outcome = "dropped"
 	OutcomeSuperseded Outcome = "superseded"
+	OutcomeReceived   Outcome = "received"                 // a ReleaseWithdrawals send Settlement received, whatever its result
 	OutcomeAbandoned  Outcome = "abandoned: domain halted" // the domain halted before the outcome was known
 )
 
 // SendRecord is one send from the executor address.
 type SendRecord struct {
 	DomainID uint32     `json:"domainId"`
-	Method   string     `json:"method"` // definition.SettlementSubmitBatchMethodName
-	BatchID  uint64     `json:"batchId"`
+	Method   string     `json:"method"`            // definition.SettlementSubmitBatchMethodName, SettlementRelayMessageMethodName or SettlementReleaseWithdrawalsMethodName
+	BatchID  uint64     `json:"batchId"`           // the batch a SubmitBatch or RelayMessage send names; 0 for ReleaseWithdrawals
 	Height   uint64     `json:"accountHeight"`     // the block's height on the executor address's account chain
 	Hash     types.Hash `json:"hash"`              // names the block built or adopted; not authoritative for which copy Settlement accepted
 	DataHash types.Hash `json:"dataHash"`          // types.NewHash (SHA3-256) of the block's Data
+	OutboxID types.Hash `json:"outboxId"`          // the withdrawal a RelayMessage send registers; zero otherwise
 	Outcome  Outcome    `json:"outcome,omitempty"` // empty while unresolved
 }
 
@@ -198,6 +198,12 @@ func readOutcome(anchors AnchorSource, r SendRecord, ss znnd.SendStatus) (sendCh
 	if h := types.NewHash(ss.Block.Data); h != r.DataHash {
 		return sendCheck{}, fmt.Errorf("supervisor: znnd returned send %s whose data hash %s differs from the record's %s", ss.Block.Hash, h, r.DataHash)
 	}
+	switch r.Method {
+	case definition.SettlementRelayMessageMethodName:
+		return relayOutcome(anchors, r, ss)
+	case definition.SettlementReleaseWithdrawalsMethodName:
+		return releaseOutcome(anchors, r, ss)
+	}
 	// A commitment this build cannot unpack or decode (another build's codec version) leaves c
 	// zero and skips only the comparison with Settlement's accepted entry.
 	var c codec.BatchCommitment
@@ -278,6 +284,12 @@ type submitter struct {
 	below   map[uint32]uint64    // the view height at which a domain's cursor was first seen below its mark
 	warned  map[string]time.Time // when each rate-limited line was last logged
 
+	withdrawalTurn bool                   // the latest send was a batch send, so the next pick tries the withdrawal pass first
+	wnext          int                    // the slot the withdrawal pass starts at
+	relays         map[uint32]*relayBatch // each domain's cached relay batch
+	relayRetry     map[uint32]*relayRetry // each domain's relay backoff
+	releaseRetry   map[uint32]*relayRetry // each domain's release backoff after a failed build; id is zero
+
 	mu         sync.Mutex
 	alertText  string
 	plasmaText string
@@ -294,6 +306,10 @@ func newSubmitter(s *Supervisor) *submitter {
 		retry:     make(map[uint32]*retryState),
 		below:     make(map[uint32]uint64),
 		warned:    make(map[string]time.Time),
+
+		relays:       make(map[uint32]*relayBatch),
+		relayRetry:   make(map[uint32]*relayRetry),
+		releaseRetry: make(map[uint32]*relayRetry),
 	}
 }
 
@@ -343,16 +359,7 @@ func (u *submitter) outage(err error) {
 // redactErr returns err's text with the request URL of a failed node call replaced by the
 // endpoint's scheme and host, so userinfo, path and query never reach the log.
 func (u *submitter) redactErr(err error) string {
-	msg := err.Error()
-	red := redactEndpoint(u.s.cfg.ZnndEndpoint)
-	var uerr *url.Error
-	if errors.As(err, &uerr) && uerr.URL != "" {
-		msg = strings.ReplaceAll(msg, uerr.URL, red)
-	}
-	if raw := u.s.cfg.ZnndEndpoint; raw != "" {
-		msg = strings.ReplaceAll(msg, raw, red)
-	}
-	return msg
+	return redactEndpointErr(u.s.cfg.ZnndEndpoint, err)
 }
 
 // halt halts the domain with err, which wraps ErrInconsistent, and logs it when it is the
@@ -363,14 +370,40 @@ func (u *submitter) halt(st *workerState, domainID uint32, err error) {
 	}
 }
 
-// pick visits every slot once, from u.next, and sends for the first domain that is ready.
+// pick runs the batch pass and the withdrawal pass, the one that did
+// not send last first, and stops at the first send. A pass with nothing
+// ready never blocks the other.
 func (u *submitter) pick(ctx context.Context) {
-	u.mu.Lock()
-	stopped := u.logText != ""
-	u.mu.Unlock()
-	if stopped {
+	if u.stopped() {
 		return
 	}
+	if u.withdrawalTurn {
+		u.withdrawalPass(ctx)
+	} else {
+		u.batchPass(ctx)
+	}
+	if u.pending == nil && ctx.Err() == nil && !u.stopped() {
+		if u.withdrawalTurn {
+			u.batchPass(ctx)
+		} else {
+			u.withdrawalPass(ctx)
+		}
+	}
+	if u.pending != nil {
+		u.withdrawalTurn = u.pending.r.Method == definition.SettlementSubmitBatchMethodName
+	}
+}
+
+// stopped reports whether sending stopped after a log write failed.
+func (u *submitter) stopped() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.logText != ""
+}
+
+// batchPass visits every slot once, from u.next, and sends for the
+// first domain that is ready.
+func (u *submitter) batchPass(ctx context.Context) {
 	n := len(u.s.slots)
 	start := u.next
 	for k := 0; k < n; k++ {
@@ -657,7 +690,7 @@ func (u *submitter) check() {
 	if p.unreadable == nil {
 		ck, err = resolveSend(s.src.Node, s.src.Anchors, s.cfg.ExecutorAddress, p.r)
 	} else {
-		ck = sendCheck{Fault: fmt.Errorf("%w: domain %d batch %d: send %s in the submission log cannot be read by this build: %w; it is recorded abandoned and not followed", ErrInconsistent, d, p.r.BatchID, p.r.Hash, p.unreadable)}
+		ck = sendCheck{Fault: fmt.Errorf("%w: domain %d %s: send %s in the submission log cannot be read by this build: %w; it is recorded abandoned and not followed", ErrInconsistent, d, sendLabel(p.r), p.r.Hash, p.unreadable)}
 	}
 	switch {
 	case err != nil:
@@ -676,7 +709,7 @@ func (u *submitter) check() {
 
 	case ck.Unconfirmed:
 		if ck.Age >= u.threshold() && !p.alerted {
-			text := fmt.Sprintf("send %s for domain %d batch %d has not been received by Settlement after %d momenta (confirmationDepth x 10 is %d); it is not replaced automatically", p.r.Hash, d, p.r.BatchID, ck.Age, u.threshold())
+			text := fmt.Sprintf("send %s for domain %d %s has not been received by Settlement after %d momenta (confirmationDepth x 10 is %d); it is not replaced automatically", p.r.Hash, d, sendLabel(p.r), ck.Age, u.threshold())
 			u.mu.Lock()
 			u.alertText = text
 			u.mu.Unlock()
@@ -700,7 +733,7 @@ func (u *submitter) abandon(p *pendingSend, st *workerState) {
 		u.logFailed(err)
 	}
 	u.release(p)
-	log.Printf("supervisor: domain %d batch %d: send %s abandoned: the domain halted", r.DomainID, r.BatchID, r.Hash)
+	log.Printf("supervisor: domain %d %s: send %s abandoned: the domain halted", r.DomainID, sendLabel(r), r.Hash)
 }
 
 // dropRemoved records the outcome ck gives the pending send of a domain that is not configured,
@@ -719,7 +752,7 @@ func (u *submitter) dropRemoved(p *pendingSend, ck sendCheck) {
 	if ck.Fault != nil {
 		fault = fmt.Sprintf(" (%v)", ck.Fault)
 	}
-	log.Printf("supervisor: WARN: submitter: domain %d is not configured: its send %s for batch %d from the submission log finished %s%s; nothing more is sent for it", r.DomainID, r.Hash, r.BatchID, r.Outcome, fault)
+	log.Printf("supervisor: WARN: submitter: domain %d is not configured: its send %s for %s from the submission log finished %s%s; nothing more is sent for it", r.DomainID, r.Hash, sendLabel(r), r.Outcome, fault)
 }
 
 // logFailed stops sending after a submission log write failed: the first call sets logText and
@@ -764,18 +797,20 @@ func (u *submitter) resume(lg sendLog, accepted map[uint32]uint64, unreadable er
 		if sl.w.DomainID != r.DomainID {
 			continue
 		}
-		sl.st.mu.Lock()
-		sl.st.unresolved = &unresolvedSend{batchID: r.BatchID}
-		sl.st.mu.Unlock()
+		if r.Method != definition.SettlementRelayMessageMethodName && r.Method != definition.SettlementReleaseWithdrawalsMethodName {
+			sl.st.mu.Lock()
+			sl.st.unresolved = &unresolvedSend{batchID: r.BatchID}
+			sl.st.mu.Unlock()
+		}
 		u.pending = &pendingSend{slot: i, r: r, unreadable: unreadable}
 		if unreadable == nil {
-			log.Printf("supervisor: domain %d batch %d: following send %s at account height %d from the submission log", r.DomainID, r.BatchID, r.Hash, r.Height)
+			log.Printf("supervisor: domain %d %s: following send %s at account height %d from the submission log", r.DomainID, sendLabel(r), r.Hash, r.Height)
 		}
 		return
 	}
 	u.pending = &pendingSend{slot: -1, r: r, unreadable: unreadable}
 	if unreadable == nil {
-		log.Printf("supervisor: WARN: submitter: domain %d is not configured; following its send %s for batch %d from the submission log to its outcome before sending anything", r.DomainID, r.Hash, r.BatchID)
+		log.Printf("supervisor: WARN: submitter: domain %d is not configured; following its send %s for %s from the submission log to its outcome before sending anything", r.DomainID, r.Hash, sendLabel(r))
 	}
 }
 
@@ -813,6 +848,14 @@ func (u *submitter) dropRetry(st *workerState, d uint32) {
 
 // finish closes the pending send with outcome o. other names the block that superseded it.
 func (u *submitter) finish(p *pendingSend, st *workerState, o Outcome, other types.Hash) {
+	switch p.r.Method {
+	case definition.SettlementRelayMessageMethodName:
+		u.finishRelay(p, st, o, other)
+		return
+	case definition.SettlementReleaseWithdrawalsMethodName:
+		u.finishRelease(p, o, other)
+		return
+	}
 	r := p.r
 	d, b := r.DomainID, r.BatchID
 

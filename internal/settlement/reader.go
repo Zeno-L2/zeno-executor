@@ -171,6 +171,24 @@ func (v *View) InputSequenceCursor(domainID uint32) (*definition.InputSequenceCu
 	return cur, nil
 }
 
+// ReleaseQueueMeta returns the domain's release queue cursors, both
+// zero when the domain has no queue.
+func (v *View) ReleaseQueueMeta(domainID uint32) (*definition.ReleaseQueueMeta, error) {
+	value, err := v.read(definition.ReleaseQueueMetaKey(domainID))
+	if err != nil {
+		return nil, err
+	}
+	m := &definition.ReleaseQueueMeta{DomainId: domainID}
+	if value == nil {
+		return m, nil
+	}
+	if err := v.unpack(m, definition.ReleaseQueueMetaVariableName, value); err != nil {
+		return nil, err
+	}
+	m.DomainId = domainID
+	return m, nil
+}
+
 // BatchEntry returns the domain's batch entry, or false when no such batch was accepted.
 func (v *View) BatchEntry(domainID uint32, batchID uint64) (*definition.BatchEntry, bool, error) {
 	value, err := v.read((&definition.BatchEntryKey{DomainId: domainID, BatchId: batchID}).Key())

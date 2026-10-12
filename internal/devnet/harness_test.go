@@ -48,6 +48,7 @@ const (
 	depositAmount      = 100  // ZNN base units per deposit
 	maxBatchWithdrawal = 1000 // ZNN base units
 	inputGas           = uint64(5000)
+	withdrawalDelay    = uint64(30) // go-zenon's devnet WithdrawalDelayMin (vm/constants/embedded_devnet.go); domain 1 registers with it
 
 	// Seeds of dev address indexes 1 and 3 (paths m/44'/73404'/1' and /3' of the devnet mnemonic
 	// in go-zenon's docker/devnet/README.md). Both are public and for the devnet only.
@@ -83,6 +84,9 @@ func newDevnet(t *testing.T) *devnet {
 	keyPair(t, executorSeed, executorAddress)
 	if types.NetworkAdmin != adminAddress {
 		t.Fatalf("types.NetworkAdmin is %s, not the devnet admin %s: the go-zenon checkout lacks the devnet build (common/types/address_devnet.go)", types.NetworkAdmin, adminAddress)
+	}
+	if constants.WithdrawalDelayMin != withdrawalDelay {
+		t.Fatalf("constants.WithdrawalDelayMin is %d, not the devnet's %d: the go-zenon checkout lacks the devnet withdrawal delay (vm/constants/embedded_devnet.go)", constants.WithdrawalDelayMin, withdrawalDelay)
 	}
 
 	c := znnd.NewClient(endpoint)
@@ -435,6 +439,16 @@ func (d *devnet) setDomainPause(active bool) uint64 {
 	return h
 }
 
+// setRelayPause sets or clears domain 1's relay pause.
+func (d *devnet) setRelayPause(active bool) {
+	d.t.Helper()
+	h := d.settlementCall(definition.SettlementPauseMethodName, domainID, false, definition.PauseScopeRelay, active)
+	d.view(h, fmt.Sprintf("relay pause %v", active), func(v *settlement.View) (bool, string, error) {
+		p, err := v.DomainPauseState(domainID)
+		return err == nil && p.RelayPaused == active, fmt.Sprintf("relay paused %v", p.RelayPaused), err
+	})
+}
+
 // setDomainStatus re-registers domain 1 with the given status.
 func (d *devnet) setDomainStatus(status uint8) uint64 {
 	d.t.Helper()
@@ -675,4 +689,22 @@ func sendLog(t *testing.T, storagePath string) []supervisor.SendRecord {
 		out = append(out, r)
 	}
 	return out
+}
+
+// withdrawalFiles returns how many batch files the executor's
+// withdrawal store for domain 1 holds under storagePath.
+func withdrawalFiles(t *testing.T, storagePath string) int {
+	t.Helper()
+	dir := filepath.Join(storagePath, "supervisor", executorAddress.String()+".withdrawals", "1")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the withdrawals store: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".json" {
+			n++
+		}
+	}
+	return n
 }

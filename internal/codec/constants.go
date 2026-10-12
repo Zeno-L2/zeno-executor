@@ -34,6 +34,9 @@ const (
 	// the revert data (§15). It does not bound a ContractEffects blob's ReturnData: an
 	// oversized one must decode, so that step 7 rejects it as RESULT_TOO_LARGE (§10.6).
 	MaxReturnData = 4 << 10
+	// MaxMerkleProofDepth bounds the step count of a MerkleProof
+	// (§27.3, §25.1).
+	MaxMerkleProofDepth = 32
 )
 
 // OutboxMessage kind ordinals (§27.4).

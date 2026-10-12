@@ -151,6 +151,12 @@ type submitHarness struct {
 	gateBy    map[uint32]settlement.Gates
 	gateErr   map[uint32]error
 	gateCalls []gateCall
+
+	relayPaused map[uint32]bool
+	queue       map[uint32]uint64 // each domain's release queue length
+	processed   map[types.Hash]bool
+	relayErr    map[uint32]error
+	relayCalls  int
 }
 
 type gateCall struct {
@@ -175,6 +181,11 @@ func newSubmitHarness(t *testing.T, domains ...uint32) *submitHarness {
 		entries:  map[entryKey]*definition.BatchEntry{},
 		gateBy:   map[uint32]settlement.Gates{},
 		gateErr:  map[uint32]error{},
+
+		relayPaused: map[uint32]bool{},
+		queue:       map[uint32]uint64{},
+		processed:   map[types.Hash]bool{},
+		relayErr:    map[uint32]error{},
 		gate: settlement.Gates{
 			Height: 100,
 			Member: &definition.ExecutorSetMember{
@@ -221,11 +232,34 @@ func newSubmitHarness(t *testing.T, domains ...uint32) *submitHarness {
 				}
 				return h.gate, nil
 			},
+			relay: func(d uint32, q *settlement.RelayQuery) (settlement.RelayState, error) {
+				h.relayCalls++
+				if err := h.relayErr[d]; err != nil {
+					return settlement.RelayState{}, err
+				}
+				rs := settlement.RelayState{Height: h.tips[d].Height, Paused: h.relayPaused[d], QueueLen: h.queue[d]}
+				if q == nil {
+					return rs, nil
+				}
+				if q.BatchID < h.tips[d].NextBatchID {
+					rs.Entry = h.entries[entryKey{d, q.BatchID}]
+				}
+				for _, id := range q.IDs {
+					if !h.processed[id] {
+						break
+					}
+					rs.Processed++
+				}
+				return rs, nil
+			},
 		},
 		Node: h.node,
 	}
 	h.sup = New(cfg, testKeyPair(t), src, Policy{BackoffMin: 10 * time.Second, BackoffMax: 80 * time.Second})
 	h.sub = h.sup.sub
+	for _, d := range domains {
+		h.st(d).withdrawals = testStore(t, d)
+	}
 	h.sub.warnEvery = 0
 	h.sub.now = func() time.Time { return h.clock }
 	return h
@@ -1156,15 +1190,17 @@ func TestSubmitShutdown(t *testing.T) {
 // --- resolveSend ---
 
 type resolveFixture struct {
-	t       *testing.T
-	node    *sendNodeFake
-	tip     settlement.Tip
-	tipErr  error
-	entries map[uint64]*definition.BatchEntry
-	c       codec.BatchCommitment
-	data    []byte
-	r       SendRecord
-	blk     *nom.AccountBlock // the send as the node would store it
+	t        *testing.T
+	node     *sendNodeFake
+	tip      settlement.Tip
+	tipErr   error
+	entries  map[uint64]*definition.BatchEntry
+	relay    settlement.RelayState
+	relayErr error
+	c        codec.BatchCommitment
+	data     []byte
+	r        SendRecord
+	blk      *nom.AccountBlock // the send as the node would store it
 }
 
 // newResolveFixture builds a record for domain 1 batch 3 sent at account height 5.
@@ -1198,6 +1234,7 @@ func (f *resolveFixture) resolve() (sendCheck, error) {
 			}
 			return nil, errors.New("fake: no such entry")
 		},
+		relay: func(uint32, *settlement.RelayQuery) (settlement.RelayState, error) { return f.relay, f.relayErr },
 	}
 	return resolveSend(f.node, anchors, harnessExecutor, f.r)
 }

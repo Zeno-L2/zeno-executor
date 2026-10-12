@@ -33,6 +33,9 @@ type vectorRaw struct {
 	RejectReason        string            `json:"reject_reason"`
 	Inputs              []inputVectorRaw  `json:"inputs"`
 	ExpectedInputRoot   string            `json:"expected_input_root"`
+	ProofsHex           []string          `json:"proofs_hex"`
+	PrefixRoot          string            `json:"prefix_root"`
+	PrefixProofsHex     []string          `json:"prefix_proofs_hex"`
 	ZtsBech32           string            `json:"zts_bech32"`
 	ZtsHex              string            `json:"zts_hex"`
 	AssetIDHex          string            `json:"asset_id_hex"`
@@ -230,6 +233,51 @@ func testInputRoot(t *testing.T, vec vectorRaw) {
 	}
 	if hex.EncodeToString(got[:]) != vec.ExpectedInputRoot {
 		t.Fatalf("expected_input_root mismatch: got %x, want %s", got, vec.ExpectedInputRoot)
+	}
+
+	checkFrozenProofs(t, "proofs_hex", elements, vec.ExpectedInputRoot, vec.ProofsHex)
+
+	prefix := elements[:len(vec.PrefixProofsHex)]
+	if gotPrefix := MerkleRoot(prefix); hex.EncodeToString(gotPrefix[:]) != vec.PrefixRoot {
+		t.Fatalf("prefix_root mismatch: got %x, want %s", gotPrefix, vec.PrefixRoot)
+	}
+	checkFrozenProofs(t, "prefix_proofs_hex", prefix, vec.PrefixRoot, vec.PrefixProofsHex)
+}
+
+// checkFrozenProofs checks that MerkleProofs reproduces the frozen
+// proof of every element, that each frozen proof verifies against
+// rootHex, and that changing its last (sibling) byte yields
+// ErrProofMismatch.
+func checkFrozenProofs(t *testing.T, name string, elements [][]byte, rootHex string, frozen []string) {
+	t.Helper()
+	if len(frozen) == 0 || len(frozen) != len(elements) {
+		t.Fatalf("%s: %d proofs for %d elements", name, len(frozen), len(elements))
+	}
+	rootBytes, err := hex.DecodeString(rootHex)
+	if err != nil || len(rootBytes) != len(types.Hash{}) {
+		t.Fatalf("%s: bad root %q", name, rootHex)
+	}
+	root := hashOf(rootBytes)
+
+	built := MerkleProofs(elements)
+	if len(built) != len(elements) {
+		t.Fatalf("%s: MerkleProofs returned %d proofs for %d elements", name, len(built), len(elements))
+	}
+	for i, element := range elements {
+		if got := hex.EncodeToString(built[i]); got != frozen[i] {
+			t.Fatalf("%s[%d]: MerkleProofs mismatch: got %s, want %s", name, i, got, frozen[i])
+		}
+		proof, err := hex.DecodeString(frozen[i])
+		if err != nil {
+			t.Fatalf("%s[%d]: %v", name, i, err)
+		}
+		if err := VerifyMerkleProof(root, element, proof); err != nil {
+			t.Fatalf("%s[%d]: VerifyMerkleProof: %v", name, i, err)
+		}
+		proof[len(proof)-1] ^= 0x01
+		if err := VerifyMerkleProof(root, element, proof); !errors.Is(err, ErrProofMismatch) {
+			t.Fatalf("%s[%d]: tampered proof: got %v, want ErrProofMismatch", name, i, err)
+		}
 	}
 }
 

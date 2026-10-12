@@ -20,6 +20,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
@@ -1665,7 +1666,7 @@ func TestOnCommitReportsDurableCommitments(t *testing.T) {
 		err error
 	}
 	var reads []read
-	cfg.OnCommit = func(c []codec.BatchCommitment) error {
+	cfg.OnCommit = func(c []codec.BatchCommitment, _ Withdrawals) error {
 		pos, ok, err := recovery.ReadCursor(layout)
 		mu.Lock()
 		calls = append(calls, c)
@@ -1732,6 +1733,121 @@ func TestOnCommitReportsDurableCommitments(t *testing.T) {
 	}
 }
 
+// withdrawalsLog calls the withdrawals function of every OnCommit and
+// OnRecover and keeps what each batch returned. committed accumulates
+// over every OnCommit call. recovered holds the batches of the latest
+// OnRecover call.
+type withdrawalsLog struct {
+	mu        sync.Mutex
+	commits   []codec.BatchCommitment
+	committed map[uint64][]batch.Withdrawal
+	recovered map[uint64][]batch.Withdrawal
+}
+
+func (w *withdrawalsLog) attach(cfg *Config) {
+	collect := func(dst map[uint64][]batch.Withdrawal, cs []codec.BatchCommitment, fn Withdrawals) error {
+		for _, c := range cs {
+			ws, err := fn(c)
+			if err != nil {
+				return err
+			}
+			dst[c.BatchID] = ws
+		}
+		return nil
+	}
+	w.committed = map[uint64][]batch.Withdrawal{}
+	cfg.OnCommit = func(cs []codec.BatchCommitment, fn Withdrawals) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.commits = append(w.commits, cs...)
+		return collect(w.committed, cs, fn)
+	}
+	cfg.OnRecover = func(_ uint64, cs []codec.BatchCommitment, fn Withdrawals) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.recovered = map[uint64][]batch.Withdrawal{}
+		return collect(w.recovered, cs, fn)
+	}
+}
+
+// requireHandOff checks that the batch returned exactly one withdrawal,
+// for the batch's first input, whose proof verifies under the
+// commitment's outbox root.
+func requireHandOff(t *testing.T, c codec.BatchCommitment, ws []batch.Withdrawal) {
+	t.Helper()
+	if len(ws) != 1 {
+		t.Fatalf("batch %d: %d withdrawals, want 1", c.BatchID, len(ws))
+	}
+	m, err := codec.DecodeOutboxMessage(ws[0].Message)
+	if err != nil {
+		t.Fatalf("batch %d: decode: %v", c.BatchID, err)
+	}
+	if m.InputIndex != c.FirstInputSeq {
+		t.Fatalf("batch %d: InputIndex = %d, want %d", c.BatchID, m.InputIndex, c.FirstInputSeq)
+	}
+	if err := codec.VerifyMerkleProof(c.OutboxRoot, ws[0].Message, ws[0].Proof); err != nil {
+		t.Fatalf("batch %d: proof: %v", c.BatchID, err)
+	}
+}
+
+// TestWithdrawalsRebuiltOnCommitAndRecover checks the withdrawals
+// function for committed and recovered batches, and that a damaged
+// bundle halts Run naming its batch.
+func TestWithdrawalsRebuiltOnCommitAndRecover(t *testing.T) {
+	src := &chainSource{}
+	cfg := validConfig(t, src)
+	layout := layoutOf(t, cfg)
+	var first withdrawalsLog
+	first.attach(&cfg)
+
+	chain := buildChain(t, 10, 0)
+	l := startRun(t, cfg, src, capDomain{})
+	l.step(chain, 4)
+	l.step(chain, 8)
+	if err := l.stop(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(first.commits) < 2 {
+		t.Fatalf("%d committed batches, want at least 2", len(first.commits))
+	}
+	for _, c := range first.commits {
+		requireHandOff(t, c, first.committed[c.BatchID])
+	}
+
+	var second withdrawalsLog
+	second.attach(&cfg)
+	l = startRun(t, cfg, src, capDomain{})
+	l.settle()
+	if err := l.stop(); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if len(second.recovered) != len(first.commits) {
+		t.Fatalf("%d recovered hand-offs, want %d", len(second.recovered), len(first.commits))
+	}
+	for _, c := range first.commits {
+		requireHandOff(t, c, second.recovered[c.BatchID])
+	}
+
+	bad := first.commits[len(first.commits)-1]
+	files, err := filepath.Glob(filepath.Join(layout.Bundles, fmt.Sprintf("%x*", bad.DAHash[:])))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("bundle files for batch %d: %v, %v", bad.BatchID, files, err)
+	}
+	if err := os.WriteFile(files[0], []byte("not the bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var third withdrawalsLog
+	third.attach(&cfg)
+	l = startRun(t, cfg, src, capDomain{})
+	err = l.exit()
+	if !errors.Is(err, recovery.ErrHalted) {
+		t.Fatalf("Run = %v, want an error wrapping recovery.ErrHalted", err)
+	}
+	if want := fmt.Sprintf("batch %d withdrawals", bad.BatchID); !strings.Contains(err.Error(), want) {
+		t.Fatalf("Run = %v, want it to name %q", err, want)
+	}
+}
+
 // --- OnRecover ---
 
 // recoverEvent is one OnCommit or OnRecover call, in call order.
@@ -1747,13 +1863,13 @@ type eventLog struct {
 }
 
 func (e *eventLog) attach(cfg *Config) {
-	cfg.OnCommit = func(c []codec.BatchCommitment) error {
+	cfg.OnCommit = func(c []codec.BatchCommitment, _ Withdrawals) error {
 		e.mu.Lock()
 		e.events = append(e.events, recoverEvent{cs: c})
 		e.mu.Unlock()
 		return nil
 	}
-	cfg.OnRecover = func(next uint64, cs []codec.BatchCommitment) error {
+	cfg.OnRecover = func(next uint64, cs []codec.BatchCommitment, _ Withdrawals) error {
 		e.mu.Lock()
 		e.events = append(e.events, recoverEvent{recovered: true, next: next, cs: cs})
 		e.mu.Unlock()
@@ -1946,7 +2062,7 @@ func TestCommitAndLocalWriteFailures(t *testing.T) {
 		src.set(chain, 12)
 		cfg := validConfig(t, src)
 		reportErr := errors.New("report failed")
-		cfg.OnCommit = func([]codec.BatchCommitment) error { return reportErr }
+		cfg.OnCommit = func([]codec.BatchCommitment, Withdrawals) error { return reportErr }
 		err := runUntil(t, cfg, func() bool { return false })
 		if !errors.Is(err, reportErr) || errors.Is(err, recovery.ErrHalted) || errors.Is(err, recovery.ErrSourceUnavailable) {
 			t.Fatalf("Run = %v, want one wrapping the OnCommit error and neither sentinel", err)
@@ -1972,7 +2088,7 @@ func TestCommitAndLocalWriteFailures(t *testing.T) {
 		}
 		t.Cleanup(func() { os.Chmod(layout.Batches, 0o755) })
 		var count atomic.Int32
-		cfg.OnCommit = func([]codec.BatchCommitment) error { count.Add(1); return nil }
+		cfg.OnCommit = func([]codec.BatchCommitment, Withdrawals) error { count.Add(1); return nil }
 		runErr := runUntil(t, cfg, func() bool { return false })
 		if errors.Is(runErr, recovery.ErrHalted) || errors.Is(runErr, recovery.ErrSourceUnavailable) {
 			t.Fatalf("Run = %v, want neither sentinel", runErr)

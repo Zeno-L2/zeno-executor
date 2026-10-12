@@ -13,6 +13,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
+	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
 )
@@ -40,10 +41,12 @@ const (
 	TypeRecovered         Type = 0x88 // W→S
 	TypeCursorRequest     Type = 0x89 // W→S
 	TypeAcceptedRequest   Type = 0x8A // W→S
+	TypeWithdrawal        Type = 0x8B // W→S
+	TypeWithdrawalsEnd    Type = 0x8C // W→S
 )
 
 // Side names the sender of a frame. Supervisor sends 0x01-0x0A and is read with MaxFrame;
-// Worker sends 0x81-0x8A and is read with MaxWorkerFrame.
+// Worker sends 0x81-0x8C and is read with MaxWorkerFrame.
 type Side uint8
 
 const (
@@ -58,9 +61,21 @@ const (
 	maxRoleLen         = 64
 	maxNetworkNameLen  = 256
 	maxStoragePathLen  = 4096
+
+	// MaxHandOffWithdrawals bounds the Withdrawal frames of one batch's
+	// hand-off: MaxBatchInputs inputs, each with at most
+	// MaxOutboxPerResult outbox messages (2,112).
+	MaxHandOffWithdrawals = batch.MaxBatchInputs * codec.MaxOutboxPerResult
+
+	// withdrawalMessageLen is the encoded size of every kind 1
+	// OutboxMessage: sourceContract 32, inputIndex 8, outboxIndex 4, kind
+	// 1, recipient 20, asset 32, amount 32, payload length 4 (the payload
+	// is always empty).
+	withdrawalMessageLen = 133
 )
 
-// Message is implemented by exactly the twenty types below, all with value receivers.
+// Message is implemented by exactly the twenty-two types below, all
+// with value receivers.
 type Message interface{ Type() Type }
 
 type WorkerConfig struct {
@@ -171,6 +186,23 @@ func (Committed) Type() Type       { return TypeCommitted }
 func (Retract) Type() Type         { return TypeRetract }
 func (Recovered) Type() Type       { return TypeRecovered }
 
+// Withdrawal carries one L1 withdrawal of batch BatchID. Message is a
+// canonical kind 1 OutboxMessage; its inputIndex and outboxIndex are
+// its position in the batch, and a batch's Withdrawal frames are
+// strictly ascending in that pair. Proof is its §27.3 MerkleProof under
+// the batch's OutboxRoot.
+type Withdrawal struct {
+	BatchID uint64
+	Message []byte
+	Proof   []byte
+}
+
+// WithdrawalsEnd closes batch BatchID's hand-off.
+type WithdrawalsEnd struct{ BatchID uint64 }
+
+func (Withdrawal) Type() Type     { return TypeWithdrawal }
+func (WithdrawalsEnd) Type() Type { return TypeWithdrawalsEnd }
+
 // --- payload reader/writer, shared with momentum.go ---
 
 // pwriter is an append-only payload buffer for the message encoders below.
@@ -272,7 +304,7 @@ func sideOfType(t Type) (Side, bool) {
 	switch t {
 	case TypeConfig, TypeFrontier, TypeMomentum, TypeRangeEnd, TypeAnchor, TypeSourceError, TypeAssignment, TypeCap, TypeCursor, TypeAccepted:
 		return Supervisor, true
-	case TypeFrontierRequest, TypeMomentaRequest, TypeAnchorRequest, TypeCommitted, TypeAssignmentRequest, TypeCapRequest, TypeRetract, TypeRecovered, TypeCursorRequest, TypeAcceptedRequest:
+	case TypeFrontierRequest, TypeMomentaRequest, TypeAnchorRequest, TypeCommitted, TypeAssignmentRequest, TypeCapRequest, TypeRetract, TypeRecovered, TypeCursorRequest, TypeAcceptedRequest, TypeWithdrawal, TypeWithdrawalsEnd:
 		return Worker, true
 	default:
 		return 0, false
@@ -340,6 +372,10 @@ func Encode(m Message) ([]byte, error) {
 		payload = encodeAcceptedRequest(v)
 	case Accepted:
 		payload, err = encodeAccepted(v)
+	case Withdrawal:
+		payload, err = encodeWithdrawal(v)
+	case WithdrawalsEnd:
+		payload = encodeWithdrawalsEnd(v)
 	default:
 		return nil, fmt.Errorf("ipc: encode: unhandled message type %T", m)
 	}
@@ -406,6 +442,10 @@ func decodePayload(t Type, payload []byte) (Message, error) {
 		return decodeCommitted(payload)
 	case TypeRetract:
 		return decodeRetract(payload)
+	case TypeWithdrawal:
+		return decodeWithdrawal(payload)
+	case TypeWithdrawalsEnd:
+		return decodeWithdrawalsEnd(payload)
 	case TypeRecovered:
 		return decodeRecovered(payload)
 	case TypeAssignmentRequest:
@@ -540,6 +580,104 @@ func decodeRetract(p []byte) (Message, error) {
 		return nil, err
 	}
 	return Retract{FromBatchID: id}, nil
+}
+
+// --- Withdrawal, WithdrawalsEnd ---
+
+// checkWithdrawalMessage requires msg to be a canonical kind 1
+// OutboxMessage of exactly withdrawalMessageLen bytes. The kind check
+// matters: a kind 0 leaf sits in the same tree, so its proof also
+// verifies, and a kind 0 message with a 52-byte payload has the same
+// length.
+func checkWithdrawalMessage(msg []byte) error {
+	if len(msg) != withdrawalMessageLen {
+		return fmt.Errorf("withdrawal message is %d bytes, want %d", len(msg), withdrawalMessageLen)
+	}
+	m, err := codec.DecodeOutboxMessage(msg)
+	if err != nil {
+		return fmt.Errorf("withdrawal message: %w", err)
+	}
+	if _, ok := m.Target.(codec.L1Withdrawal); !ok {
+		return errors.New("withdrawal message is not a kind 1 outbox message")
+	}
+	return nil
+}
+
+// CheckProof requires proof to be a well-formed MerkleProof: a u32 step
+// count of at most codec.MaxMerkleProofDepth, then exactly that many
+// steps of a side byte (0 or 1) and a 32-byte sibling.
+func CheckProof(proof []byte) error {
+	if len(proof) < 4 {
+		return fmt.Errorf("proof is %d bytes, want at least 4", len(proof))
+	}
+	count := binary.BigEndian.Uint32(proof)
+	if count > codec.MaxMerkleProofDepth {
+		return fmt.Errorf("proof has %d steps, maximum %d", count, codec.MaxMerkleProofDepth)
+	}
+	if want := 4 + 33*int(count); len(proof) != want {
+		return fmt.Errorf("proof is %d bytes, want %d for %d steps", len(proof), want, count)
+	}
+	for i := 0; i < int(count); i++ {
+		if side := proof[4+33*i]; side > 1 {
+			return fmt.Errorf("proof step %d has side %d", i, side)
+		}
+	}
+	return nil
+}
+
+func encodeWithdrawal(m Withdrawal) ([]byte, error) {
+	if err := checkWithdrawalMessage(m.Message); err != nil {
+		return nil, err
+	}
+	if err := CheckProof(m.Proof); err != nil {
+		return nil, err
+	}
+	w := &pwriter{}
+	w.u64(m.BatchID)
+	w.raw(m.Message)
+	w.raw(m.Proof)
+	return w.buf, nil
+}
+
+func decodeWithdrawal(p []byte) (Message, error) {
+	r := newPReader(p)
+	id, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	msg, err := r.fixed(withdrawalMessageLen)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkWithdrawalMessage(msg); err != nil {
+		return nil, err
+	}
+	proof, err := r.fixed(r.remaining())
+	if err != nil {
+		return nil, err
+	}
+	if err := CheckProof(proof); err != nil {
+		return nil, err
+	}
+	return Withdrawal{BatchID: id, Message: append([]byte{}, msg...), Proof: append([]byte{}, proof...)}, nil
+}
+
+func encodeWithdrawalsEnd(m WithdrawalsEnd) []byte {
+	w := &pwriter{}
+	w.u64(m.BatchID)
+	return w.buf
+}
+
+func decodeWithdrawalsEnd(p []byte) (Message, error) {
+	r := newPReader(p)
+	id, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.end(); err != nil {
+		return nil, err
+	}
+	return WithdrawalsEnd{BatchID: id}, nil
 }
 
 // --- Momentum ---

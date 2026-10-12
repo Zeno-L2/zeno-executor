@@ -9,6 +9,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
+	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ledger"
 	"github.com/digitalSloth/go-executor/internal/recovery"
@@ -334,8 +335,13 @@ func (c *Client) MaxBatchWithdrawals(domainID uint32, height uint64, hash types.
 }
 
 // ReportRecovered implements runtime.Config.OnRecover: it writes Retract{FromBatchID:
-// nextBatchID}, then one Recovered frame per commitment, in order, and reads no reply.
-func (c *Client) ReportRecovered(nextBatchID uint64, cs []codec.BatchCommitment) error {
+// nextBatchID}, then for each commitment, in order, a Recovered frame,
+// one Withdrawal frame per entry withdrawals returns for it, and
+// WithdrawalsEnd. It reads no reply. withdrawals is called once per
+// commitment, before that commitment's frames, and one result is held
+// at a time. A withdrawals error is returned unchanged, before that
+// commitment's Recovered frame, and does not mark the client broken.
+func (c *Client) ReportRecovered(nextBatchID uint64, cs []codec.BatchCommitment, withdrawals func(codec.BatchCommitment) ([]batch.Withdrawal, error)) error {
 	if c.broken != nil {
 		return c.broken
 	}
@@ -343,23 +349,53 @@ func (c *Client) ReportRecovered(nextBatchID uint64, cs []codec.BatchCommitment)
 		return err
 	}
 	for _, cm := range cs {
-		if err := c.send(Recovered{Commitment: cm}); err != nil {
+		ws, err := withdrawals(cm)
+		if err != nil {
+			return err
+		}
+		if err := c.handOff(Recovered{Commitment: cm}, cm.BatchID, ws); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// ReportCommitted implements runtime.Config.OnCommit: it writes one Committed frame per
-// commitment, in order, and reads no reply. An empty cs writes nothing.
-func (c *Client) ReportCommitted(cs []codec.BatchCommitment) error {
+// ReportCommitted implements runtime.Config.OnCommit: for each
+// commitment, in order, it writes a Committed frame, one Withdrawal
+// frame per entry withdrawals returns for it, and WithdrawalsEnd. It
+// reads no reply. An empty cs writes nothing. withdrawals is called
+// once per commitment, before that commitment's frames, and one result
+// is held at a time. A withdrawals error is returned unchanged, before
+// that commitment's Committed frame, and does not mark the client
+// broken.
+func (c *Client) ReportCommitted(cs []codec.BatchCommitment, withdrawals func(codec.BatchCommitment) ([]batch.Withdrawal, error)) error {
 	if c.broken != nil {
 		return c.broken
 	}
 	for _, cm := range cs {
-		if err := c.send(Committed{Commitment: cm}); err != nil {
+		ws, err := withdrawals(cm)
+		if err != nil {
+			return err
+		}
+		if err := c.handOff(Committed{Commitment: cm}, cm.BatchID, ws); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// handOff writes report, then one Withdrawal{batchID, w.Message,
+// w.Proof} per entry of ws in slice order, then
+// WithdrawalsEnd{batchID}. It writes each entry exactly once and never
+// sorts, filters or retries one.
+func (c *Client) handOff(report Message, batchID uint64, ws []batch.Withdrawal) error {
+	if err := c.send(report); err != nil {
+		return err
+	}
+	for _, w := range ws {
+		if err := c.send(Withdrawal{BatchID: batchID, Message: w.Message, Proof: w.Proof}); err != nil {
+			return err
+		}
+	}
+	return c.send(WithdrawalsEnd{BatchID: batchID})
 }
