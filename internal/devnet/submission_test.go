@@ -18,13 +18,15 @@ import (
 
 // TestSubmissionOnDevnet runs the executor binaries against the devnet and checks that
 // Settlement accepts the batches they submit, across a restart with an unresolved send, a submit
-// pause with a paused domain, and a re-sync from an empty domain directory.
+// pause with a paused domain, and a re-sync from an empty domain directory, and, once Settlement's
+// relay pause is cleared, the registration, release and payout of each deposit's refund.
 func TestSubmissionOnDevnet(t *testing.T) {
 	t.Logf("phase 1: setup")
 	d := newDevnet(t)
 	executorBin, workerBin := buildBinaries(t, d.dir)
 	configPath, storage := writeConfig(t, d.dir, workerBin)
 	d.setup()
+	d.setRelayPause(true)
 
 	// Phase 2: the first batch across a restart.
 	t.Logf("phase 2: the first batch across a restart")
@@ -188,5 +190,7 @@ func TestSubmissionOnDevnet(t *testing.T) {
 			t.Fatalf("record %d has hash %s, want the hash %s of its send record", i, r[i].Hash, r[i-1].Hash)
 		}
 	}
+	t.Logf("phase 5: withdrawals")
+	d.withdrawalPhase(storage)
 	d.exec.stop()
 }

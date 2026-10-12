@@ -18,12 +18,16 @@ import (
 // maxSendLogBytes is the size at which the submission log is rotated before its next send.
 const maxSendLogBytes = 16 << 20
 
-// sendLogVersion is the log-format version this build writes and reads in full.
-const sendLogVersion = 1
+// sendLogVersion is the log-format version this build writes; it reads
+// versions 1 and 2 in full.
+const sendLogVersion = 2
 
-// logLine is one line of the submission log. Every log-format version keeps version,
-// domainId, batchId, hash and outcome with their version 1 meaning, so replay can place
-// any line; a line may carry fields this build does not know, and replay ignores them.
+// logLine is one line of the submission log. Every log-format version
+// keeps version, domainId, batchId, hash and outcome with their version
+// 1 meaning, so replay can place any line; a line may carry fields this
+// build does not know, and replay ignores them. batchId names the batch
+// of a SubmitBatch or RelayMessage line and is 0 on a
+// ReleaseWithdrawals line.
 type logLine struct {
 	Version uint32 `json:"version"`
 	SendRecord
@@ -131,7 +135,7 @@ func (l *fileLog) replay(name string, data []byte) error {
 		l.mem.Resolved(r)
 		if last, _ := l.mem.Last(); last == r {
 			l.unreadable = nil
-			if why == nil && r.Outcome == OutcomeAccepted {
+			if why == nil && r.Outcome == OutcomeAccepted && r.Method == definition.SettlementSubmitBatchMethodName {
 				l.accepted[r.DomainID] = r.BatchID
 			}
 		}
@@ -169,20 +173,24 @@ func decodeSendRecord(line []byte) (r SendRecord, unreadable error, err error) {
 	}
 	r = SendRecord{DomainID: env.DomainID, BatchID: env.BatchID, Hash: env.Hash, Outcome: env.Outcome}
 
-	if env.Version != sendLogVersion {
-		return r, fmt.Errorf("log-format version %d is not %d", env.Version, sendLogVersion), nil
+	if env.Version != 1 && env.Version != 2 {
+		return r, fmt.Errorf("log-format version %d is not 1 or 2", env.Version), nil
 	}
 	var ll logLine
 	if err := json.Unmarshal(line, &ll); err != nil {
 		return r, err, nil
 	}
+	readable := ll.Method == definition.SettlementSubmitBatchMethodName ||
+		env.Version == 2 && (ll.Method == definition.SettlementRelayMessageMethodName || ll.Method == definition.SettlementReleaseWithdrawalsMethodName)
 	switch {
-	case ll.Method != definition.SettlementSubmitBatchMethodName:
-		return r, fmt.Errorf("method %q is not %s", ll.Method, definition.SettlementSubmitBatchMethodName), nil
+	case !readable:
+		return r, fmt.Errorf("method %q is not readable in log-format version %d", ll.Method, env.Version), nil
 	case ll.Height == 0:
 		return r, errors.New("account height 0"), nil
 	case ll.DataHash == types.ZeroHash:
 		return r, errors.New("no data hash"), nil
+	case ll.Method == definition.SettlementRelayMessageMethodName && ll.OutboxID == types.ZeroHash:
+		return r, errors.New("no outbox id"), nil
 	}
 	return ll.SendRecord, nil, nil
 }

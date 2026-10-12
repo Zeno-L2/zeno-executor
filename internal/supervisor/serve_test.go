@@ -17,6 +17,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
+	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
@@ -51,6 +52,15 @@ type fakeAnchors struct {
 	accepted func(domainID uint32, from uint64, max int) (settlement.Accepted, error)
 	tip      func(domainID uint32) (settlement.Tip, error)
 	gates    func(domainID uint32, pillarName string) (settlement.Gates, error)
+	// relay, when set, answers Relay; a nil relay reads as an idle domain.
+	relay func(domainID uint32, q *settlement.RelayQuery) (settlement.RelayState, error)
+}
+
+func (f fakeAnchors) Relay(domainID uint32, q *settlement.RelayQuery) (settlement.RelayState, error) {
+	if f.relay == nil {
+		return settlement.RelayState{}, nil
+	}
+	return f.relay(domainID, q)
 }
 
 func (f fakeAnchors) Gates(domainID uint32, pillarName string) (settlement.Gates, error) {
@@ -245,7 +255,7 @@ func syncRoundTrip(t *testing.T, wEnd io.ReadWriter) {
 
 func TestServeFrontier(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	src := Sources{Momenta: fakeMomenta{frontier: func() (uint64, error) { return 42, nil }}}
 	done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
 
@@ -276,7 +286,7 @@ func TestServeFrontier(t *testing.T) {
 func TestServeAnchor(t *testing.T) {
 	t.Run("found", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		var gotDomain uint32
 		src := Sources{Anchors: fakeAnchors{anchor: func(domainID uint32) (recovery.Anchor, bool, error) {
 			gotDomain = domainID
@@ -307,7 +317,7 @@ func TestServeAnchor(t *testing.T) {
 
 	t.Run("not found", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		src := Sources{Anchors: fakeAnchors{anchor: func(domainID uint32) (recovery.Anchor, bool, error) {
 			// A non-zero anchor from the source with found == false; the reply must be the
 			// zero anchor, since ipc.Encode rejects a not-found anchor with a non-zero root
@@ -336,7 +346,7 @@ func TestServeAnchor(t *testing.T) {
 
 func TestServeAnchorPrunesBelowNextBatchID(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	w := WorkerConfig{DomainID: 1}
 	exec := types.Address{0x09}
 	src := Sources{Anchors: fakeAnchors{anchor: func(uint32) (recovery.Anchor, bool, error) {
@@ -348,9 +358,7 @@ func TestServeAnchorPrunesBelowNextBatchID(t *testing.T) {
 		t.Fatalf("WriteMessage: %v", err)
 	}
 	for id := uint64(1); id <= 4; id++ {
-		if err := ipc.WriteMessage(wEnd, ipc.Recovered{Commitment: commitmentFor(1, exec, id, id*3)}); err != nil {
-			t.Fatalf("WriteMessage: %v", err)
-		}
+		writeHandOff(t, wEnd, ipc.Recovered{Commitment: commitmentFor(1, exec, id, id*3)})
 	}
 	if err := ipc.WriteMessage(wEnd, ipc.AnchorRequest{}); err != nil {
 		t.Fatalf("WriteMessage: %v", err)
@@ -410,7 +418,7 @@ func requestMomenta(t *testing.T, wEnd io.ReadWriter, height, count uint64) ([]*
 
 func TestServeMomentaRange(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	chain := fiveMomentumChain()
 	src := Sources{Momenta: fakeMomenta{byHeight: func(height, count uint64) ([]*nom.DetailedMomentum, error) {
 		start := int(height) - 1
@@ -513,7 +521,7 @@ func checkMomentaRead(t *testing.T, step string, lm *limitedMomenta, wEnd io.Rea
 func TestServeMomentaHalvesOversizedRange(t *testing.T) {
 	t.Run("halves until it fits", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		lm := newLimitedMomenta(2)
 		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
 		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
@@ -530,7 +538,7 @@ func TestServeMomentaHalvesOversizedRange(t *testing.T) {
 
 	t.Run("too large at count 1", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		lm := newLimitedMomenta(0)
 		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
 		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
@@ -558,7 +566,7 @@ func TestServeMomentaHalvesOversizedRange(t *testing.T) {
 
 func TestServeMomentaCountGrowsBack(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	lm := newLimitedMomenta(1)
 	src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
 	done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
@@ -589,7 +597,7 @@ func TestServeMomentaCountGrowsBack(t *testing.T) {
 
 func TestServeMomentaTrimsToCount(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	chain := fiveMomentumChain()
 	src := Sources{Momenta: fakeMomenta{byHeight: func(height, count uint64) ([]*nom.DetailedMomentum, error) {
 		return chain, nil // the source ignores count and always returns all five
@@ -609,7 +617,7 @@ func TestServeMomentaTrimsToCount(t *testing.T) {
 
 func TestServeMomentaZero(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	src := Sources{Momenta: fakeMomenta{byHeight: func(height, count uint64) ([]*nom.DetailedMomentum, error) {
 		return nil, nil
 	}}}
@@ -644,7 +652,7 @@ func TestServeSourceErrorMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name+"/frontier", func(t *testing.T) {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			src := Sources{Momenta: fakeMomenta{frontier: func() (uint64, error) { return 0, tc.err }}}
 			done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
 
@@ -666,7 +674,7 @@ func TestServeSourceErrorMapping(t *testing.T) {
 
 		t.Run(tc.name+"/anchor", func(t *testing.T) {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			src := Sources{Anchors: fakeAnchors{anchor: func(uint32) (recovery.Anchor, bool, error) {
 				return recovery.Anchor{}, false, tc.err
 			}}}
@@ -690,7 +698,7 @@ func TestServeSourceErrorMapping(t *testing.T) {
 
 		t.Run(tc.name+"/momenta", func(t *testing.T) {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			src := Sources{Momenta: fakeMomenta{byHeight: func(uint64, uint64) ([]*nom.DetailedMomentum, error) {
 				return nil, tc.err
 			}}}
@@ -716,7 +724,7 @@ func TestServeSourceErrorMapping(t *testing.T) {
 
 func TestServeSourceErrorMessageCut(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	long := strings.Repeat("x", 5000)
 	src := Sources{Momenta: fakeMomenta{frontier: func() (uint64, error) { return 0, errors.New(long) }}}
 	done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
@@ -747,7 +755,7 @@ func TestServeMomentaNilEntry(t *testing.T) {
 
 	t.Run("nil DetailedMomentum", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		ms := []*nom.DetailedMomentum{chain[0], nil, chain[1]}
 		src := Sources{Momenta: fakeMomenta{byHeight: func(uint64, uint64) ([]*nom.DetailedMomentum, error) {
 			return ms, nil
@@ -775,7 +783,7 @@ func TestServeMomentaNilEntry(t *testing.T) {
 
 	t.Run("nil account block", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		bad := *chain[1]
 		bad.AccountBlocks = []*nom.AccountBlock{nil}
 		ms := []*nom.DetailedMomentum{chain[0], &bad}
@@ -808,7 +816,7 @@ func TestServeMomentaNilEntry(t *testing.T) {
 
 func TestServeCommittedValid(t *testing.T) {
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	w := WorkerConfig{DomainID: 1}
 	executor := types.Address{0x09}
 	// syncRoundTrip below needs a working FrontierRequest round trip to serve as its sync point.
@@ -819,9 +827,7 @@ func TestServeCommittedValid(t *testing.T) {
 	if err := ipc.WriteMessage(wEnd, ipc.Retract{FromBatchID: 0}); err != nil {
 		t.Fatalf("WriteMessage: %v", err)
 	}
-	if err := ipc.WriteMessage(wEnd, ipc.Committed{Commitment: c1}); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
-	}
+	writeHandOff(t, wEnd, ipc.Committed{Commitment: c1})
 	// A Committed frame gets no reply; sync against serve's recording goroutine before reading
 	// shared state.
 	syncRoundTrip(t, wEnd)
@@ -841,9 +847,7 @@ func TestServeCommittedValid(t *testing.T) {
 
 	// A second Committed with a lower LastInputSeq updates lastCommitted but is not progress.
 	c2 := commitmentFor(w.DomainID, executor, 2, 2)
-	if err := ipc.WriteMessage(wEnd, ipc.Committed{Commitment: c2}); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
-	}
+	writeHandOff(t, wEnd, ipc.Committed{Commitment: c2})
 	syncRoundTrip(t, wEnd)
 
 	st.mu.Lock()
@@ -862,9 +866,7 @@ func TestServeCommittedValid(t *testing.T) {
 	// A third Committed with LastInputSeq exactly at highWater updates lastCommitted but is
 	// still not progress: only a strictly higher LastInputSeq counts.
 	c3 := commitmentFor(w.DomainID, executor, 3, 5)
-	if err := ipc.WriteMessage(wEnd, ipc.Committed{Commitment: c3}); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
-	}
+	writeHandOff(t, wEnd, ipc.Committed{Commitment: c3})
 	syncRoundTrip(t, wEnd)
 
 	st.mu.Lock()
@@ -907,7 +909,7 @@ type recoveryHarness struct {
 func newRecoveryHarness(t *testing.T) *recoveryHarness {
 	t.Helper()
 	sEnd, wEnd := newChannel(t)
-	h := &recoveryHarness{t: t, wEnd: wEnd, st: &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}, w: WorkerConfig{DomainID: 1}, exec: types.Address{0x09}}
+	h := &recoveryHarness{t: t, wEnd: wEnd, st: &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}, w: WorkerConfig{DomainID: 1}, exec: types.Address{0x09}}
 	src := Sources{Momenta: fakeMomenta{frontier: func() (uint64, error) { return 0, nil }}}
 	h.done = runServe(t, sEnd, h.w, h.exec, src, h.st)
 	// The session's opening Retract, which discards nothing these tests hold.
@@ -917,6 +919,11 @@ func newRecoveryHarness(t *testing.T) *recoveryHarness {
 
 func (h *recoveryHarness) send(m ipc.Message) {
 	h.t.Helper()
+	switch m.(type) {
+	case ipc.Committed, ipc.Recovered:
+		writeHandOff(h.t, h.wEnd, m)
+		return
+	}
 	if err := ipc.WriteMessage(h.wEnd, m); err != nil {
 		h.t.Fatalf("WriteMessage: %v", err)
 	}
@@ -1126,6 +1133,14 @@ func TestServeFrameOrder(t *testing.T) {
 	C := func(id uint64) ipc.Message { return ipc.Committed{Commitment: commitmentFor(1, exec, id, id)} }
 	R := func(id uint64) ipc.Message { return ipc.Recovered{Commitment: commitmentFor(1, exec, id, id)} }
 	Rt := func(from uint64) ipc.Message { return ipc.Retract{FromBatchID: from} }
+	E := func(id uint64) ipc.Message { return ipc.WithdrawalsEnd{BatchID: id} }
+	wc := commitmentFor(1, exec, 0, 1)
+	wd := withdrawalBatch(t, &wc, []codec.OutboxMessage{l1msg(1, 0, assetN(1), 5, types.Hash{0x01})})[0]
+	W := func(id uint64) ipc.Message {
+		w := wd
+		w.BatchID = id
+		return w
+	}
 
 	violations := []struct {
 		name   string
@@ -1134,18 +1149,25 @@ func TestServeFrameOrder(t *testing.T) {
 	}{
 		{"Committed first", []ipc.Message{C(1)}, "Committed batch 1 arrived before the session's first Retract"},
 		{"Recovered first", []ipc.Message{R(1)}, "Recovered batch 1 arrived before the session's first Retract"},
-		{"Recovered after Committed", []ipc.Message{Rt(5), C(1), R(2)}, "follows a Committed with no Retract between"},
+		{"Recovered after Committed", []ipc.Message{Rt(5), C(1), E(1), R(2)}, "follows a Committed with no Retract between"},
 		{"Recovered equal to from", []ipc.Message{Rt(5), R(5)}, "is at or above the Retract from batch 5"},
 		{"Recovered above from", []ipc.Message{Rt(5), R(6)}, "is at or above the Retract from batch 5"},
-		{"Recovered repeated", []ipc.Message{Rt(5), R(2), R(2)}, "is not above the previous Recovered batch"},
-		{"Recovered descending", []ipc.Message{Rt(5), R(3), R(2)}, "is not above the previous Recovered batch"},
+		{"Recovered repeated", []ipc.Message{Rt(5), R(2), E(2), R(2)}, "is not above the previous Recovered batch"},
+		{"Recovered descending", []ipc.Message{Rt(5), R(3), E(3), R(2)}, "is not above the previous Recovered batch"},
 		{"order before field check", []ipc.Message{ipc.Committed{Commitment: commitmentFor(1, types.Address{0xFF}, 1, 1)}}, "Committed batch 1 arrived before the session's first Retract"},
 		{"later Retract sets from", []ipc.Message{Rt(5), Rt(2), R(3)}, "is at or above the Retract from batch 2"},
+		{"Withdrawal first", []ipc.Message{Rt(5), W(1)}, "arrived outside a hand-off"},
+		{"WithdrawalsEnd first", []ipc.Message{Rt(5), E(1)}, "arrived outside a hand-off"},
+		{"Withdrawal for another batch", []ipc.Message{Rt(5), C(1), W(2)}, "arrived inside batch 1's hand-off"},
+		{"WithdrawalsEnd for another batch", []ipc.Message{Rt(5), C(1), E(2)}, "arrived inside batch 1's hand-off"},
+		{"request inside a hand-off", []ipc.Message{Rt(5), C(1), ipc.FrontierRequest{}}, "arrived inside batch 1's hand-off"},
+		{"Retract inside a hand-off", []ipc.Message{Rt(5), C(1), Rt(5)}, "arrived inside batch 1's hand-off"},
+		{"Committed inside a hand-off", []ipc.Message{Rt(5), C(1), C(2)}, "arrived inside batch 1's hand-off"},
 	}
 	for _, tc := range violations {
 		t.Run(tc.name, func(t *testing.T) {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, exec, Sources{}, st)
 			for _, m := range tc.frames {
 				if err := ipc.WriteMessage(wEnd, m); err != nil {
@@ -1175,14 +1197,14 @@ func TestServeFrameOrder(t *testing.T) {
 		frames []ipc.Message
 		held   []uint64
 	}{
-		{"boot then rollback", []ipc.Message{Rt(3), R(1), R(2), C(3), C(4), Rt(3), R(1), R(2), ipc.Committed{Commitment: c3}}, []uint64{1, 2, 3}},
-		{"Retract zero then Committed", []ipc.Message{Rt(0), C(0)}, []uint64{0}},
-		{"Retract resets ascending", []ipc.Message{Rt(5), R(3), Rt(5), R(1)}, []uint64{1, 3}},
+		{"boot then rollback", []ipc.Message{Rt(3), R(1), E(1), R(2), E(2), C(3), E(3), C(4), E(4), Rt(3), R(1), E(1), R(2), E(2), ipc.Committed{Commitment: c3}, E(3)}, []uint64{1, 2, 3}},
+		{"Retract zero then Committed", []ipc.Message{Rt(0), C(0), E(0)}, []uint64{0}},
+		{"Retract resets ascending", []ipc.Message{Rt(5), R(3), E(3), Rt(5), R(1), E(1)}, []uint64{1, 3}},
 	}
 	for _, tc := range honest {
 		t.Run(tc.name, func(t *testing.T) {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, exec, Sources{}, st)
 			for _, m := range tc.frames {
 				if err := ipc.WriteMessage(wEnd, m); err != nil {
@@ -1266,7 +1288,7 @@ func TestServeHeldCommitmentCap(t *testing.T) {
 func TestServeEOFAndShortRead(t *testing.T) {
 	t.Run("EOF", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		done := runServe(t, sEnd, WorkerConfig{}, types.Address{}, Sources{}, st)
 		wEnd.Close()
 		if err := waitServe(t, done); err != nil {
@@ -1276,7 +1298,7 @@ func TestServeEOFAndShortRead(t *testing.T) {
 
 	t.Run("short read", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		done := runServe(t, sEnd, WorkerConfig{}, types.Address{}, Sources{}, st)
 		if _, err := wEnd.Write([]byte{0x00, 0x00}); err != nil {
 			t.Fatalf("Write: %v", err)
@@ -1313,7 +1335,7 @@ func TestServeMalformed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			done := runServe(t, sEnd, w, executor, Sources{}, st)
 
 			if _, err := wEnd.Write(tc.frame); err != nil {
@@ -1361,7 +1383,7 @@ func TestServeMalformed(t *testing.T) {
 func malformedCommitmentFrame(t *testing.T, w WorkerConfig, executor types.Address, m ipc.Message) {
 	t.Helper()
 	sEnd, wEnd := newChannel(t)
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	done := runServe(t, sEnd, w, executor, Sources{}, st)
 
 	// The session's opening Retract, so the frame reaches checkCommitment.
@@ -1419,7 +1441,7 @@ func requestThenBadFrame(t *testing.T, m ipc.Message) io.Reader {
 func TestServeWriteFailure(t *testing.T) {
 	t.Run("Frontier reply", func(t *testing.T) {
 		conn := &failAfterWriter{Reader: requestThenBadFrame(t, ipc.FrontierRequest{}), failFrom: 1}
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		src := Sources{Momenta: fakeMomenta{frontier: func() (uint64, error) { return 42, nil }}}
 		if err := serve(conn, WorkerConfig{DomainID: 1}, types.Address{}, src, st); err != nil {
 			t.Fatalf("serve = %v, want nil", err)
@@ -1428,7 +1450,7 @@ func TestServeWriteFailure(t *testing.T) {
 
 	t.Run("Anchor reply", func(t *testing.T) {
 		conn := &failAfterWriter{Reader: requestThenBadFrame(t, ipc.AnchorRequest{}), failFrom: 1}
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		src := Sources{Anchors: fakeAnchors{anchor: func(uint32) (recovery.Anchor, bool, error) {
 			return recovery.Anchor{}, false, nil
 		}}}
@@ -1439,7 +1461,7 @@ func TestServeWriteFailure(t *testing.T) {
 
 	t.Run("Momenta source-error reply", func(t *testing.T) {
 		conn := &failAfterWriter{Reader: requestThenBadFrame(t, ipc.MomentaRequest{Height: 1, Count: 1}), failFrom: 1}
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		src := Sources{Momenta: fakeMomenta{byHeight: func(uint64, uint64) ([]*nom.DetailedMomentum, error) {
 			return nil, errors.New("upstream unavailable")
 		}}}
@@ -1454,7 +1476,7 @@ func TestServeWriteFailure(t *testing.T) {
 	t.Run("first Momentum frame of a 3-momentum range", func(t *testing.T) {
 		chain := fiveMomentumChain()[:3]
 		conn := &failAfterWriter{Reader: requestThenBadFrame(t, ipc.MomentaRequest{Height: 1, Count: 3}), failFrom: 1}
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		src := Sources{Momenta: fakeMomenta{byHeight: func(uint64, uint64) ([]*nom.DetailedMomentum, error) {
 			return chain, nil
 		}}}
@@ -1469,7 +1491,7 @@ func TestServeWriteFailure(t *testing.T) {
 	t.Run("RangeEnd of a 3-momentum range", func(t *testing.T) {
 		chain := fiveMomentumChain()[:3]
 		conn := &failAfterWriter{Reader: requestThenBadFrame(t, ipc.MomentaRequest{Height: 1, Count: 3}), failFrom: 4}
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		src := Sources{Momenta: fakeMomenta{byHeight: func(uint64, uint64) ([]*nom.DetailedMomentum, error) {
 			return chain, nil
 		}}}
@@ -1508,7 +1530,7 @@ func TestServeAssignment(t *testing.T) {
 			*got = call{d, h, hash, n}
 			return reply()
 		}}}
-		done := runServe(t, sEnd, w, types.Address{}, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches)})
+		done := runServe(t, sEnd, w, types.Address{}, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)})
 		client := ipc.NewClient(wEnd, nil)
 		if _, err := client.ReadConfig(); err != nil {
 			t.Fatalf("ReadConfig: %v", err)
@@ -1586,7 +1608,7 @@ func TestServeCap(t *testing.T) {
 			*got = append(*got, call{d, h, hash, a})
 			return reply()
 		}}}
-		done := runServe(t, sEnd, w, types.Address{}, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches)})
+		done := runServe(t, sEnd, w, types.Address{}, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)})
 		client := ipc.NewClient(wEnd, nil)
 		if _, err := client.ReadConfig(); err != nil {
 			t.Fatalf("ReadConfig: %v", err)
@@ -1665,7 +1687,7 @@ func TestServeAgainstRealClient(t *testing.T) {
 		Anchors: fakeAnchors{anchor: func(uint32) (recovery.Anchor, bool, error) { return anchor, true, nil }},
 	}
 
-	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+	st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 	done := runServe(t, sEnd, w, executor, src, st)
 
 	client := ipc.NewClient(wEnd, nil)
@@ -1694,10 +1716,34 @@ func TestServeAgainstRealClient(t *testing.T) {
 		t.Fatalf("FinalizedAnchor = %+v, %v, %v", a, ok, err)
 	}
 
-	if err := client.ReportRecovered(1, nil); err != nil {
+	// Hand-off frames follow the Retract, sit between two Recovered
+	// frames and follow the Committed. The supervisor verifies and
+	// stores each batch's withdrawal.
+	msgs := make([][]byte, 3)
+	proofs := make([][]byte, 3)
+	cms := make([]codec.BatchCommitment, 3)
+	for id := range cms {
+		msg, err := codec.OutboxMessage{
+			SourceContract: types.Hash{0x04},
+			InputIndex:     uint64(id),
+			Target:         codec.L1Withdrawal{RecipientL1: types.Address{0x01}, Asset: codec.AssetIDFromZTS(types.ZnnTokenStandard), Amount: codec.U256{31: 9}},
+		}.Encode()
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		msgs[id], proofs[id] = msg, codec.MerkleProofs([][]byte{msg})[0]
+		cms[id] = commitmentFor(w.DomainID, executor, uint64(id), uint64(id))
+		cms[id].FirstInputSeq = uint64(id)
+		cms[id].OutboxRoot = codec.MerkleRoot([][]byte{msg})
+		cms[id].AssetFlowSummary = codec.AssetFlowSummary{{Asset: codec.AssetIDFromZTS(types.ZnnTokenStandard), WithdrawalDebit: codec.U256{31: 9}}}
+	}
+	oneWithdrawal := func(c codec.BatchCommitment) ([]batch.Withdrawal, error) {
+		return []batch.Withdrawal{{Message: msgs[c.BatchID], Proof: proofs[c.BatchID]}}, nil
+	}
+	if err := client.ReportRecovered(2, cms[:2], oneWithdrawal); err != nil {
 		t.Fatalf("ReportRecovered: %v", err)
 	}
-	if err := client.ReportCommitted([]codec.BatchCommitment{commitmentFor(w.DomainID, executor, 1, 1)}); err != nil {
+	if err := client.ReportCommitted(cms[2:], oneWithdrawal); err != nil {
 		t.Fatalf("ReportCommitted: %v", err)
 	}
 	if client.Broken() != nil {
@@ -1709,9 +1755,22 @@ func TestServeAgainstRealClient(t *testing.T) {
 
 	st.mu.Lock()
 	committed := st.lastCommitted
+	held := len(st.commitments)
+	_, has0 := st.commitments[0]
+	_, has1 := st.commitments[1]
+	_, has2 := st.commitments[2]
 	st.mu.Unlock()
-	if committed == nil {
-		t.Fatalf("lastCommitted not recorded")
+	if committed == nil || committed.BatchID != 2 {
+		t.Fatalf("lastCommitted = %+v, want batch 2", committed)
+	}
+	if held != 3 || !has0 || !has1 || !has2 {
+		t.Fatalf("held commitments = %d (0: %v, 1: %v, 2: %v), want batches 0, 1 and 2", held, has0, has1, has2)
+	}
+	for id := uint64(0); id < 3; id++ {
+		b := mustBatch(t, st.withdrawals, id)
+		if !b.Verified || len(b.Withdrawals) != 1 || !bytes.Equal(b.Withdrawals[0].Message, msgs[id]) || !bytes.Equal(b.Withdrawals[0].Proof, proofs[id]) {
+			t.Fatalf("stored batch %d = %+v, want the verified hand-off", id, b)
+		}
 	}
 
 	// A nil momentum entry in the range: an error wrapping recovery.ErrHalted, the client stays
@@ -1750,7 +1809,7 @@ func TestServeAgainstRealClient(t *testing.T) {
 func TestServeMomentaRememberedCount(t *testing.T) {
 	t.Run("a failure at count 1 is remembered", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		lm := newLimitedMomenta(0)
 		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
 		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
@@ -1778,7 +1837,7 @@ func TestServeMomentaRememberedCount(t *testing.T) {
 
 	t.Run("another error is not retried and leaves the count", func(t *testing.T) {
 		sEnd, wEnd := newChannel(t)
-		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+		st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 		var mu sync.Mutex
 		var counts []uint64
 		src := Sources{Momenta: fakeMomenta{byHeight: func(height, count uint64) ([]*nom.DetailedMomentum, error) {
@@ -1820,7 +1879,7 @@ func TestServeMomentaRememberedCount(t *testing.T) {
 		src := Sources{Momenta: fakeMomenta{byHeight: lm.byHeight}}
 		for i := 0; i < 2; i++ {
 			sEnd, wEnd := newChannel(t)
-			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches)}
+			st := &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, 1)}
 			done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
 			checkMomentaRead(t, "read", lm, wEnd, 1, 5, []uint64{1, 2}, []uint64{5, 2})
 			wEnd.Close()

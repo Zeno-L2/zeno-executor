@@ -2,12 +2,16 @@
 // frames, u32 length ‖ u8 type ‖ payload, big-endian, where length counts the type byte and payload.
 //
 // Session rules. The worker sends one request and reads its whole reply before it sends anything
-// else. It sends Committed, Retract and Recovered frames only between requests, and none gets a
-// reply. At boot and after every rollback it sends one Retract, then zero or more Recovered
-// frames, strictly ascending by batchId and each below that Retract's FromBatchID, before any
-// Committed. The supervisor treats any other order of these frames as malformed. A Retract
-// discards every batchId at or above FromBatchID. A Committed or Recovered for a batchId the supervisor holds must equal the
-// held commitment unless a Retract discarded it first.
+// else. It sends Committed, Retract, Recovered, Withdrawal and
+// WithdrawalsEnd frames only between requests, and none gets a reply.
+// At boot and after every rollback it sends one Retract, then zero or
+// more Recovered frames, each followed by its hand-off, strictly
+// ascending by batchId and each below that Retract's FromBatchID,
+// before any Committed. The supervisor treats any other order of these
+// frames as malformed. A Retract discards every batchId at or above
+// FromBatchID. A Committed or Recovered for a batchId the supervisor
+// holds must equal the held commitment unless a Retract discarded it
+// first.
 //   - FrontierRequest is answered by Frontier or by SourceError.
 //   - MomentaRequest is answered by (Momentum* RangeEnd) or by SourceError. SourceError is valid only
 //     as the first reply frame, so the supervisor must validate and encode a whole range before it
@@ -24,6 +28,25 @@
 //     NextBatchID, and carries none only when FromBatchID is at or above NextBatchID.
 //
 // A Committed or Recovered below the highest nextBatchId the supervisor has read is not held.
+//
+// Hand-off. After each Committed or Recovered for batch B, the worker
+// sends B's hand-off before any other frame: one Withdrawal per kind 1
+// outbox message of B, each with BatchID B, then WithdrawalsEnd{B}.
+//   - B's Withdrawal frames are strictly ascending by the message's
+//     (inputIndex, outboxIndex): each frame's pair is greater than the
+//     previous frame's, so no message is sent twice.
+//   - A batch with no kind 1 message sends WithdrawalsEnd{B} alone.
+//     Kind 0 messages are never sent.
+//   - A hand-off carries at most MaxHandOffWithdrawals Withdrawal
+//     frames, and each Proof places its Message under B's OutboxRoot.
+//   - The worker sends the full hand-off after every Committed and
+//     every Recovered, whatever nextBatchId it last read.
+//   - Withdrawal and WithdrawalsEnd frames are sent only inside a
+//     hand-off and get no reply. The supervisor treats either frame
+//     outside a hand-off, a wrong BatchID, any other frame inside a
+//     hand-off, or more than MaxHandOffWithdrawals Withdrawal frames as
+//     malformed. A Withdrawal not after the previous one is a
+//     consistency fault.
 //
 // Any other reply sequence is a channel failure, and so is a Momentum the worker cannot decode or
 // whose hashes do not verify: the worker exits 1, a counted failure. Encode does not verify

@@ -59,7 +59,7 @@ type commitLog struct {
 }
 
 func (c *commitLog) attach(cfg *Config) {
-	cfg.OnCommit = func(cs []codec.BatchCommitment) error {
+	cfg.OnCommit = func(cs []codec.BatchCommitment, _ Withdrawals) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.calls = append(c.calls, append([]codec.BatchCommitment(nil), cs...))
@@ -494,7 +494,7 @@ func TestAlignedResyncResumesFromItsLastCommit(t *testing.T) {
 	log.attach(&cfg2)
 	var recoveredNext []uint64
 	var mu sync.Mutex
-	cfg2.OnRecover = func(next uint64, _ []codec.BatchCommitment) error {
+	cfg2.OnRecover = func(next uint64, _ []codec.BatchCommitment, _ Withdrawals) error {
 		mu.Lock()
 		defer mu.Unlock()
 		recoveredNext = append(recoveredNext, next)

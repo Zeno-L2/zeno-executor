@@ -2,6 +2,8 @@ package ipc
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
+	"github.com/digitalSloth/go-executor/internal/batch"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
 	"github.com/digitalSloth/go-executor/internal/ledger"
@@ -477,10 +480,10 @@ func TestChannelFailures(t *testing.T) {
 				if _, _, err := c.FinalizedAnchor(1); !errors.Is(err, ErrChannel) {
 					t.Errorf("FinalizedAnchor after break: err = %v", err)
 				}
-				if err := c.ReportCommitted([]codec.BatchCommitment{{}}); !errors.Is(err, ErrChannel) {
+				if err := c.ReportCommitted([]codec.BatchCommitment{{}}, noWithdrawals); !errors.Is(err, ErrChannel) {
 					t.Errorf("ReportCommitted after break: err = %v", err)
 				}
-				if err := c.ReportRecovered(3, nil); !errors.Is(err, ErrChannel) {
+				if err := c.ReportRecovered(3, nil, noWithdrawals); !errors.Is(err, ErrChannel) {
 					t.Errorf("ReportRecovered after break: err = %v", err)
 				}
 				if _, err := c.ReadConfig(); !errors.Is(err, ErrChannel) {
@@ -499,48 +502,109 @@ func TestChannelFailures(t *testing.T) {
 	}
 }
 
+// requireFrames fails unless got and want encode to the same frames in
+// the same order. It compares encodings because a decoded commitment's
+// empty ProofData differs from nil.
+func requireFrames(t *testing.T, got, want []Message) {
+	t.Helper()
+	enc := func(ms []Message) []string {
+		out := make([]string, len(ms))
+		for i, m := range ms {
+			b, err := Encode(m)
+			if err != nil {
+				t.Fatalf("Encode %T: %v", m, err)
+			}
+			out[i] = fmt.Sprintf("%T %x", m, b)
+		}
+		return out
+	}
+	if g, w := enc(got), enc(want); !reflect.DeepEqual(g, w) {
+		t.Fatalf("received %d frames, want %d\n got: %v\nwant: %v", len(g), len(w), g, w)
+	}
+}
+
+func noWithdrawals(codec.BatchCommitment) ([]batch.Withdrawal, error) { return nil, nil }
+
+// readUntilEOF reads worker frames from conn until the writer closes,
+// so a missing, extra, reordered or repeated frame changes the returned
+// sequence. It does not use recvFrom, which reports the closing EOF as
+// a failure.
+func readUntilEOF(t *testing.T, conn net.Conn) <-chan []Message {
+	got := make(chan []Message, 1)
+	go func() {
+		var recvd []Message
+		for {
+			m, err := ReadMessage(conn, Worker)
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					t.Errorf("fake: ReadMessage: %v", err)
+				}
+				got <- recvd
+				return
+			}
+			recvd = append(recvd, m)
+		}
+	}()
+	return got
+}
+
+// handOffFixture returns three distinct, ascending withdrawals for
+// batch 1 and none for batch 2, with the commitments of both.
+func handOffFixture() (cs []codec.BatchCommitment, ws []batch.Withdrawal, fn func(codec.BatchCommitment) ([]batch.Withdrawal, error)) {
+	c1 := validCommitment()
+	c1.BatchID = 1
+	c2 := validCommitment()
+	c2.BatchID = 2
+	_, proof := withdrawalFixture()
+	for i := uint32(0); i < 3; i++ {
+		ws = append(ws, batch.Withdrawal{Message: withdrawalMessage(1, i), Proof: proof})
+	}
+	fn = func(c codec.BatchCommitment) ([]batch.Withdrawal, error) {
+		if c.BatchID == 1 {
+			return ws, nil
+		}
+		return nil, nil
+	}
+	return []codec.BatchCommitment{c1, c2}, ws, fn
+}
+
+// handOffFrames is the expected frames after the report of batch 1 and
+// of batch 2.
+func handOffFrames(report func(codec.BatchCommitment) Message, cs []codec.BatchCommitment, ws []batch.Withdrawal) []Message {
+	out := []Message{report(cs[0])}
+	for _, w := range ws {
+		out = append(out, Withdrawal{BatchID: 1, Message: w.Message, Proof: w.Proof})
+	}
+	return append(out, WithdrawalsEnd{BatchID: 1}, report(cs[1]), WithdrawalsEnd{BatchID: 2})
+}
+
 func TestReportCommitted(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
 	c := NewClient(a, nil)
+	cs, ws, fn := handOffFixture()
 
-	c1 := validCommitment()
-	c1.BatchID = 1
-	c2 := validCommitment()
-	c2.BatchID = 2
-
-	got := make(chan []Committed, 1)
-	go func() {
-		var recvd []Committed
-		for i := 0; i < 2; i++ {
-			m, _ := recvFrom(t, b, Worker).(Committed)
-			recvd = append(recvd, m)
-		}
-		got <- recvd
-	}()
-
-	if err := c.ReportCommitted([]codec.BatchCommitment{c1, c2}); err != nil {
+	got := readUntilEOF(t, b)
+	if err := c.ReportCommitted(cs, fn); err != nil {
 		t.Fatalf("ReportCommitted: %v", err)
 	}
-	recvd := <-got
-	if recvd[0].Commitment.BatchID != 1 || recvd[1].Commitment.BatchID != 2 {
-		t.Fatalf("received = %+v", recvd)
-	}
+	a.Close()
+	want := handOffFrames(func(cm codec.BatchCommitment) Message { return Committed{Commitment: cm} }, cs, ws)
+	requireFrames(t, <-got, want)
 }
 
 func TestReportRecovered(t *testing.T) {
-	c1 := validCommitment()
-	c1.BatchID = 4
-	c2 := validCommitment()
-	c2.BatchID = 5
+	cs, ws, fn := handOffFixture()
 
 	cases := []struct {
 		name string
 		cs   []codec.BatchCommitment
+		want []Message
 	}{
-		{"commitments", []codec.BatchCommitment{c1, c2}},
-		{"empty", nil},
+		{"commitments", cs, append([]Message{Retract{FromBatchID: 4}},
+			handOffFrames(func(cm codec.BatchCommitment) Message { return Recovered{Commitment: cm} }, cs, ws)...)},
+		{"empty", nil, []Message{Retract{FromBatchID: 4}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -549,32 +613,122 @@ func TestReportRecovered(t *testing.T) {
 			defer b.Close()
 			c := NewClient(a, nil)
 
-			got := make(chan []Message, 1)
-			go func() {
-				var recvd []Message
-				for i := 0; i < 1+len(tc.cs); i++ {
-					recvd = append(recvd, recvFrom(t, b, Worker))
-				}
-				got <- recvd
-			}()
-
-			if err := c.ReportRecovered(4, tc.cs); err != nil {
+			got := readUntilEOF(t, b)
+			if err := c.ReportRecovered(4, tc.cs, fn); err != nil {
 				t.Fatalf("ReportRecovered: %v", err)
 			}
-			// Closing the writer ends the reader at EOF if ReportRecovered wrote fewer frames
-			// than expected, so a missing frame fails instead of blocking.
 			a.Close()
-			recvd := <-got
-			if r, ok := recvd[0].(Retract); !ok || r.FromBatchID != 4 {
-				t.Fatalf("first frame = %#v, want Retract{4}", recvd[0])
-			}
-			for i, cm := range tc.cs {
-				r, ok := recvd[i+1].(Recovered)
-				if !ok || r.Commitment.BatchID != cm.BatchID {
-					t.Fatalf("frame %d = %#v, want Recovered batch %d", i+1, recvd[i+1], cm.BatchID)
-				}
-			}
+			requireFrames(t, <-got, tc.want)
 		})
+	}
+}
+
+// A withdrawals failure for the second batch returns that error, leaves
+// the client healthy and leaves exactly the first batch's complete
+// hand-off on the wire.
+func TestReportWithdrawalsError(t *testing.T) {
+	cs, ws, fn := handOffFixture()
+	boom := errors.New("rebuild failed")
+	failing := func(c codec.BatchCommitment) ([]batch.Withdrawal, error) {
+		if c.BatchID == 2 {
+			return nil, boom
+		}
+		return fn(c)
+	}
+	first := handOffFrames(func(cm codec.BatchCommitment) Message { return Committed{Commitment: cm} }, cs, ws)[:len(ws)+2]
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := NewClient(a, nil)
+	got := readUntilEOF(t, b)
+	if err := c.ReportCommitted(cs, failing); !errors.Is(err, boom) {
+		t.Fatalf("ReportCommitted: err = %v, want the withdrawals error", err)
+	}
+	if c.Broken() != nil {
+		t.Fatalf("Broken() = %v, want nil", c.Broken())
+	}
+	a.Close()
+	requireFrames(t, <-got, first)
+}
+
+// A recovered batch's withdrawals failure returns that error, leaves
+// the client healthy and leaves the Retract and the first batch's
+// complete hand-off on the wire.
+func TestReportRecoveredWithdrawalsError(t *testing.T) {
+	cs, ws, fn := handOffFixture()
+	boom := errors.New("rebuild failed")
+	failing := func(c codec.BatchCommitment) ([]batch.Withdrawal, error) {
+		if c.BatchID == 2 {
+			return nil, boom
+		}
+		return fn(c)
+	}
+	first := handOffFrames(func(cm codec.BatchCommitment) Message { return Recovered{Commitment: cm} }, cs, ws)[:len(ws)+2]
+	want := append([]Message{Retract{FromBatchID: 4}}, first...)
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := NewClient(a, nil)
+	got := readUntilEOF(t, b)
+	if err := c.ReportRecovered(4, cs, failing); !errors.Is(err, boom) {
+		t.Fatalf("ReportRecovered: err = %v, want the withdrawals error", err)
+	}
+	if c.Broken() != nil {
+		t.Fatalf("Broken() = %v, want nil", c.Broken())
+	}
+	a.Close()
+	requireFrames(t, <-got, want)
+}
+
+// Each Withdrawal frame carries the proof of its own message.
+func TestHandOffKeepsEachProofWithItsMessage(t *testing.T) {
+	var msgs [][]byte
+	for i := uint32(0); i < 4; i++ {
+		msgs = append(msgs, withdrawalMessage(1, i))
+	}
+	proofs := codec.MerkleProofs(msgs)
+	var ws []batch.Withdrawal
+	var want []Message
+	cm := validCommitment()
+	cm.BatchID = 7
+	for i := range msgs {
+		ws = append(ws, batch.Withdrawal{Message: msgs[i], Proof: proofs[i]})
+	}
+	fn := func(codec.BatchCommitment) ([]batch.Withdrawal, error) { return ws, nil }
+
+	for name, tc := range map[string]struct {
+		report func(c *Client) error
+		head   []Message
+	}{
+		"committed": {func(c *Client) error { return c.ReportCommitted([]codec.BatchCommitment{cm}, fn) }, []Message{Committed{Commitment: cm}}},
+		"recovered": {func(c *Client) error { return c.ReportRecovered(8, []codec.BatchCommitment{cm}, fn) },
+			[]Message{Retract{FromBatchID: 8}, Recovered{Commitment: cm}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want = append([]Message{}, tc.head...)
+			for i := range msgs {
+				want = append(want, Withdrawal{BatchID: 7, Message: msgs[i], Proof: proofs[i]})
+			}
+			want = append(want, WithdrawalsEnd{BatchID: 7})
+
+			a, b := net.Pipe()
+			defer a.Close()
+			defer b.Close()
+			got := readUntilEOF(t, b)
+			if err := tc.report(NewClient(a, nil)); err != nil {
+				t.Fatalf("report: %v", err)
+			}
+			a.Close()
+			requireFrames(t, <-got, want)
+		})
+	}
+}
+
+func TestMaxHandOffWithdrawals(t *testing.T) {
+	if MaxHandOffWithdrawals != 2112 {
+		t.Fatalf("MaxHandOffWithdrawals = %d, want 2112", MaxHandOffWithdrawals)
 	}
 }
 

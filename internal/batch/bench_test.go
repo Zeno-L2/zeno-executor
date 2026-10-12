@@ -74,3 +74,16 @@ func BenchmarkAbsentKeyWitness(b *testing.B) {
 		_ = store.Close()
 	}
 }
+
+// BenchmarkWithdrawals times the rebuild of a maximal batch's
+// withdrawals: 64 inputs with 33 outbox messages each.
+func BenchmarkWithdrawals(b *testing.B) {
+	bundle, root := bigBundle(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Withdrawals(bundle, root); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

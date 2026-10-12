@@ -21,15 +21,23 @@ import (
 	"github.com/digitalSloth/go-executor/internal/znnd"
 )
 
-// ErrMalformed marks a worker frame that breaks the protocol: over the frame cap, an unknown or
-// wrong-direction type, a bad payload, a Committed or Recovered that fails a field check or
-// exceeds the held-commitment cap, or a Committed or Recovered out of the session's frame order
-// (internal/ipc/frame.go).
+// ErrMalformed marks a worker frame that breaks the protocol: over the
+// frame cap, an unknown or wrong-direction type, a bad payload, a
+// Committed or Recovered that fails a field check or exceeds the
+// held-commitment cap, a Committed or Recovered out of the session's
+// frame order, or a Withdrawal or WithdrawalsEnd out of the hand-off
+// order (internal/ipc/frame.go).
 var ErrMalformed = errors.New("supervisor: malformed worker message")
 
-// ErrInconsistent marks a worker frame that conflicts with a commitment the supervisor holds for
-// the same batchId.
+// ErrInconsistent marks a frame or stored hand-off that conflicts with
+// a held commitment, with Settlement's accepted entry, or with its
+// batch's withdrawal checks.
 var ErrInconsistent = errors.New("supervisor: consistency fault")
+
+// ErrWithdrawalStore marks a failure to read, write or delete the
+// withdrawal store during a hand-off or Retract. serve returns it and
+// runOnce kills the worker; it is not a consistency fault.
+var ErrWithdrawalStore = errors.New("supervisor: withdrawal store")
 
 // workerBufferedInputs mirrors the follower buffer the worker runs with, commitInputInterval in
 // runtime/loop.go, which is passed as the follower's MaxBufferedInputs.
@@ -71,6 +79,9 @@ type AnchorSource interface {
 	Tip(domainID uint32) (settlement.Tip, error)
 	// Gates returns the submit pauses for the domain and pillarName's standing.
 	Gates(domainID uint32, pillarName string) (settlement.Gates, error)
+	// Relay returns what the domain's relay and release sends check; q may
+	// be nil.
+	Relay(domainID uint32, q *settlement.RelayQuery) (settlement.RelayState, error)
 }
 
 // Sources is what serve reads to answer a worker's requests. Run also reads it: it calls Ready
@@ -101,6 +112,12 @@ type workerState struct {
 	// It carries across worker runs like highWater and is created on first write.
 	commitments map[uint64]codec.BatchCommitment
 	fault       string // the consistency fault's error text; empty until one occurs
+	// withdrawals is the domain's durable hand-off store; set by Run
+	// before any worker starts and never written after.
+	withdrawals *withdrawalStore
+	// verify is the retry schedule for unverified files; its settings
+	// are set by New.
+	verify verifyRetry
 
 	// chainNext is the highest nextBatchId read at the confirmed height, 0 before any read. Serve's
 	// reads, the submitter's Tip read and the submitter's accepted batches all raise it, and the
@@ -120,17 +137,25 @@ type workerState struct {
 	// rejectError is the submitter's rejection status for this domain: set once Settlement has
 	// rejected the domain's next batch rejectAlert times in a row; empty otherwise.
 	rejectError string
+	// relayError is the submitter's relay status for this domain: set once
+	// Settlement has rejected the relay of one withdrawal rejectAlert
+	// times in a row; empty otherwise.
+	relayError string
 
 	maxHeld  int           // the held-commitment cap; set by New and never written after
 	halt     chan struct{} // closed by haltDomain when it records a fault; set by New and never written after
 	endpoint string        // the znnd endpoint's scheme and host, named in log lines; set by New and never written after
+	rawURL   string        // the configured znnd endpoint, used only to redact errors before they are logged; set by New and never written after
 }
 
-// serve answers conn's requests from src until EOF, a short read or a write failure (nil), or a
-// malformed frame (an error wrapping ErrMalformed) or a consistency fault (an error wrapping
-// ErrInconsistent).
+// serve answers conn's requests from src until EOF, a short read or a
+// write failure (nil), or a malformed frame (an error wrapping
+// ErrMalformed), a consistency fault (an error wrapping
+// ErrInconsistent) or a withdrawal store failure (an error wrapping
+// ErrWithdrawalStore).
 func serve(conn io.ReadWriter, w WorkerConfig, executor types.Address, src Sources, st *workerState) error {
 	var order frameOrder
+	var ho *handOff
 	for {
 		m, err := ipc.ReadMessage(conn, ipc.Worker)
 		if err != nil {
@@ -151,6 +176,9 @@ func serve(conn io.ReadWriter, w WorkerConfig, executor types.Address, src Sourc
 		switch m.(type) {
 		case ipc.FrontierRequest, ipc.AnchorRequest, ipc.AssignmentRequest, ipc.CapRequest, ipc.MomentaRequest, ipc.CursorRequest, ipc.AcceptedRequest:
 			if err := settleOwed(src, st); err != nil {
+				return err
+			}
+			if err := retryUnverified(w, src, st); err != nil {
 				return err
 			}
 		}
@@ -192,17 +220,32 @@ func serve(conn io.ReadWriter, w WorkerConfig, executor types.Address, src Sourc
 			}
 
 		case ipc.Committed:
-			if err := recordCommitted(v.Commitment, w, executor, src, st); err != nil {
+			if ho, err = openHandOff(v.Commitment, true, w, executor, src, st); err != nil {
 				return err
 			}
 
 		case ipc.Recovered:
-			if err := recordRecovered(v.Commitment, w, executor, src, st); err != nil {
+			if ho, err = openHandOff(v.Commitment, false, w, executor, src, st); err != nil {
+				return err
+			}
+
+		case ipc.Withdrawal:
+			if err := ho.add(v, st); err != nil {
+				return err
+			}
+
+		case ipc.WithdrawalsEnd:
+			err := ho.close(st)
+			ho = nil
+			if err != nil {
 				return err
 			}
 
 		case ipc.Retract:
 			retract(v.FromBatchID, st)
+			if err := dropWithdrawals(v.FromBatchID, st); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -393,19 +436,14 @@ func serveMomenta(conn io.ReadWriter, v ipc.MomentaRequest, src Sources, st *wor
 	return true
 }
 
-// recordCommitted validates a worker's Committed frame and, if valid, records it. c is already
-// strictly decoded by ReadMessage (codec.DecodeBatchCommitment, internal/ipc/messages.go).
+// recordCommitted records a worker's Committed batch. handOff.close
+// calls it once the batch's hand-off is checked and stored. c is
+// already strictly decoded by ReadMessage (codec.DecodeBatchCommitment,
+// internal/ipc/messages.go).
 //
-// A frame below the observed nextBatchId is not held: Settlement already accepted that batch. It
-// still counts as progress.
-func recordCommitted(c codec.BatchCommitment, w WorkerConfig, executor types.Address, src Sources, st *workerState) error {
-	if err := checkCommitment(c, w, executor); err != nil {
-		return err
-	}
-	if err := checkTip(c, src, st); err != nil {
-		return err
-	}
-
+// A batch below the observed nextBatchId is not held: Settlement
+// already accepted that batch. It still counts as progress.
+func recordCommitted(c codec.BatchCommitment, st *workerState) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if c.BatchID >= st.chainNext {
@@ -423,17 +461,12 @@ func recordCommitted(c codec.BatchCommitment, w WorkerConfig, executor types.Add
 	return nil
 }
 
-// recordRecovered validates a worker's Recovered frame and, if valid and new, holds it and raises
-// highWater. A re-report is never progress and never changes lastCommitted. A frame below the
-// observed nextBatchId changes nothing.
-func recordRecovered(c codec.BatchCommitment, w WorkerConfig, executor types.Address, src Sources, st *workerState) error {
-	if err := checkCommitment(c, w, executor); err != nil {
-		return err
-	}
-	if err := checkTip(c, src, st); err != nil {
-		return err
-	}
-
+// recordRecovered records a worker's Recovered batch: if new, it holds
+// it and raises highWater. handOff.close calls it once the batch's
+// hand-off is checked and stored. A re-report is never progress and
+// never changes lastCommitted. A batch below the observed nextBatchId
+// changes nothing.
+func recordRecovered(c codec.BatchCommitment, st *workerState) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if c.BatchID < st.chainNext {
@@ -468,29 +501,40 @@ func checkTip(c codec.BatchCommitment, src Sources, st *workerState) error {
 // leaves the comparison owed to the next request frame. A mismatch, or an entry that is missing
 // below nextBatchId, is a consistency fault. The caller holds no lock.
 func compareEntry(c codec.BatchCommitment, src Sources, st *workerState) error {
-	st.mu.Lock()
-	e := st.accepted
-	st.mu.Unlock()
-	if e == nil || e.BatchId != c.BatchID {
-		var err error
-		e, err = src.Anchors.AcceptedEntry(c.DomainID, c.BatchID)
-		if err != nil {
-			if errors.Is(err, recovery.ErrHalted) {
-				return fault(st, fmt.Errorf("%w: domain %d batch %d has no readable accepted entry: %w", ErrInconsistent, c.DomainID, c.BatchID, err))
-			}
-			st.mu.Lock()
-			st.owed = &c
-			st.mu.Unlock()
-			return nil
+	e, err := acceptedEntry(c.DomainID, c.BatchID, src, st)
+	if err != nil {
+		if errors.Is(err, recovery.ErrHalted) {
+			return fault(st, fmt.Errorf("%w: domain %d batch %d has no readable accepted entry: %w", ErrInconsistent, c.DomainID, c.BatchID, err))
 		}
 		st.mu.Lock()
-		st.accepted = e
+		st.owed = &c
 		st.mu.Unlock()
+		return nil
 	}
 	if err := settlement.EntryMatches(e, c); err != nil {
 		return fault(st, fmt.Errorf("%w: domain %d batch %d differs from Settlement's accepted entry: %w", ErrInconsistent, c.DomainID, c.BatchID, err))
 	}
 	return nil
+}
+
+// acceptedEntry returns the chain's accepted entry for batchID: the
+// cached one when it holds batchID, otherwise one read, cached on
+// success. The caller holds no lock.
+func acceptedEntry(domainID uint32, batchID uint64, src Sources, st *workerState) (*definition.BatchEntry, error) {
+	st.mu.Lock()
+	e := st.accepted
+	st.mu.Unlock()
+	if e != nil && e.BatchId == batchID {
+		return e, nil
+	}
+	e, err := src.Anchors.AcceptedEntry(domainID, batchID)
+	if err != nil {
+		return nil, err
+	}
+	st.mu.Lock()
+	st.accepted = e
+	st.mu.Unlock()
+	return e, nil
 }
 
 // fault records err as the consistency fault unless one is recorded, and returns err.
@@ -526,12 +570,44 @@ type frameOrder struct {
 	committed bool   // a Committed arrived since that Retract
 	recovered bool   // a Recovered arrived since that Retract
 	last      uint64 // the batchId of the latest Recovered since that Retract
+	open      bool   // a hand-off is open
+	batch     uint64 // the open hand-off's batchId
+	count     int    // Withdrawal frames in the open hand-off
 }
 
-// next checks m against the session's frame order and records it. Only Committed, Recovered and
-// Retract are checked; every other message returns nil. A violation is an error wrapping
+// next checks m against the session's frame order and records it.
+// Inside a hand-off only the batch's Withdrawal frames and its
+// WithdrawalsEnd are allowed. Outside one, those two are not allowed.
+// Otherwise only Committed, Recovered and Retract are checked and every
+// other message returns nil. A violation is an error wrapping
 // ErrMalformed.
 func (o *frameOrder) next(m ipc.Message) error {
+	if o.open {
+		switch v := m.(type) {
+		case ipc.Withdrawal:
+			o.count++
+			if v.BatchID != o.batch {
+				return fmt.Errorf("%w: Withdrawal for batch %d arrived inside batch %d's hand-off", ErrMalformed, v.BatchID, o.batch)
+			}
+			if o.count > ipc.MaxHandOffWithdrawals {
+				return fmt.Errorf("%w: batch %d's hand-off exceeds %d withdrawals", ErrMalformed, o.batch, ipc.MaxHandOffWithdrawals)
+			}
+		case ipc.WithdrawalsEnd:
+			if v.BatchID != o.batch {
+				return fmt.Errorf("%w: WithdrawalsEnd for batch %d arrived inside batch %d's hand-off", ErrMalformed, v.BatchID, o.batch)
+			}
+			o.open = false
+		default:
+			return fmt.Errorf("%w: %T arrived inside batch %d's hand-off", ErrMalformed, m, o.batch)
+		}
+		return nil
+	}
+	switch v := m.(type) {
+	case ipc.Withdrawal:
+		return fmt.Errorf("%w: %T for batch %d arrived outside a hand-off", ErrMalformed, m, v.BatchID)
+	case ipc.WithdrawalsEnd:
+		return fmt.Errorf("%w: %T for batch %d arrived outside a hand-off", ErrMalformed, m, v.BatchID)
+	}
 	switch v := m.(type) {
 	case ipc.Retract:
 		o.retracted = true
@@ -543,6 +619,7 @@ func (o *frameOrder) next(m ipc.Message) error {
 			return fmt.Errorf("%w: Committed batch %d arrived before the session's first Retract", ErrMalformed, v.Commitment.BatchID)
 		}
 		o.committed = true
+		o.open, o.batch, o.count = true, v.Commitment.BatchID, 0
 	case ipc.Recovered:
 		id := v.Commitment.BatchID
 		switch {
@@ -557,6 +634,7 @@ func (o *frameOrder) next(m ipc.Message) error {
 		}
 		o.recovered = true
 		o.last = id
+		o.open, o.batch, o.count = true, id, 0
 	}
 	return nil
 }
@@ -595,26 +673,57 @@ func retract(from uint64, st *workerState) {
 // no-op; a different one is a consistency fault; a new batchId when the cap is reached is
 // malformed. The caller holds st.mu.
 func hold(c codec.BatchCommitment, st *workerState) (added bool, err error) {
+	if err := checkHold(c, st); err != nil {
+		return false, err
+	}
+	if _, ok := st.commitments[c.BatchID]; ok {
+		return false, nil
+	}
+	if st.commitments == nil {
+		st.commitments = make(map[uint64]codec.BatchCommitment)
+	}
+	st.commitments[c.BatchID] = c
+	return true, nil
+}
+
+// checkHold applies hold's checks without storing c: a new batchId when
+// the cap is reached is malformed, and a held batchId with a different
+// commitment is a consistency fault. The caller holds st.mu.
+func checkHold(c codec.BatchCommitment, st *workerState) error {
 	held, ok := st.commitments[c.BatchID]
 	if !ok {
 		if len(st.commitments) >= st.maxHeld {
-			return false, fmt.Errorf("%w: domain %d holds %d commitments, batch %d would exceed the cap",
+			return fmt.Errorf("%w: domain %d holds %d commitments, batch %d would exceed the cap",
 				ErrMalformed, c.DomainID, len(st.commitments), c.BatchID)
 		}
-		if st.commitments == nil {
-			st.commitments = make(map[uint64]codec.BatchCommitment)
-		}
-		st.commitments[c.BatchID] = c
-		return true, nil
+		return nil
 	}
 	if reflect.DeepEqual(held, c) {
-		return false, nil
+		return nil
 	}
-	err = fmt.Errorf("%w: domain %d batch %d differs from the held commitment and was not retracted", ErrInconsistent, c.DomainID, c.BatchID)
+	err := fmt.Errorf("%w: domain %d batch %d differs from the held commitment and was not retracted", ErrInconsistent, c.DomainID, c.BatchID)
 	if st.fault == "" {
 		st.fault = err.Error()
 	}
-	return false, err
+	return err
+}
+
+// dropWithdrawals removes every verified stored batch at or above from,
+// but never one below the observed nextBatchId. An unverified batch is
+// kept: it belongs to a batch Settlement accepted.
+func dropWithdrawals(from uint64, st *workerState) error {
+	st.mu.Lock()
+	floor := max(from, st.chainNext)
+	st.mu.Unlock()
+	for _, ref := range st.withdrawals.Batches() {
+		if ref.BatchID < floor || !ref.Verified {
+			continue
+		}
+		if err := st.withdrawals.Remove(ref.BatchID); err != nil {
+			return storeError(fmt.Sprintf("remove batch %d", ref.BatchID), err)
+		}
+	}
+	return nil
 }
 
 // checkCommitment applies the field checks every Committed and Recovered frame must pass.

@@ -54,4 +54,10 @@ var (
 	// ErrInvalidOwner is returned when a ContractMetadata's owner is inconsistent with its
 	// upgrade_policy (§27.12).
 	ErrInvalidOwner = errors.New("codec: owner inconsistent with upgrade policy")
+	// ErrInvalidProofSide is returned when a MerkleProof step's side is
+	// not 0 or 1.
+	ErrInvalidProofSide = errors.New("codec: invalid merkle proof side")
+	// ErrProofMismatch is returned when a well-formed MerkleProof does
+	// not reach the root.
+	ErrProofMismatch = errors.New("codec: merkle proof does not reach root")
 )

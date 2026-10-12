@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1287,5 +1289,98 @@ func TestRunWithTheLeaseHeldOpensNoLog(t *testing.T) {
 	}
 	if _, err := os.Stat(r.path); !os.IsNotExist(err) {
 		t.Fatalf("log file: %v, want none", err)
+	}
+}
+
+// --- withdrawal store ---
+
+func withdrawalDir(storage string, executor types.Address, id uint32) string {
+	return filepath.Join(storage, "supervisor", executor.String()+".withdrawals", strconv.FormatUint(uint64(id), 10))
+}
+
+func TestRunFailsOnADamagedWithdrawalFile(t *testing.T) {
+	storage := openTempDir(t)
+	chain := buildChain(t, 12, func(uint64, byte) string { return "" })
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1))
+	dir := withdrawalDir(storage, cfg.ExecutorAddress, 1)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "7.json")
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sup := New(cfg, nil, chainSources(chain, newFrontier(6)), shrunkPolicy)
+	err := sup.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), path) {
+		t.Fatalf("Run = %v, want an error naming %s", err, path)
+	}
+	if pid := statusFor(sup, 1).PID; pid != 0 {
+		t.Fatalf("domain 1 PID = %d, want no worker", pid)
+	}
+}
+
+func TestWithdrawalStoreFailureKillsTheWorker(t *testing.T) {
+	storage := openTempDir(t)
+	chain := buildChain(t, 12, func(uint64, byte) string { return "" })
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1))
+	sup, _, _ := startSupervisor(t, cfg, chainSources(chain, newFrontier(6)), shrunkPolicy)
+
+	waitFor(t, 30*time.Second, "domain 1 LastCommitted", func() bool { return statusFor(sup, 1).LastCommitted != nil })
+	pid := statusFor(sup, 1).PID
+	if err := os.RemoveAll(withdrawalDir(storage, cfg.ExecutorAddress, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("Kill(%d): %v", pid, err)
+	}
+
+	waitFor(t, 30*time.Second, "domain 1 HALTED", func() bool { return statusFor(sup, 1).State == StateHalted })
+	if s1 := statusFor(sup, 1); !strings.Contains(s1.LastExit, "withdrawal store") {
+		t.Fatalf("domain 1 LastExit = %q, want the withdrawal store failure", s1.LastExit)
+	}
+	if s2 := statusFor(sup, 2); s2.State != StateRunning {
+		t.Fatalf("domain 2 state = %s, want RUNNING", s2.State)
+	}
+}
+
+func TestWithdrawalStoreSurvivesRestarts(t *testing.T) {
+	storage, chain, frontier, copies := firstPhaseCommitments(t, 1)
+
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1))
+	s, err := openWithdrawalStore(withdrawalDir(storage, cfg.ExecutorAddress, 1), 1)
+	if err != nil {
+		t.Fatalf("open the store after shutdown: %v", err)
+	}
+	var want []BatchRef
+	for id := range copies[1] {
+		want = append(want, BatchRef{BatchID: id, Verified: true})
+	}
+	slices.SortFunc(want, func(a, b BatchRef) int { return cmp.Compare(a.BatchID, b.BatchID) })
+	if got := s.Batches(); len(want) == 0 || !slices.Equal(got, want) {
+		t.Fatalf("Batches = %v, want every held batch %v, verified", got, want)
+	}
+
+	sup, _, _ := startSupervisor(t, cfg, chainSources(chain, frontier), shrunkPolicy)
+	waitFor(t, 30*time.Second, "the held set refilled", func() bool {
+		return reflect.DeepEqual(heldCommitments(sup, 1), copies[1])
+	})
+	st := slotFor(sup, 1).st
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.fault != "" {
+		t.Fatalf("fault = %q, want none", st.fault)
+	}
+}
+
+func TestNewSetsAFreshRetrySchedule(t *testing.T) {
+	cfg := supervisorConfig(t.TempDir(), workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1))
+	sup := New(cfg, nil, Sources{}, shrunkPolicy)
+	want := verifyRetry{base: time.Second, max: time.Minute, timeout: 2 * time.Second, delay: time.Second}
+	for _, sl := range sup.slots {
+		if sl.st.verify != want {
+			t.Fatalf("domain %d verify = %+v, want %+v", sl.w.DomainID, sl.st.verify, want)
+		}
 	}
 }

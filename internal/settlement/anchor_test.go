@@ -627,3 +627,143 @@ func TestGatesReadAtTheConfirmedHeight(t *testing.T) {
 		}
 	}
 }
+
+// fakeRelay is a relayReader. Its cursor and entry reads come from the
+// embedded fakeBatches; flags lists the processed ids.
+type fakeRelay struct {
+	fakeBatches
+	global, domain definition.PauseState
+	meta           definition.ReleaseQueueMeta
+	flags          map[types.Hash]bool
+	errs           map[string]error // keyed by method name
+	cursorReads    int
+	metaReads      int
+	flagReads      int
+}
+
+func (f *fakeRelay) InputSequenceCursor(d uint32) (*definition.InputSequenceCursor, error) {
+	f.cursorReads++
+	return f.fakeBatches.InputSequenceCursor(d)
+}
+
+func (f *fakeRelay) GlobalPauseState() (definition.PauseState, error) {
+	return f.global, f.errs["global"]
+}
+
+func (f *fakeRelay) DomainPauseState(uint32) (definition.PauseState, error) {
+	return f.domain, f.errs["domain"]
+}
+
+func (f *fakeRelay) ReleaseQueueMeta(d uint32) (*definition.ReleaseQueueMeta, error) {
+	f.metaReads++
+	m := f.meta
+	m.DomainId = d
+	return &m, f.errs["meta"]
+}
+
+func (f *fakeRelay) OutboxProcessed(id types.Hash) (bool, error) {
+	f.flagReads++
+	return f.flags[id], f.errs["flag"]
+}
+
+func TestRelay(t *testing.T) {
+	ids := []types.Hash{{0x01}, {0x02}, {0x03}}
+
+	t.Run("pauses and queue length", func(t *testing.T) {
+		rs, err := relay(&fakeRelay{meta: definition.ReleaseQueueMeta{Head: 2, Tail: 7}}, anchorHeight, 3, nil)
+		if err != nil || rs.Height != anchorHeight || rs.Paused || rs.QueueLen != 5 {
+			t.Fatalf("relay = %+v, %v; want height %d, not paused, queue 5", rs, err, anchorHeight)
+		}
+		for _, f := range []*fakeRelay{
+			{global: definition.PauseState{RelayPaused: true}},
+			{domain: definition.PauseState{RelayPaused: true}},
+		} {
+			if rs, err := relay(f, anchorHeight, 3, nil); err != nil || !rs.Paused {
+				t.Fatalf("relay = %+v, %v; want paused", rs, err)
+			}
+		}
+		for _, f := range []*fakeRelay{
+			{global: definition.PauseState{SubmitPaused: true}},
+			{domain: definition.PauseState{SubmitPaused: true}},
+		} {
+			if rs, err := relay(f, anchorHeight, 3, nil); err != nil || rs.Paused {
+				t.Fatalf("relay = %+v, %v; want a submit pause to leave relay unpaused", rs, err)
+			}
+		}
+	})
+
+	t.Run("a queue head above its tail halts", func(t *testing.T) {
+		_, err := relay(&fakeRelay{meta: definition.ReleaseQueueMeta{Head: 4, Tail: 3}}, anchorHeight, 3, nil)
+		mustHalt(t, "relay", err)
+	})
+
+	t.Run("a nil query reads no cursor, entry or flag", func(t *testing.T) {
+		f := &fakeRelay{fakeBatches: fakeBatches{cur: definition.InputSequenceCursor{NextBatchId: 5}}, flags: map[types.Hash]bool{ids[0]: true}}
+		rs, err := relay(f, anchorHeight, 3, nil)
+		if err != nil || rs.Entry != nil || rs.Processed != 0 {
+			t.Fatalf("relay = %+v, %v", rs, err)
+		}
+		if f.cursorReads != 0 || f.entryReads != 0 || f.flagReads != 0 {
+			t.Fatalf("reads: cursor %d, entry %d, flag %d; want none", f.cursorReads, f.entryReads, f.flagReads)
+		}
+	})
+
+	t.Run("the entry and the flags", func(t *testing.T) {
+		e := batch(2, true)
+		f := &fakeRelay{
+			fakeBatches: fakeBatches{cur: definition.InputSequenceCursor{NextBatchId: 3}, entries: map[uint64]*definition.BatchEntry{2: e}},
+			flags:       map[types.Hash]bool{ids[0]: true, ids[1]: true, ids[2]: false},
+		}
+		rs, err := relay(f, anchorHeight, 3, &RelayQuery{BatchID: 2, IDs: ids})
+		if err != nil || rs.Entry != e || rs.Processed != 2 {
+			t.Fatalf("relay = %+v, %v; want the entry and 2 processed", rs, err)
+		}
+		if f.flagReads != 3 {
+			t.Fatalf("%d flag reads, want 3 (stopping at the first false)", f.flagReads)
+		}
+	})
+
+	t.Run("flags stop at the first that is not set", func(t *testing.T) {
+		f := &fakeRelay{flags: map[types.Hash]bool{ids[1]: true, ids[2]: true}}
+		rs, err := relay(f, anchorHeight, 3, &RelayQuery{BatchID: 0, IDs: ids})
+		if err != nil || rs.Processed != 0 || f.flagReads != 1 {
+			t.Fatalf("relay = %+v, %v with %d flag reads; want 0 processed after 1 read", rs, err, f.flagReads)
+		}
+	})
+
+	t.Run("a batch not below nextBatchId has no entry but still reads the flags", func(t *testing.T) {
+		f := &fakeRelay{
+			fakeBatches: fakeBatches{cur: definition.InputSequenceCursor{NextBatchId: 2}},
+			flags:       map[types.Hash]bool{ids[0]: true},
+		}
+		rs, err := relay(f, anchorHeight, 3, &RelayQuery{BatchID: 2, IDs: ids[:1]})
+		if err != nil || rs.Entry != nil || rs.Processed != 1 || f.entryReads != 0 {
+			t.Fatalf("relay = %+v, %v with %d entry reads; want no entry and 1 processed", rs, err, f.entryReads)
+		}
+	})
+
+	t.Run("a missing entry below nextBatchId halts", func(t *testing.T) {
+		f := &fakeRelay{fakeBatches: fakeBatches{cur: definition.InputSequenceCursor{NextBatchId: 3}}}
+		_, err := relay(f, anchorHeight, 3, &RelayQuery{BatchID: 1, IDs: ids})
+		mustHalt(t, "relay", err)
+	})
+
+	t.Run("read errors return unchanged", func(t *testing.T) {
+		for _, m := range []string{"global", "domain", "meta", "flag"} {
+			boom := errors.New("boom " + m)
+			f := &fakeRelay{errs: map[string]error{m: boom}}
+			if _, err := relay(f, anchorHeight, 3, &RelayQuery{IDs: ids}); err != boom {
+				t.Fatalf("%s error = %v, want it returned unchanged", m, err)
+			}
+		}
+		boom := errors.New("boom cursor")
+		if _, err := relay(&fakeRelay{fakeBatches: fakeBatches{curErr: boom}}, anchorHeight, 3, &RelayQuery{IDs: ids}); err != boom {
+			t.Fatalf("cursor error = %v, want it returned unchanged", err)
+		}
+		boom = errors.New("boom entry")
+		f := &fakeRelay{fakeBatches: fakeBatches{cur: definition.InputSequenceCursor{NextBatchId: 3}, entryErr: boom}}
+		if _, err := relay(f, anchorHeight, 3, &RelayQuery{BatchID: 1, IDs: ids}); err != boom {
+			t.Fatalf("entry error = %v, want it returned unchanged", err)
+		}
+	})
+}

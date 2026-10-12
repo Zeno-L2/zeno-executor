@@ -34,6 +34,19 @@ func logRecLine(r SendRecord) string {
 	return s + "}"
 }
 
+// writtenLines returns rs as the log writes them: version 2, every
+// line carrying its outbox id.
+func writtenLines(rs ...SendRecord) string {
+	var sb strings.Builder
+	for _, r := range rs {
+		line := logRecLine(r)
+		line = strings.Replace(line, `"version":1`, `"version":2`, 1)
+		line = strings.Replace(line, fmt.Sprintf(`"dataHash":"%s"`, r.DataHash), fmt.Sprintf(`"dataHash":"%s","outboxId":"%s"`, r.DataHash, r.OutboxID), 1)
+		sb.WriteString(line + "\n")
+	}
+	return sb.String()
+}
+
 func logResolved(r SendRecord, o Outcome) SendRecord {
 	r.Outcome = o
 	return r
@@ -103,8 +116,8 @@ func TestSendLogRoundTrip(t *testing.T) {
 		t.Fatalf("Last = %+v, want %+v", got, acc)
 	}
 
-	want := fmt.Sprintf(`{"version":1,"domainId":1,"method":%q,"batchId":3,"accountHeight":7,"hash":"%s","dataHash":"%s"}`, r.Method, r.Hash, r.DataHash) + "\n" +
-		fmt.Sprintf(`{"version":1,"domainId":1,"method":%q,"batchId":3,"accountHeight":7,"hash":"%s","dataHash":"%s","outcome":"accepted"}`, r.Method, r.Hash, r.DataHash) + "\n"
+	want := fmt.Sprintf(`{"version":2,"domainId":1,"method":%q,"batchId":3,"accountHeight":7,"hash":"%s","dataHash":"%s","outboxId":"%s"}`, r.Method, r.Hash, r.DataHash, types.ZeroHash) + "\n" +
+		fmt.Sprintf(`{"version":2,"domainId":1,"method":%q,"batchId":3,"accountHeight":7,"hash":"%s","dataHash":"%s","outboxId":"%s","outcome":"accepted"}`, r.Method, r.Hash, r.DataHash, types.ZeroHash) + "\n"
 	if got := readLog(t, path); got != want {
 		t.Fatalf("file = %q, want %q", got, want)
 	}
@@ -164,7 +177,7 @@ func TestSendLogReplay(t *testing.T) {
 		if got, _ := mustOpenLog(t, path).Last(); got != a {
 			t.Fatalf("Last = %+v, want %+v unresolved", got, a)
 		}
-		if got, want := readLog(t, path), logLines(a, other); got != want {
+		if got, want := readLog(t, path), writtenLines(a, other); got != want {
 			t.Fatalf("file = %q, want both lines %q", got, want)
 		}
 	})
@@ -321,10 +334,10 @@ func TestSendLogRotation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got, want := readLog(t, path+".1"), logLines(a, accA); got != want {
+	if got, want := readLog(t, path+".1"), writtenLines(a, accA); got != want {
 		t.Fatalf(".1 = %q, want %q", got, want)
 	}
-	if got, want := readLog(t, path), logLines(b); got != want {
+	if got, want := readLog(t, path), writtenLines(b); got != want {
 		t.Fatalf("file = %q, want %q", got, want)
 	}
 	l.Close()
@@ -426,7 +439,7 @@ func TestSendLogFailureIsSticky(t *testing.T) {
 func TestSendLogUnreadableRecords(t *testing.T) {
 	prefix := logLines(logRec(1, 3, 0x01), logResolved(logRec(1, 3, 0x01), OutcomeAccepted))
 	h := types.Hash{0x02}
-	u := fmt.Sprintf(`{"version":2,"domainId":2,"batchId":3,"hash":"%s","extra":1}`, h)
+	u := fmt.Sprintf(`{"version":3,"domainId":2,"batchId":3,"hash":"%s","extra":1}`, h)
 	open := func(t *testing.T, tail string) (*fileLog, string) {
 		t.Helper()
 		path := newLogPath(t)
@@ -441,7 +454,7 @@ func TestSendLogUnreadableRecords(t *testing.T) {
 		if got, _ := l.Last(); got != env {
 			t.Fatalf("Last = %+v, want %+v", got, env)
 		}
-		for _, s := range []string{path, "line 3", "log-format version 2 is not 1"} {
+		for _, s := range []string{path, "line 3", "log-format version 3 is not 1 or 2"} {
 			if l.unreadable == nil || !strings.Contains(l.unreadable.Error(), s) {
 				t.Fatalf("unreadable = %v, want %q", l.unreadable, s)
 			}
@@ -538,7 +551,7 @@ func TestSendLogRotationBoundary(t *testing.T) {
 		if err := l.Sent(b); err != nil {
 			t.Fatal(err)
 		}
-		if got, want := readLog(t, path+".1"), logLines(a); got != want {
+		if got, want := readLog(t, path+".1"), writtenLines(a); got != want {
 			t.Fatalf(".1 = %q, want %q", got, want)
 		}
 	})
@@ -572,7 +585,7 @@ func TestSendLogRotationBoundary(t *testing.T) {
 		if err != nil || fi.Mode().Perm() != 0o600 {
 			t.Fatalf("rotated file = %v, %v; want mode 0600", fi, err)
 		}
-		if want := int64(len(logLines(b))); l.size != want || fi.Size() != want {
+		if want := int64(len(writtenLines(b))); l.size != want || fi.Size() != want {
 			t.Fatalf("size = %d, file size = %d, want %d", l.size, fi.Size(), want)
 		}
 		// b's line is as long as a's, so a size that kept the old bytes would rotate again.
@@ -580,7 +593,7 @@ func TestSendLogRotationBoundary(t *testing.T) {
 		if err := l.Sent(c); err != nil {
 			t.Fatal(err)
 		}
-		if got, want := readLog(t, path+".1"), logLines(a); got != want {
+		if got, want := readLog(t, path+".1"), writtenLines(a); got != want {
 			t.Fatalf(".1 = %q, want %q", got, want)
 		}
 	})
@@ -596,7 +609,7 @@ func TestSendLogRotationBoundary(t *testing.T) {
 		if got, want := readLog(t, path+".1"), logLines(a); got != want {
 			t.Fatalf(".1 = %q, want %q", got, want)
 		}
-		if got, want := readLog(t, path), logLines(b); got != want {
+		if got, want := readLog(t, path), writtenLines(b); got != want {
 			t.Fatalf("file = %q, want %q", got, want)
 		}
 	})
@@ -621,7 +634,7 @@ func TestSendLogRotationBoundary(t *testing.T) {
 		if err := l.Sent(c); err == nil || err.Error() != first.Error() {
 			t.Fatalf("Sent err = %v, want the first error %v", err, first)
 		}
-		if got, want := readLog(t, path), logLines(a); got != want {
+		if got, want := readLog(t, path), writtenLines(a); got != want {
 			t.Fatalf("file = %q, want only a", got)
 		}
 	})
@@ -679,6 +692,79 @@ func TestSendLogDirectorySyncFailure(t *testing.T) {
 		}
 		if last, _ := l.Last(); last != a {
 			t.Fatalf("Last = %+v, want %+v", last, a)
+		}
+	})
+}
+
+func TestSendLogVersion2Records(t *testing.T) {
+	submit := logRec(1, 3, 0x01)
+	relay := SendRecord{
+		DomainID: 1, Method: definition.SettlementRelayMessageMethodName, BatchID: 9,
+		Height: 7, Hash: types.Hash{0x02}, DataHash: types.Hash{0x02, 0x01}, OutboxID: types.Hash{0x0d},
+	}
+	release := SendRecord{
+		DomainID: 1, Method: definition.SettlementReleaseWithdrawalsMethodName,
+		Height: 7, Hash: types.Hash{0x03}, DataHash: types.Hash{0x03, 0x01},
+	}
+
+	t.Run("round trip", func(t *testing.T) {
+		path := newLogPath(t)
+		l := mustOpenLog(t, path)
+		for _, r := range []SendRecord{submit, relay, release} {
+			if err := l.Sent(r); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Resolved(logResolved(r, OutcomeAccepted)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		l.Close()
+		lines := strings.Split(strings.TrimSuffix(readLog(t, path), "\n"), "\n")
+		if len(lines) != 6 {
+			t.Fatalf("%d lines, want 6", len(lines))
+		}
+		for i, r := range []SendRecord{submit, relay, release} {
+			for k, want := range []SendRecord{r, logResolved(r, OutcomeAccepted)} {
+				got, why, err := decodeSendRecord([]byte(lines[2*i+k]))
+				if err != nil || why != nil || got != want {
+					t.Fatalf("line %d decoded to %+v, %v, %v; want %+v", 2*i+k+1, got, why, err, want)
+				}
+			}
+		}
+		if got, _ := mustOpenLog(t, path).Last(); got != logResolved(release, OutcomeAccepted) {
+			t.Fatalf("Last = %+v, want the accepted release", got)
+		}
+	})
+
+	unreadable := func(t *testing.T, line, why string) {
+		t.Helper()
+		got, gotWhy, err := decodeSendRecord([]byte(line))
+		if err != nil || gotWhy == nil || !strings.Contains(gotWhy.Error(), why) {
+			t.Fatalf("decode = %+v, %v, %v; want unreadable with %q", got, gotWhy, err, why)
+		}
+	}
+
+	t.Run("a version 1 line with method RelayMessage is unreadable", func(t *testing.T) {
+		unreadable(t, logRecLine(relay), "not readable in log-format version 1")
+	})
+
+	t.Run("a relay line with no outbox id is unreadable", func(t *testing.T) {
+		noID := relay
+		noID.OutboxID = types.ZeroHash
+		unreadable(t, strings.TrimSuffix(writtenLines(noID), "\n"), "no outbox id")
+	})
+
+	t.Run("another method is unreadable", func(t *testing.T) {
+		line := strings.Replace(strings.TrimSuffix(writtenLines(submit), "\n"), `"method":"SubmitBatch"`, `"method":"Other"`, 1)
+		unreadable(t, line, `method "Other" is not readable in log-format version 2`)
+	})
+
+	t.Run("an accepted relay does not seed the batch mark", func(t *testing.T) {
+		path := newLogPath(t)
+		writeLog(t, path, logLines(submit, logResolved(submit, OutcomeAccepted))+writtenLines(relay, logResolved(relay, OutcomeAccepted)))
+		l := mustOpenLog(t, path)
+		if want := map[uint32]uint64{1: 3}; !reflect.DeepEqual(l.accepted, want) {
+			t.Fatalf("accepted = %v, want %v", l.accepted, want)
 		}
 	})
 }

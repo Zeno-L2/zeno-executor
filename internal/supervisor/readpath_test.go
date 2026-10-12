@@ -46,7 +46,7 @@ func readPathClient(t *testing.T, fx *znndtest.Fixture, srv *znndtest.Server, de
 
 	zc := znnd.NewClient(srv.URL)
 	src := Sources{Momenta: zc, Anchors: settlement.NewAnchorSource(settlement.NewReader(zc), depth), Assignments: settlement.NewReader(zc), Caps: NewCapCache(settlement.NewReader(zc))}
-	done := runServe(t, sEnd, w, executor, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches)})
+	done := runServe(t, sEnd, w, executor, src, &workerState{maxHeld: heldCap(defaultMaxPendingBatches), withdrawals: testStore(t, fx.DomainID)})
 
 	client := ipc.NewClient(wEnd, nil)
 	if _, err := client.ReadConfig(); err != nil {

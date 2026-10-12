@@ -26,7 +26,7 @@ wipe
 compose up -d --build pillar pillar2 pillar3 rpc observer
 
 status=0
-(cd "$root" && go test -tags devnet -count=1 -timeout 60m -v ./internal/devnet/) || status=$?
+(cd "$root" && go test -tags devnet -count=1 -timeout 90m -v ./internal/devnet/) || status=$?
 
 if [ "$status" -eq 0 ]; then
   wipe

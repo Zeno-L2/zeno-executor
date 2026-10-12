@@ -325,6 +325,20 @@ func (l *loop) acceptedFor(id uint64) (*definition.BatchEntry, error) {
 	return nil, nil
 }
 
+// withdrawals rebuilds c's L1 withdrawals from c's stored bundle. Every
+// failure halts: the bundle is this worker's own, boot checked it is
+// present, and Get checks it hashes to c.DAHash.
+func (l *loop) withdrawals(c codec.BatchCommitment) ([]batch.Withdrawal, error) {
+	bundle, err := l.bundles.Get(c.DAHash)
+	if err == nil {
+		var ws []batch.Withdrawal
+		if ws, err = batch.Withdrawals(bundle, c.OutboxRoot); err == nil {
+			return ws, nil
+		}
+	}
+	return nil, halt(fmt.Errorf("batch %d withdrawals: %w: stop the executor, remove %s and re-sync", c.BatchID, err, l.rcfg.Layout.Root))
+}
+
 // misaligned halts the domain: the rebuilt batch id does not reproduce Settlement's accepted
 // entry, or the input stream cannot end a batch where the entry does.
 func (l *loop) misaligned(id uint64, cause error) error {
@@ -399,7 +413,7 @@ func (l *loop) commitStep() error {
 	committed := l.pending
 	l.pos, l.fresh, l.pending = pos, false, nil
 	if l.cfg.OnCommit != nil {
-		if err := l.cfg.OnCommit(committed); err != nil {
+		if err := l.cfg.OnCommit(committed, l.withdrawals); err != nil {
 			return fmt.Errorf("runtime: report committed batches: %w", err)
 		}
 	}
@@ -504,7 +518,7 @@ func (l *loop) reportRecovered() error {
 	if err != nil {
 		return halt(err)
 	}
-	if err := l.cfg.OnRecover(l.pos.NextBatchID, cs); err != nil {
+	if err := l.cfg.OnRecover(l.pos.NextBatchID, cs, l.withdrawals); err != nil {
 		return fmt.Errorf("runtime: report recovered batches: %w", err)
 	}
 	return nil
