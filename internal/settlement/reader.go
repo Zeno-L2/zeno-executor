@@ -50,6 +50,7 @@ type View struct {
 
 	c    *znnd.Client
 	root types.Hash // the momentum header's StateRoot at Height
+	time uint64     // the momentum's TimestampUnix
 }
 
 // At returns the view at height. It fails when the momentum does not exist or predates the
@@ -66,8 +67,11 @@ func (r *Reader) At(height uint64) (*View, error) {
 	if m.Version < nom.StateRootMomentumVersion {
 		return nil, fmt.Errorf("settlement: StateRootSpork is not active at height %d (momentum version %d)", height, m.Version)
 	}
-	return &View{Height: height, c: r.c, root: m.StateRoot}, nil
+	return &View{Height: height, c: r.c, root: m.StateRoot, time: m.TimestampUnix}, nil
 }
+
+// Momentum returns the view's height and its momentum's unix time.
+func (v *View) Momentum() (height, unixTime uint64) { return v.Height, v.time }
 
 // CheckNode confirms the node serves usable state at the confirmed height: the StateRootSpork
 // is active, the node's state root matches the header, and a proven read succeeds. It returns

@@ -1,9 +1,21 @@
 package wasm
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/zenon-network/go-zenon/common/crypto"
+	"github.com/zenon-network/go-zenon/common/types"
+
+	"github.com/digitalSloth/go-executor/domain"
+	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
 func TestCodeStorePutGetRoundTrip(t *testing.T) {
@@ -195,5 +207,303 @@ func TestCodeStoreGetTooShortFileIsAbsent(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("get: ok = true for a too-short file, want false")
+	}
+}
+
+func noFetch(types.Hash) ([]byte, bool, error) { return nil, false, nil }
+
+func hashKey(b byte) []byte {
+	h := types.Hash{b}
+	return h[:]
+}
+
+func memTierState(m *memTier) string {
+	var names []string
+	for _, h := range m.order {
+		names = append(names, fmt.Sprintf("%d:%d", h[0], len(m.mods[h])))
+	}
+	return fmt.Sprintf("%v bytes=%d", names, m.bytes)
+}
+
+func TestMemTierLRU(t *testing.T) {
+	m := newMemTier(noFetch, 10, 100)
+	put := func(b byte, n int) {
+		t.Helper()
+		if err := m.put(entryInstrumentedModule, hashKey(b), bytes.Repeat([]byte{b}, n)); err != nil {
+			t.Fatalf("put %d: %v", b, err)
+		}
+	}
+	put(1, 4)
+	put(2, 4)
+	if got, want := memTierState(m), "[1:4 2:4] bytes=8"; got != want {
+		t.Fatalf("after two puts: %s, want %s", got, want)
+	}
+
+	// A hit refreshes: 1 becomes the most recent, so 2 is evicted next.
+	if v, ok, err := m.get(entryInstrumentedModule, hashKey(1)); err != nil || !ok || len(v) != 4 {
+		t.Fatalf("get 1: %v %v %v", v, ok, err)
+	}
+	put(3, 4)
+	if got, want := memTierState(m), "[1:4 3:4] bytes=8"; got != want {
+		t.Fatalf("after eviction by bytes: %s, want %s", got, want)
+	}
+	if _, ok, _ := m.get(entryInstrumentedModule, hashKey(2)); ok {
+		t.Fatal("2 survived eviction")
+	}
+
+	// Replacing a key adjusts the byte count and refreshes it.
+	put(1, 2)
+	if got, want := memTierState(m), "[3:4 1:2] bytes=6"; got != want {
+		t.Fatalf("after replace: %s, want %s", got, want)
+	}
+
+	// One put can evict several.
+	put(4, 9)
+	if got, want := memTierState(m), "[4:9] bytes=9"; got != want {
+		t.Fatalf("after a large put: %s, want %s", got, want)
+	}
+
+	// The entry bound evicts with room to spare in bytes.
+	e := newMemTier(noFetch, 100, 2)
+	for _, b := range []byte{1, 2, 3} {
+		if err := e.put(entryInstrumentedModule, hashKey(b), []byte{b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := memTierState(e), "[2:1 3:1] bytes=2"; got != want {
+		t.Fatalf("entry bound: %s, want %s", got, want)
+	}
+}
+
+func TestMemTierErrors(t *testing.T) {
+	m := newMemTier(noFetch, 8, 4)
+	if err := m.put(entryInstrumentedModule, hashKey(1), make([]byte, 9)); err == nil {
+		t.Error("oversize put succeeded")
+	}
+	if len(m.mods) != 0 || m.bytes != 0 {
+		t.Errorf("oversize put stored something: %s", memTierState(m))
+	}
+	short := make([]byte, 31)
+	if err := m.put(entryInstrumentedModule, short, []byte{1}); err == nil {
+		t.Error("put with a 31-byte key succeeded")
+	}
+	if _, _, err := m.get(entryInstrumentedModule, short); err == nil {
+		t.Error("get with a 31-byte key succeeded")
+	}
+	if _, _, err := m.get(entryAssembledModule, short); err == nil {
+		t.Error("assembled get with a 31-byte key succeeded")
+	}
+	for _, k := range []entryKind{entryDeployChunk, entryPendingRecord} {
+		if _, _, err := m.get(k, hashKey(1)); err == nil || !strings.Contains(err.Error(), "simulate mode") {
+			t.Errorf("get %s: %v", k.dirName(), err)
+		}
+		if err := m.put(k, hashKey(1), []byte{1}); err == nil || !strings.Contains(err.Error(), "simulate mode") {
+			t.Errorf("put %s: %v", k.dirName(), err)
+		}
+	}
+	if err := m.put(entryAssembledModule, hashKey(1), []byte{1}); err == nil || !strings.Contains(err.Error(), "simulate mode") {
+		t.Errorf("assembled put: %v", err)
+	}
+	for _, k := range allEntryKinds {
+		if err := m.delete(k, hashKey(1)); err == nil || !strings.Contains(err.Error(), "simulate mode") {
+			t.Errorf("delete %s: %v", k.dirName(), err)
+		}
+	}
+	boom := errors.New("boom")
+	f := newMemTier(func(types.Hash) ([]byte, bool, error) { return nil, false, boom }, 8, 4)
+	if _, _, err := f.get(entryAssembledModule, hashKey(1)); !errors.Is(err, boom) {
+		t.Errorf("fetch error: %v", err)
+	}
+}
+
+func TestMemTierAssembledNotKept(t *testing.T) {
+	calls := 0
+	m := newMemTier(func(types.Hash) ([]byte, bool, error) { calls++; return []byte{1}, true, nil }, 8, 4)
+	for i := 0; i < 2; i++ {
+		if v, ok, err := m.get(entryAssembledModule, hashKey(1)); err != nil || !ok || len(v) != 1 {
+			t.Fatalf("get: %v %v %v", v, ok, err)
+		}
+	}
+	if calls != 2 {
+		t.Errorf("fetch called %d times, want 2", calls)
+	}
+	if len(m.mods) != 0 || m.bytes != 0 {
+		t.Errorf("assembled bytes were kept: %s", memTierState(m))
+	}
+}
+
+// simPlugin returns a simulate-mode plugin whose fetch serves modules
+// by pre code hash and counts its calls.
+func simPlugin(t *testing.T, modules map[types.Hash][]byte, calls *int) *Plugin {
+	t.Helper()
+	p, err := New(Config{NetworkName: "testnet", FetchModule: func(h types.Hash) ([]byte, bool, error) {
+		*calls++
+		m, ok := modules[h]
+		return m, ok, nil
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	return p
+}
+
+func TestSimulateModePlugin(t *testing.T) {
+	f := buildSuccessFixture(t)
+	modules := map[types.Hash][]byte{f.preCodeHash: f.raw}
+
+	disk := newTestPlugin(t)
+	if err := disk.store.put(entryAssembledModule, f.preCodeHash[:], f.raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := disk.store.put(entryInstrumentedModule, f.codeHash[:], f.instrumented); err != nil {
+		t.Fatal(err)
+	}
+	want, err := disk.Apply(f.state(), f.input("CallL2"))
+	if err != nil {
+		t.Fatalf("disk Apply: %v", err)
+	}
+
+	calls := 0
+	p := simPlugin(t, modules, &calls)
+	for i := 0; i < 2; i++ {
+		got, err := p.Apply(f.state(), f.input("CallL2"))
+		if err != nil {
+			t.Fatalf("Apply %d: %v", i, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Apply %d effects differ:\n got %+v\nwant %+v", i, got, want)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("fetch called %d times over two Apply calls, want 1", calls)
+	}
+
+	tierEmpty := func(p *Plugin) bool {
+		m := p.store.(*memTier)
+		return len(m.mods) == 0 && m.bytes == 0
+	}
+
+	t.Run("wrong bytes", func(t *testing.T) {
+		calls := 0
+		p := simPlugin(t, map[types.Hash][]byte{f.preCodeHash: append([]byte{}, f.instrumented...)}, &calls)
+		if _, err := p.Apply(f.state(), f.input("CallL2")); err == nil {
+			t.Fatal("Apply accepted bytes that do not hash to the pre code hash")
+		}
+		if !tierEmpty(p) {
+			t.Error("tier kept a module after a failed hash check")
+		}
+	})
+	t.Run("wrong code hash leaf", func(t *testing.T) {
+		calls := 0
+		p := simPlugin(t, modules, &calls)
+		st := f.state()
+		st.values[derive(f.contractID, keyCodeHash)] = bytes.Repeat([]byte{0xEE}, 32)
+		if _, err := p.Apply(st, f.input("CallL2")); err == nil {
+			t.Fatal("Apply accepted a code hash leaf the module does not instrument to")
+		}
+		if !tierEmpty(p) {
+			t.Error("tier kept a module after a failed code hash check")
+		}
+	})
+	t.Run("not found", func(t *testing.T) {
+		calls := 0
+		p := simPlugin(t, nil, &calls)
+		if _, err := p.Apply(f.state(), f.input("CallL2")); err == nil {
+			t.Fatal("Apply succeeded with no module")
+		}
+	})
+	t.Run("fetch error", func(t *testing.T) {
+		p, err := New(Config{NetworkName: "testnet", FetchModule: func(types.Hash) ([]byte, bool, error) {
+			return nil, false, errors.New("boom")
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = p.Close() })
+		if _, err := p.Apply(f.state(), f.input("CallL2")); err == nil {
+			t.Fatal("Apply succeeded despite a fetch error")
+		}
+	})
+}
+
+// buildAltFixture is buildSuccessFixture with another contract and
+// return data, so its module and code hash differ.
+func buildAltFixture(t *testing.T) successFixture {
+	t.Helper()
+	contractID := types.Hash{8, 8, 8}
+	decoded := codec.ContractEffects{
+		Version:          codec.ExecutionResultVersion,
+		GlobalInputIndex: 3,
+		ReturnData:       []byte("alt"),
+	}
+	blob := encodeEffects(t, decoded)
+	offset := uint32(1024)
+	body := appendVarS64([]byte{0x42}, (int64(offset)<<32)|int64(len(blob)))
+	body = append(body, 0x0B)
+	raw := buildModule(&dataSeg{offset: offset, bytes: blob}, []byte{0x00}, body, 1)
+	instrumented, err := module.Instrument(raw, moduleLimits())
+	if err != nil {
+		t.Fatalf("Instrument: %v", err)
+	}
+	return successFixture{contractID: contractID, globalInputIndex: 3, raw: raw, instrumented: instrumented,
+		codeHash: CodeHash(instrumented), preCodeHash: CodeHash(raw), blob: blob, decoded: decoded}
+}
+
+func TestSimulateModeEviction(t *testing.T) {
+	a, b := buildSuccessFixture(t), buildAltFixture(t)
+	fetches := map[types.Hash]int{}
+	p, err := New(Config{NetworkName: "testnet", FetchModule: func(h types.Hash) ([]byte, bool, error) {
+		fetches[h]++
+		switch h {
+		case a.preCodeHash:
+			return a.raw, true, nil
+		case b.preCodeHash:
+			return b.raw, true, nil
+		}
+		return nil, false, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	n := max(len(a.instrumented), len(b.instrumented))
+	if len(a.instrumented)+len(b.instrumented) <= n {
+		t.Fatal("fixture sizes leave no room to evict")
+	}
+	p.store = newMemTier(p.cfg.FetchModule, n, simModuleCacheEntries)
+
+	for _, f := range []successFixture{a, b, a} {
+		if _, err := p.Apply(f.state(), f.input("CallL2")); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+	}
+	if fetches[a.preCodeHash] != 2 || fetches[b.preCodeHash] != 1 {
+		t.Errorf("fetches a=%d b=%d, want 2 and 1", fetches[a.preCodeHash], fetches[b.preCodeHash])
+	}
+}
+
+func TestSimulateModeRefusals(t *testing.T) {
+	calls := 0
+	p := simPlugin(t, nil, &calls)
+
+	if _, err := p.DecodeInput(domain.InputContext{}, encodeInput(t, codec.DeployStartArgs{CodeHash: types.Hash{2}, MetadataHash: types.Hash{3}, TotalSize: 100, ChunkCount: 1})); err == nil {
+		t.Error("kind 2 DecodeInput succeeded")
+	}
+	chunk := []byte("chunk bytes")
+	chunkArgs := codec.DeployChunkArgs{CodeHash: types.Hash{2}, ChunkIndex: 0, ChunkHash: hashOf(crypto.Hash(chunk))}
+	if _, err := p.DecodeInput(domain.InputContext{SourceData: chunk}, encodeInput(t, chunkArgs)); err == nil {
+		t.Error("kind 3 DecodeInput succeeded")
+	}
+	in, err := p.DecodeInput(domain.InputContext{}, encodeInput(t, codec.DeployFinalizeArgs{CodeHash: types.Hash{2}}))
+	if err != nil {
+		t.Fatalf("kind 4 DecodeInput: %v", err)
+	}
+	if _, err := p.Apply(&mapState{}, in); err == nil || !strings.Contains(err.Error(), "simulate mode") {
+		t.Errorf("kind 4 Apply: %v", err)
+	}
+
+	if _, err := New(Config{NetworkName: "testnet", FetchModule: noFetch, CodeStorePath: t.TempDir()}); err == nil {
+		t.Error("New accepted FetchModule with CodeStorePath")
 	}
 }

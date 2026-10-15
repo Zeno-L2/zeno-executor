@@ -289,3 +289,18 @@ func TestReleaseQueueMeta(t *testing.T) {
 	_, err = v.ReleaseQueueMeta(garbage)
 	mustHalt(t, "ReleaseQueueMeta(garbage)", err)
 }
+
+func TestViewMomentum(t *testing.T) {
+	fx, srv, v := viewAtRead(t, 10)
+	ms, err := znnd.NewClient(srv.URL).DetailedMomentumsByHeight(fx.ReadHeight, 1)
+	if err != nil || len(ms) != 1 || ms[0].Momentum == nil {
+		t.Fatalf("DetailedMomentumsByHeight(%d) = %v, %v", fx.ReadHeight, ms, err)
+	}
+	want := ms[0].Momentum.TimestampUnix
+	if want == 0 {
+		t.Fatal("the fixture momentum has a zero time, so the test would not tell a missing time from a read one")
+	}
+	if h, ts := v.Momentum(); h != fx.ReadHeight || ts != want {
+		t.Fatalf("Momentum() = %d, %d; want %d, %d", h, ts, fx.ReadHeight, want)
+	}
+}

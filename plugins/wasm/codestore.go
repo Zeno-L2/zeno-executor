@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
+	"github.com/zenon-network/go-zenon/common/types"
 )
 
 // entryKind partitions the code store's flat key space into the four entry shapes §4
@@ -45,6 +46,20 @@ func (k entryKind) dirName() string {
 		panic(fmt.Sprintf("wasm: code store: unknown entry kind %d", k))
 	}
 }
+
+// codeTier is the store the plugin reads and memoizes into: the disk
+// codeStore of an executor worker, or the in-memory memTier of a
+// simulate-mode worker.
+type codeTier interface {
+	get(kind entryKind, key []byte) (value []byte, ok bool, err error)
+	put(kind entryKind, key, value []byte) error
+	delete(kind entryKind, key []byte) error
+}
+
+var (
+	_ codeTier = (*codeStore)(nil)
+	_ codeTier = (*memTier)(nil)
+)
 
 var allEntryKinds = []entryKind{entryDeployChunk, entryPendingRecord, entryAssembledModule, entryInstrumentedModule}
 
@@ -148,4 +163,120 @@ func (s *codeStore) get(kind entryKind, key []byte) (value []byte, ok bool, err 
 		return nil, false, nil
 	}
 	return value, true, nil
+}
+
+const (
+	// simModuleCacheBytes bounds the instrumented modules a
+	// simulate-mode plugin keeps.
+	simModuleCacheBytes = 32 << 20
+	// simModuleCacheEntries bounds their count, which keeps the linear
+	// scan of memTier.order short and the per-entry map and slice
+	// overhead small beside the cached bytes.
+	simModuleCacheEntries = 1024
+)
+
+// memTier is the in-memory code tier of a simulate-mode plugin. It
+// holds only instrumented modules, in an LRU bounded by bytes and
+// entries. An assembled-module miss asks fetch and keeps nothing; every
+// other entry kind, and every delete, is refused, because a simulation
+// never writes the chunk or pending-record tiers. A memTier is not safe
+// for concurrent use: a simulator runs one Apply at a time.
+type memTier struct {
+	fetch      func(types.Hash) ([]byte, bool, error)
+	maxBytes   int // simModuleCacheBytes outside tests
+	maxEntries int // simModuleCacheEntries outside tests
+	mods       map[types.Hash][]byte
+	order      []types.Hash // least to most recently used
+	bytes      int          // sum of len over mods
+}
+
+// newMemTier returns an empty memTier that fetches assembled modules
+// through fetch.
+func newMemTier(fetch func(types.Hash) ([]byte, bool, error), maxBytes, maxEntries int) *memTier {
+	return &memTier{fetch: fetch, maxBytes: maxBytes, maxEntries: maxEntries, mods: map[types.Hash][]byte{}}
+}
+
+func memTierKey(key []byte) (types.Hash, error) {
+	var h types.Hash
+	if len(key) != len(h) {
+		return h, fmt.Errorf("wasm: code store: key is %d bytes, want %d", len(key), len(h))
+	}
+	copy(h[:], key)
+	return h, nil
+}
+
+func refusedInSimulate(op string, kind entryKind) error {
+	return fmt.Errorf("wasm: code store: %s of %s entries is not available in simulate mode", op, kind.dirName())
+}
+
+// touch moves h to the most recently used end of order.
+func (m *memTier) touch(h types.Hash) {
+	m.drop(h)
+	m.order = append(m.order, h)
+}
+
+// drop removes h from order.
+func (m *memTier) drop(h types.Hash) {
+	for i, o := range m.order {
+		if o == h {
+			m.order = append(m.order[:i], m.order[i+1:]...)
+			return
+		}
+	}
+}
+
+func (m *memTier) get(kind entryKind, key []byte) (value []byte, ok bool, err error) {
+	if kind != entryInstrumentedModule && kind != entryAssembledModule {
+		return nil, false, refusedInSimulate("get", kind)
+	}
+	h, err := memTierKey(key)
+	if err != nil {
+		return nil, false, err
+	}
+	if kind == entryAssembledModule {
+		module, found, err := m.fetch(h)
+		if err != nil {
+			return nil, false, fmt.Errorf("wasm: code store: fetch: %w", err)
+		}
+		if !found {
+			return nil, false, nil
+		}
+		return module, true, nil
+	}
+	value, ok = m.mods[h]
+	if !ok {
+		return nil, false, nil
+	}
+	m.touch(h)
+	return value, true, nil
+}
+
+func (m *memTier) put(kind entryKind, key, value []byte) error {
+	if kind != entryInstrumentedModule {
+		return refusedInSimulate("put", kind)
+	}
+	h, err := memTierKey(key)
+	if err != nil {
+		return err
+	}
+	if len(value) > m.maxBytes {
+		return fmt.Errorf("wasm: code store: put: module of %d bytes exceeds the %d byte cache", len(value), m.maxBytes)
+	}
+	if old, ok := m.mods[h]; ok {
+		m.bytes -= len(old)
+	}
+	m.mods[h] = value
+	m.bytes += len(value)
+	m.touch(h)
+	for m.bytes > m.maxBytes || len(m.mods) > m.maxEntries {
+		oldest := m.order[0]
+		m.order = m.order[1:]
+		m.bytes -= len(m.mods[oldest])
+		delete(m.mods, oldest)
+	}
+	return nil
+}
+
+func (m *memTier) delete(kind entryKind, key []byte) error {
+	return refusedInSimulate("delete", kind)
 }

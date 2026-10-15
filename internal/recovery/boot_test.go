@@ -307,7 +307,7 @@ func TestReconcileBranches(t *testing.T) {
 				rec,
 				{BatchID: 2, Status: StatusBuilt, FirstInputSeq: 12, LastInputSeq: 20},
 			} {
-				if err := writeJSON(batchPath(cfg.Layout, r.BatchID), r); err != nil {
+				if err := writeJSON(batchPath(cfg.Layout, r.BatchID), r, readFileMode); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -454,7 +454,7 @@ func TestBootPrunesAboveLoadedPosition(t *testing.T) {
 	strays := func(t *testing.T, cfg Config) {
 		t.Helper()
 		writeSnapshotAt(t, cfg, Position{LastInputSeq: 9, MomentumHeight: 9, NextBatchID: 10}, 0x55, testSTF)
-		if err := writeJSON(batchPath(cfg.Layout, 9), BatchRecord{BatchID: 9, Status: StatusBuilt}); err != nil {
+		if err := writeJSON(batchPath(cfg.Layout, 9), BatchRecord{BatchID: 9, Status: StatusBuilt}, readFileMode); err != nil {
 			t.Fatal(err)
 		}
 		var w []MomentumRef
@@ -611,7 +611,7 @@ func TestRollbackLeavesAnchoredWindow(t *testing.T) {
 func TestCrashOrphanIsNotARollbackTarget(t *testing.T) {
 	cfg := buildTree(t, 4, 8) // window 4..8, snapshots {3, 7, 8}
 	writeSnapshotAt(t, cfg, Position{LastInputSeq: 12, MomentumHeight: 12, NextBatchID: 13}, 0x66, testSTF)
-	if err := writeJSON(batchPath(cfg.Layout, 12), BatchRecord{BatchID: 12, Status: StatusBuilt}); err != nil {
+	if err := writeJSON(batchPath(cfg.Layout, 12), BatchRecord{BatchID: 12, Status: StatusBuilt}, readFileMode); err != nil {
 		t.Fatal(err)
 	}
 	src := newChainSource(12, 0)
@@ -642,7 +642,7 @@ func TestInterruptedCommitWindowIsStillChecked(t *testing.T) {
 
 	// A later commit's artifacts, written without renaming the cursor.
 	writeSnapshotAt(t, cfg, Position{LastInputSeq: 17, MomentumHeight: 17, NextBatchID: 18}, 0x77, testSTF)
-	if err := writeJSON(batchPath(cfg.Layout, 17), BatchRecord{BatchID: 17, Status: StatusBuilt}); err != nil {
+	if err := writeJSON(batchPath(cfg.Layout, 17), BatchRecord{BatchID: 17, Status: StatusBuilt}, readFileMode); err != nil {
 		t.Fatal(err)
 	}
 	var ring []MomentumRef
@@ -851,7 +851,7 @@ func writeRecord(t *testing.T, l Layout, rec BatchRecord) {
 	if err := os.MkdirAll(l.Batches, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(batchPath(l, rec.BatchID), rec); err != nil {
+	if err := writeJSON(batchPath(l, rec.BatchID), rec, readFileMode); err != nil {
 		t.Fatalf("writeJSON: %v", err)
 	}
 }

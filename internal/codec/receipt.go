@@ -187,3 +187,69 @@ func ReturnHash(data []byte) types.Hash {
 	}
 	return hashOf(crypto.Hash(data))
 }
+
+// EncodeReceiptSidecar returns a batch's receipt sidecar (EXECUTOR §21.2): the List<Bytes>
+// (§27.0) of each receipt's canonical encoding, in order. receipts MUST be strictly
+// ascending by InputIndex. The elements are exactly the batch's receiptRoot leaves.
+func EncodeReceiptSidecar(receipts []Receipt) ([]byte, error) {
+	for i := 1; i < len(receipts); i++ {
+		if receipts[i].InputIndex == receipts[i-1].InputIndex {
+			return nil, fmt.Errorf("codec: encode receipt sidecar: %w", ErrDuplicateKey)
+		}
+		if receipts[i].InputIndex < receipts[i-1].InputIndex {
+			return nil, fmt.Errorf("codec: encode receipt sidecar: %w", ErrNotSorted)
+		}
+	}
+
+	w := &writer{}
+	w.u32(uint32(len(receipts)))
+	for _, rec := range receipts {
+		enc, err := rec.Encode()
+		if err != nil {
+			return nil, fmt.Errorf("codec: encode receipt sidecar: %w", err)
+		}
+		w.bytes(enc)
+	}
+	return w.buf, nil
+}
+
+// receiptEncodedSize is the length of a receipt's canonical encoding,
+// which has only fixed-width fields.
+const receiptEncodedSize = 263
+
+// DecodeReceiptSidecar decodes a receipt sidecar. It returns the receipts and their
+// encodings (the receiptRoot leaves), both in sidecar order.
+func DecodeReceiptSidecar(b []byte) ([]Receipt, [][]byte, error) {
+	r := newReader(b)
+	n, err := r.count(4 + receiptEncodedSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("codec: decode receipt sidecar: %w", err)
+	}
+	receipts := make([]Receipt, 0, n)
+	leaves := make([][]byte, 0, n)
+	for i := uint32(0); i < n; i++ {
+		leaf, err := r.bytes(receiptEncodedSize)
+		if err != nil {
+			return nil, nil, fmt.Errorf("codec: decode receipt sidecar: %w", err)
+		}
+		rec, err := DecodeReceipt(leaf)
+		if err != nil {
+			return nil, nil, fmt.Errorf("codec: decode receipt sidecar: %w", err)
+		}
+		if i > 0 {
+			prev := receipts[i-1].InputIndex
+			if rec.InputIndex == prev {
+				return nil, nil, fmt.Errorf("codec: decode receipt sidecar: %w", ErrDuplicateKey)
+			}
+			if rec.InputIndex < prev {
+				return nil, nil, fmt.Errorf("codec: decode receipt sidecar: %w", ErrNotSorted)
+			}
+		}
+		receipts = append(receipts, rec)
+		leaves = append(leaves, leaf)
+	}
+	if err := r.end(); err != nil {
+		return nil, nil, fmt.Errorf("codec: decode receipt sidecar: %w", err)
+	}
+	return receipts, leaves, nil
+}

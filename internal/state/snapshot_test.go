@@ -239,3 +239,40 @@ func TestTruncateLog(t *testing.T) {
 		t.Fatalf("replayed leaf set is not the post-truncate record alone")
 	}
 }
+
+// TestWALIsPrivate checks that Open and OpenEmpty leave the log mode 0600, for a new log and for
+// one that already exists with mode 0644.
+func TestWALIsPrivate(t *testing.T) {
+	openers := map[string]func(string) (*Store, error){"Open": Open, "OpenEmpty": OpenEmpty}
+	for name, open := range openers {
+		for _, existing := range []bool{false, true} {
+			label := name + "/new"
+			if existing {
+				label = name + "/existing"
+			}
+			t.Run(label, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "wal")
+				if existing {
+					if err := os.WriteFile(path, nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chmod(path, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				s, err := open(path)
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				defer s.Close()
+				fi, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := fi.Mode().Perm(); got != 0o600 {
+					t.Fatalf("log mode = %o, want 600", got)
+				}
+			})
+		}
+	}
+}

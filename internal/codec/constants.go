@@ -19,6 +19,7 @@ const (
 const (
 	MaxStateKeySize       = 32
 	MaxStateValueSize     = 16 << 10
+	MaxBatchInputs        = 64
 	MaxEventsPerExecution = 64
 	MaxEventDataSize      = 1 << 10
 	MaxTopicsPerEvent     = 4

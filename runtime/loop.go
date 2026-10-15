@@ -81,6 +81,7 @@ type loop struct {
 	executor types.Address
 	dom      domain.Domain
 	bundles  *recovery.BundleStore
+	receipts *recovery.ReceiptStore
 
 	store    *state.Store
 	follower *ledger.Follower
@@ -152,6 +153,7 @@ func (l *loop) build(rdy recovery.Ready) error {
 		Store:        rdy.Store,
 		Inputs:       boundary,
 		Bundles:      l.bundles,
+		Receipts:     l.receipts,
 		FirstBatchID: rdy.Position.NextBatchID,
 	})
 	if err != nil {

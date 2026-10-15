@@ -35,7 +35,7 @@ func (r *Reader) Assignment(domainID uint32, height uint64, hash types.Hash, nex
 		return nil, nil
 	}
 	// Build the view from this momentum: a second fetch could return a different momentum.
-	v := &View{Height: height, c: r.c, root: m.StateRoot}
+	v := &View{Height: height, c: r.c, root: m.StateRoot, time: m.TimestampUnix}
 
 	// The node answers getProof from its current chain, so a reorg at height after the fetch
 	// above surfaces as a halt from a proof read. The halt stands only when the momentum still

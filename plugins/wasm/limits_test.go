@@ -3,6 +3,8 @@ package wasm
 import (
 	"testing"
 
+	"github.com/zenon-network/go-zenon/vm/constants"
+
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
@@ -23,5 +25,11 @@ func TestModuleLimitsMapping(t *testing.T) {
 	got := moduleLimits()
 	if got != want {
 		t.Fatalf("moduleLimits() = %+v, want %+v", got, want)
+	}
+}
+
+func TestMaxExecutionResultMatchesSettlement(t *testing.T) {
+	if MaxExecutionResult != constants.MaxExecutionResult {
+		t.Fatalf("MaxExecutionResult = %d, Settlement's constants.MaxExecutionResult = %d", MaxExecutionResult, constants.MaxExecutionResult)
 	}
 }

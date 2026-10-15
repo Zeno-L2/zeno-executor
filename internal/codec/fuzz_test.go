@@ -101,6 +101,14 @@ var codecFamilies = []roundTripper{
 		enc, err := EncodeBundle(records)
 		return true, enc, err
 	}},
+	{"receipt_sidecar", func(b []byte) (bool, []byte, error) {
+		receipts, _, err := DecodeReceiptSidecar(b)
+		if err != nil {
+			return false, nil, nil
+		}
+		enc, err := EncodeReceiptSidecar(receipts)
+		return true, enc, err
+	}},
 }
 
 // sampleEncodings returns one representative valid encoding per family, used both as fuzz
@@ -179,6 +187,12 @@ func sampleEncodings(t testing.TB) map[string][]byte {
 		t.Fatal(err)
 	}
 	out["bundle"] = b
+
+	b, err = EncodeReceiptSidecar(sampleSidecarReceipts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out["receipt_sidecar"] = b
 
 	return out
 }

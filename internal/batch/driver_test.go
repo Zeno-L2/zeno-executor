@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/big"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -115,6 +117,28 @@ func (s *fakeBundleStore) Get(daHash types.Hash) ([]byte, error) {
 	return out, nil
 }
 
+// fakeReceiptStore is an in-memory ReceiptStore that records every Put; when err is set, Put
+// returns it and records nothing.
+type fakeReceiptStore struct {
+	puts []receiptPut
+	err  error
+}
+
+type receiptPut struct {
+	daHash, receiptRoot types.Hash
+	sidecar             []byte
+}
+
+func newFakeReceiptStore() *fakeReceiptStore { return &fakeReceiptStore{} }
+
+func (s *fakeReceiptStore) Put(daHash, receiptRoot types.Hash, sidecar []byte) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.puts = append(s.puts, receiptPut{daHash, receiptRoot, append([]byte(nil), sidecar...)})
+	return nil
+}
+
 // --- helpers ---
 
 func openTestStore(t *testing.T) *state.Store {
@@ -136,6 +160,7 @@ func testConfig(t *testing.T, dom domain.Domain, inputs InputSource, bundles Bun
 		Store:        openTestStore(t),
 		Inputs:       inputs,
 		Bundles:      bundles,
+		Receipts:     newFakeReceiptStore(),
 		FirstBatchID: 100,
 	}
 }
@@ -306,6 +331,82 @@ func TestDriverReplayDeterminism(t *testing.T) {
 		if !bytes.Equal(ea, eb) {
 			t.Fatalf("receipt %d differs:\n a = %x\n b = %x", i, ea, eb)
 		}
+	}
+}
+
+// twoInputDriver returns a driver over the two-input batch of TestDriverReplayDeterminism and
+// its receipt store.
+func twoInputDriver(t *testing.T) (*Driver, *fakeReceiptStore) {
+	t.Helper()
+	contractID := hashN(2)
+	src := hashN(1)
+	inputs := []ledger.Input{
+		ledgerInput(0, callPayload(t, src, contractID, codec.AssetID{}, codec.U256{})),
+		ledgerInput(1, callPayload(t, src, contractID, codec.AssetID{}, codec.U256{})),
+	}
+	dom := &fakeDomain{steps: []fakeStep{
+		{effects: withdrawalEffects(contractID, 0, assetN(1), u256N(10))},
+		{effects: withdrawalEffects(contractID, 1, assetN(1), u256N(20))},
+	}}
+	cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, newFakeBundleStore())
+	rs := cfg.Receipts.(*fakeReceiptStore)
+	d, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return d, rs
+}
+
+func TestDriverWritesReceiptSidecar(t *testing.T) {
+	d, rs := twoInputDriver(t)
+	got, ok, err := d.NextBatch()
+	if err != nil || !ok {
+		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+	}
+	if len(rs.puts) != 1 {
+		t.Fatalf("receipt puts = %d, want 1", len(rs.puts))
+	}
+	p := rs.puts[0]
+	if p.daHash != got.Commitment.DAHash {
+		t.Fatalf("put daHash = %x, want %x", p.daHash, got.Commitment.DAHash)
+	}
+	if p.receiptRoot != got.Commitment.ReceiptRoot {
+		t.Fatalf("put receiptRoot = %x, want %x", p.receiptRoot, got.Commitment.ReceiptRoot)
+	}
+	receipts, leaves, err := codec.DecodeReceiptSidecar(p.sidecar)
+	if err != nil {
+		t.Fatalf("DecodeReceiptSidecar: %v", err)
+	}
+	if !reflect.DeepEqual(receipts, got.Receipts) {
+		t.Fatalf("sidecar receipts = %+v, want %+v", receipts, got.Receipts)
+	}
+	if codec.MerkleRoot(leaves) != got.Commitment.ReceiptRoot {
+		t.Fatalf("sidecar leaves do not hash to ReceiptRoot")
+	}
+}
+
+func TestDriverReceiptStoreError(t *testing.T) {
+	d, rs := twoInputDriver(t)
+	boom := errors.New("receipt disk full")
+	rs.err = boom
+	got, ok, err := d.NextBatch()
+	if !errors.Is(err, boom) {
+		t.Fatalf("NextBatch err = %v, want it to wrap %v", err, boom)
+	}
+	if ok {
+		t.Fatalf("NextBatch ok = true on a receipt store error")
+	}
+	if !reflect.DeepEqual(got, Batch{}) {
+		t.Fatalf("NextBatch returned a non-zero Batch on error")
+	}
+}
+
+func TestNewRejectsNilReceipts(t *testing.T) {
+	cfg := testConfig(t, &fakeDomain{}, &fakeInputSource{}, newFakeBundleStore())
+	cfg.Receipts = nil
+	_, err := New(cfg)
+	if err == nil || !strings.Contains(err.Error(), "Config.Receipts is nil") {
+		t.Fatalf("New err = %v, want Config.Receipts is nil", err)
 	}
 }
 
@@ -976,6 +1077,65 @@ func TestDriverClaimedDepositExceedsAmount(t *testing.T) {
 	if !errors.Is(err, ErrEffectsInvariant) {
 		t.Fatalf("NextBatch err = %v, want ErrEffectsInvariant", err)
 	}
+	if !strings.Contains(err.Error(), "ClaimedDeposit exceeds the input's deposit_amount") {
+		t.Fatalf("NextBatch err = %v, want the claimed-deposit invariant", err)
+	}
+}
+
+func TestCheckEffects(t *testing.T) {
+	refund := func(mut func(*codec.OutboxMessage)) domain.Effects {
+		eff := refundEffects(0, assetN(1), u256N(100))
+		mut(&eff.OutboxMessages[0])
+		return eff
+	}
+	revertWithRefund := refundEffects(0, assetN(1), u256N(100))
+	revertWithRefund.Status = codec.StatusRevert
+	revertWithRefund.AbortCode = 7
+	revertWithRefund.ReturnData = []byte("r")
+	contractContent := withdrawalEffects(hashN(2), 0, assetN(1), u256N(5))
+	contractContent.StateDiff = []domain.StateDiffEntry{{Path: pathN(1), Value: []byte("v")}}
+	contractContent.Events = []codec.Event{{ContractID: hashN(2)}}
+	contractContent.ReturnData = []byte("r")
+	twoRefunds := refundEffects(0, assetN(1), u256N(100))
+	twoRefunds.OutboxMessages = append(twoRefunds.OutboxMessages, twoRefunds.OutboxMessages[0])
+
+	for _, tc := range []struct {
+		name    string
+		eff     domain.Effects
+		deposit codec.U256
+		reason  string
+	}{
+		{"revert with state diff", domain.Effects{Status: codec.StatusRevert, StateDiff: []domain.StateDiffEntry{{Path: pathN(1), Value: []byte("v")}}}, u256N(100), "non-empty StateDiff/Events"},
+		{"runtime fault with event", domain.Effects{Status: codec.StatusRuntimeFault, Events: []codec.Event{{ContractID: hashN(2)}}}, u256N(100), "non-empty StateDiff/Events"},
+		{"runtime fault with return data", domain.Effects{Status: codec.StatusRuntimeFault, ReturnData: []byte{1}}, u256N(100), "non-empty ReturnData outside REVERT"},
+		{"revert with claimed deposit", domain.Effects{Status: codec.StatusRevert, ClaimedDeposit: u256N(1)}, u256N(100), "non-zero ClaimedDeposit"},
+		{"out of gas with abort code", domain.Effects{Status: codec.StatusOutOfGas, AbortCode: 7}, u256N(100), "non-zero AbortCode outside REVERT"},
+		{"outbox message is not a withdrawal", domain.Effects{Status: codec.StatusRevert, OutboxMessages: []codec.OutboxMessage{{Target: codec.L2Delivery{TargetContract: hashN(2)}}}}, u256N(100), "outbox message is not an L1Withdrawal"},
+		{"refund outbox index", refund(func(m *codec.OutboxMessage) { m.OutboxIndex = 1 }), u256N(100), "refund OutboxIndex != 0"},
+		{"refund source contract", refund(func(m *codec.OutboxMessage) { m.SourceContract = hashN(2) }), u256N(100), "refund SourceContract != zero"},
+		{"two refunds", twoRefunds, u256N(100), "more than one outbox message"},
+		{"success claims above deposit", domain.Effects{Status: codec.StatusSuccess, ClaimedDeposit: u256N(101)}, u256N(100), "ClaimedDeposit exceeds the input's deposit_amount"},
+		{"success claims with no deposit", domain.Effects{Status: codec.StatusSuccess, ClaimedDeposit: u256N(1)}, codec.U256{}, "ClaimedDeposit exceeds the input's deposit_amount"},
+		{"runtime fault with refund", refundEffects(0, assetN(1), u256N(100)), u256N(100), ""},
+		{"revert with refund, abort code and return data", revertWithRefund, u256N(100), ""},
+		{"bare revert", domain.Effects{Status: codec.StatusRevert}, u256N(100), ""},
+		{"success with contract content", contractContent, u256N(100), ""},
+		{"success claims below deposit", domain.Effects{Status: codec.StatusSuccess, ClaimedDeposit: u256N(40)}, u256N(100), ""},
+		{"success claims the deposit", domain.Effects{Status: codec.StatusSuccess, ClaimedDeposit: u256N(100)}, u256N(100), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckEffects(tc.eff, tc.deposit)
+			if tc.reason == "" {
+				if err != nil {
+					t.Fatalf("CheckEffects = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrEffectsInvariant) || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("CheckEffects = %v, want ErrEffectsInvariant containing %q", err, tc.reason)
+			}
+		})
+	}
 }
 
 // --- tests 11-13: source error classes ---
@@ -1305,4 +1465,38 @@ func TestDriverCapLookup(t *testing.T) {
 			t.Fatalf("ok=%v err=%v receipts=%d, want a batch of 1", ok, err, len(b.Receipts))
 		}
 	})
+}
+
+// bundleCheckingReceipts fails a Put unless the bundle for the same DAHash is already stored.
+type bundleCheckingReceipts struct {
+	bundles BundleStore
+	puts    int
+}
+
+func (s *bundleCheckingReceipts) Put(daHash, _ types.Hash, _ []byte) error {
+	if _, err := s.bundles.Get(daHash); err != nil {
+		return fmt.Errorf("receipt put before its bundle: %w", err)
+	}
+	s.puts++
+	return nil
+}
+
+func TestDriverWritesSidecarAfterBundle(t *testing.T) {
+	contractID := hashN(2)
+	inputs := []ledger.Input{ledgerInput(0, callPayload(t, hashN(1), contractID, codec.AssetID{}, codec.U256{}))}
+	dom := &fakeDomain{steps: []fakeStep{{effects: withdrawalEffects(contractID, 0, assetN(1), u256N(10))}}}
+	bundles := newFakeBundleStore()
+	cfg := testConfig(t, dom, &fakeInputSource{inputs: inputs}, bundles)
+	rs := &bundleCheckingReceipts{bundles: bundles}
+	cfg.Receipts = rs
+	d, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok, err := d.NextBatch(); err != nil || !ok {
+		t.Fatalf("NextBatch: ok=%v err=%v", ok, err)
+	}
+	if rs.puts != 1 {
+		t.Fatalf("receipt puts = %d, want 1", rs.puts)
+	}
 }
