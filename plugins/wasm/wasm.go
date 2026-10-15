@@ -14,6 +14,7 @@ import (
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/engine"
+	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
 )
 
 // Config is the plugin's construction-time configuration.
@@ -24,25 +25,38 @@ type Config struct {
 	NetworkName string
 	// CodeStorePath is the directory for the local, non-consensus code store (§4).
 	CodeStorePath string
+	// FetchModule, when set, selects simulate mode: an in-memory code
+	// tier whose assembled-module misses call it.
+	FetchModule func(sourceCodeHash types.Hash) (module []byte, found bool, err error)
 }
 
 // Plugin is the WASM domain.Domain implementation.
 type Plugin struct {
 	cfg     Config
 	chainID types.Hash
-	store   *codeStore
+	store   codeTier
 	engine  *engine.Engine
 }
 
 // New returns a WASM domain plugin, erroring on an empty NetworkName or an unusable
-// CodeStorePath.
+// CodeStorePath. With FetchModule set it keeps its code in memory and
+// refuses a CodeStorePath.
 func New(cfg Config) (*Plugin, error) {
 	if cfg.NetworkName == "" {
 		return nil, fmt.Errorf("wasm: NetworkName is required")
 	}
-	store, err := newCodeStore(cfg.CodeStorePath)
-	if err != nil {
-		return nil, fmt.Errorf("wasm: %w", err)
+	var store codeTier
+	if cfg.FetchModule != nil {
+		if cfg.CodeStorePath != "" {
+			return nil, fmt.Errorf("wasm: CodeStorePath and FetchModule are mutually exclusive")
+		}
+		store = newMemTier(cfg.FetchModule, simModuleCacheBytes, simModuleCacheEntries)
+	} else {
+		disk, err := newCodeStore(cfg.CodeStorePath)
+		if err != nil {
+			return nil, fmt.Errorf("wasm: %w", err)
+		}
+		store = disk
 	}
 	eng, err := engine.New()
 	if err != nil {
@@ -50,7 +64,7 @@ func New(cfg Config) (*Plugin, error) {
 	}
 	return &Plugin{
 		cfg:     cfg,
-		chainID: hashOf(crypto.Hash([]byte("ZENON_WASM_L2:"), []byte(cfg.NetworkName))),
+		chainID: keys.ChainID(cfg.NetworkName),
 		store:   store,
 		engine:  eng,
 	}, nil

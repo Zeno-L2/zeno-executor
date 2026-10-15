@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -320,6 +321,30 @@ func TestRunCommitsAndRecovers(t *testing.T) {
 		next = r.LastInputSeq + 2
 		if ok, err := bundles.Has(r.DAHash); err != nil || !ok {
 			t.Fatalf("bundle of record %d: %v, %v", r.BatchID, ok, err)
+		}
+		sidecar, err := os.ReadFile(filepath.Join(layout.Receipts, hex.EncodeToString(r.DAHash[:])+".receipts"))
+		if err != nil {
+			t.Fatalf("sidecar of record %d: %v", r.BatchID, err)
+		}
+		receipts, leaves, err := codec.DecodeReceiptSidecar(sidecar)
+		if err != nil || len(receipts) == 0 {
+			t.Fatalf("decode sidecar of record %d: %d receipts, %v", r.BatchID, len(receipts), err)
+		}
+		c, err := codec.DecodeBatchCommitment(r.Commitment)
+		if err != nil {
+			t.Fatalf("decode commitment of record %d: %v", r.BatchID, err)
+		}
+		if codec.MerkleRoot(leaves) != c.ReceiptRoot {
+			t.Fatalf("sidecar of record %d does not hash to ReceiptRoot", r.BatchID)
+		}
+		for _, rc := range receipts {
+			if rc.BatchID != r.BatchID {
+				t.Fatalf("sidecar of record %d holds a receipt of batch %d", r.BatchID, rc.BatchID)
+			}
+		}
+		if receipts[0].InputIndex != r.FirstInputSeq || receipts[len(receipts)-1].InputIndex != r.LastInputSeq {
+			t.Fatalf("sidecar of record %d spans inputs %d..%d, want %d..%d", r.BatchID,
+				receipts[0].InputIndex, receipts[len(receipts)-1].InputIndex, r.FirstInputSeq, r.LastInputSeq)
 		}
 	}
 
@@ -2083,10 +2108,7 @@ func TestCommitAndLocalWriteFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chmod(layout.Batches, 0o555); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { os.Chmod(layout.Batches, 0o755) })
+		denyWritesOnRecover(t, &cfg, layout.Batches)
 		var count atomic.Int32
 		cfg.OnCommit = func([]codec.BatchCommitment, Withdrawals) error { count.Add(1); return nil }
 		runErr := runUntil(t, cfg, func() bool { return false })
@@ -2112,10 +2134,7 @@ func TestCommitAndLocalWriteFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chmod(layout.Bundles, 0o555); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { os.Chmod(layout.Bundles, 0o755) })
+		denyWritesOnRecover(t, &cfg, layout.Bundles)
 		runErr := runUntil(t, cfg, func() bool { return false })
 		if !errors.Is(runErr, recovery.ErrHalted) || errors.Is(runErr, recovery.ErrSourceUnavailable) {
 			t.Fatalf("Run = %v, want ErrHalted, not ErrSourceUnavailable", runErr)
@@ -2124,6 +2143,45 @@ func TestCommitAndLocalWriteFailures(t *testing.T) {
 			t.Fatalf("cursor exists after a bundle write failure")
 		}
 	})
+
+	t.Run("receipt write failure halts", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		src := &chainSource{}
+		src.set(chain, 12)
+		cfg := validConfig(t, src)
+		layout, err := recovery.NewLayout(cfg.StoragePath, cfg.DomainID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		denyWritesOnRecover(t, &cfg, layout.Receipts)
+		runErr := runUntil(t, cfg, func() bool { return false })
+		if !errors.Is(runErr, recovery.ErrHalted) || errors.Is(runErr, recovery.ErrSourceUnavailable) {
+			t.Fatalf("Run = %v, want ErrHalted, not ErrSourceUnavailable", runErr)
+		}
+		if _, ok := cursorAt(t, cfg); ok {
+			t.Fatalf("cursor exists after a receipt write failure")
+		}
+		records, err := recovery.ListBatchRecords(layout)
+		if err != nil || len(records) != 0 {
+			t.Fatalf("batch records = %v, %v, want none", records, err)
+		}
+	})
+}
+
+// denyWritesOnRecover makes dir read-only from cfg's OnRecover hook, which the loop calls after
+// boot and before the first batch. Run sets the directory modes at its start, so a chmod before
+// Run would be undone.
+func denyWritesOnRecover(t *testing.T, cfg *Config, dir string) {
+	t.Helper()
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	cfg.OnRecover = func(uint64, []codec.BatchCommitment, Withdrawals) error {
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Errorf("chmod %s: %v", dir, err)
+		}
+		return nil
+	}
 }
 
 // --- lagging source during a reorg ---

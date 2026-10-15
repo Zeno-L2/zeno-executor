@@ -211,6 +211,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
+	receipts, err := recovery.NewReceiptStore(layout.Receipts)
+	if err != nil {
+		return fmt.Errorf("runtime: %w", err)
+	}
 	executor, err := types.ParseAddress(r.cfg.ExecutorID)
 	if err != nil {
 		return fmt.Errorf("runtime: executorId %q is not an address: %w", r.cfg.ExecutorID, err)
@@ -237,7 +241,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	log.Printf("runtime: executor %q registered domain %d (%T), ready at momentum height %d (fresh: %t)",
 		r.cfg.ExecutorID, r.cfg.DomainID, d, ready.Position.MomentumHeight, ready.Fresh)
 
-	lp := &loop{cfg: r.cfg, rcfg: rcfg, executor: executor, dom: d, bundles: bundles}
+	lp := &loop{cfg: r.cfg, rcfg: rcfg, executor: executor, dom: d, bundles: bundles, receipts: receipts}
 	err = lp.run(ctx, ready)
 
 	log.Printf("runtime: shutting down")

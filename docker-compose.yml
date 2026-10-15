@@ -8,6 +8,9 @@ services:
       additional_contexts:
         go-zenon: ../go-zenon
     command: ["-config", "/etc/executor/executor.json"]
+    # The image defaults to the gateway's uid. The supervisor needs root
+    # to separate worker uids.
+    user: "0:0"
     init: true
     privileged: true
     cgroup: private
@@ -26,8 +29,45 @@ services:
     pids_limit: 256
     stop_grace_period: 45s
 
+  # The gateway runs unprivileged as uid 9999. Its simulators run as
+  # the same uid with no memory cap of their own, so mem_limit and
+  # memswap_limit cap the gateway and its simulators together.
+  # GOMAXPROCS matches cpus for the gateway only: simulators start
+  # with an empty environment.
+  gateway:
+    build:
+      context: .
+      target: runtime
+      additional_contexts:
+        go-zenon: ../go-zenon
+    entrypoint: ["gateway"]
+    command: ["-config", "/etc/gateway/gateway.json"]
+    user: "9999:9999"
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      GOMAXPROCS: "2"
+    ports:
+      - "127.0.0.1:35999:35999"
+    volumes:
+      - executor-data:/var/lib/executor:ro
+      - gateway-data:/var/lib/gateway
+      - ./docker/gateway.json:/etc/gateway/gateway.json:ro
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 2
+    pids_limit: 256
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   executor-data:
+  gateway-data:
 
 secrets:
   executor_key:

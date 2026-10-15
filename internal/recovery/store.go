@@ -6,16 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
+	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
@@ -24,33 +27,62 @@ const (
 	batchName = 20 // digits in a zero-padded batch id
 	bundleExt = ".bundle"
 	snapExt   = ".snap"
+
+	receiptExt = ".receipts"
+)
+
+// File and directory modes. bundles/, receipts/ and batches/ are the gateway's read
+// interface (EXECUTOR §16): their directories are readDirMode and their files readFileMode,
+// inside a domain directory other users can traverse but not list. Every other file this
+// package writes is privateFileMode. Each mode is set by an explicit chmod, never by the
+// umask.
+const (
+	domainDirMode   os.FileMode = 0o711
+	readDirMode     os.FileMode = 0o755
+	readFileMode    os.FileMode = 0o644
+	privateFileMode os.FileMode = 0o600
 )
 
 // Layout is the per-domain on-disk tree (EXECUTOR §16), rooted at <storagePath>/<domainId>.
 // Momenta is the path of momentum_hashes/window.json; every other field that names a
-// directory (Snapshots, Bundles, Batches) is that directory.
+// directory (Snapshots, Bundles, Receipts, Batches) is that directory.
 type Layout struct {
-	Root, StateWAL, Snapshots, Bundles, Batches, Cursor, Momenta, Meta string
+	Root, StateWAL, Snapshots, Bundles, Receipts, Batches, Cursor, Momenta, Meta string
 }
 
-// NewLayout resolves the tree for domainID under storagePath and creates every directory it
-// names.
-func NewLayout(storagePath string, domainID uint32) (Layout, error) {
+// ResolveLayout returns the tree for domainID under storagePath
+// without creating, reading or changing anything, for a reader of the
+// read interface such as the gateway.
+func ResolveLayout(storagePath string, domainID uint32) Layout {
 	root := filepath.Join(storagePath, strconv.FormatUint(uint64(domainID), 10))
-	l := Layout{
+	return Layout{
 		Root:      root,
 		StateWAL:  filepath.Join(root, "state", "wal"),
 		Snapshots: filepath.Join(root, "snapshots"),
 		Bundles:   filepath.Join(root, "bundles"),
+		Receipts:  filepath.Join(root, "receipts"),
 		Batches:   filepath.Join(root, "batches"),
 		Cursor:    filepath.Join(root, "cursor"),
 		Momenta:   filepath.Join(root, "momentum_hashes", "window.json"),
 		Meta:      filepath.Join(root, "meta.json"),
 	}
-	for _, dir := range []string{filepath.Dir(l.StateWAL), l.Snapshots, l.Bundles, l.Batches, filepath.Dir(l.Momenta)} {
+}
+
+// NewLayout resolves the tree for domainID under storagePath and creates every directory it
+// names. It sets the domain directory to 0711 and batches/ to 0755 on every call, whatever the
+// umask.
+func NewLayout(storagePath string, domainID uint32) (Layout, error) {
+	l := ResolveLayout(storagePath, domainID)
+	for _, dir := range []string{filepath.Dir(l.StateWAL), l.Snapshots, l.Bundles, l.Receipts, l.Batches, filepath.Dir(l.Momenta)} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, fmt.Errorf("recovery: create %s: %w", dir, err)
 		}
+	}
+	if err := os.Chmod(l.Root, domainDirMode); err != nil {
+		return Layout{}, fmt.Errorf("recovery: chmod %s: %w", l.Root, err)
+	}
+	if err := os.Chmod(l.Batches, readDirMode); err != nil {
+		return Layout{}, fmt.Errorf("recovery: chmod %s: %w", l.Batches, err)
 	}
 	return l, nil
 }
@@ -84,7 +116,7 @@ func OpenMeta(l Layout, want Meta) (Meta, error) {
 		return Meta{}, fmt.Errorf("recovery: read meta: %w", err)
 	}
 	if !found {
-		if err := writeJSON(l.Meta, want); err != nil {
+		if err := writeJSON(l.Meta, want, privateFileMode); err != nil {
 			return Meta{}, fmt.Errorf("recovery: write meta: %w", err)
 		}
 		return want, nil
@@ -99,7 +131,7 @@ func OpenMeta(l Layout, want Meta) (Meta, error) {
 	got.STFSpecHash = want.STFSpecHash
 	got.Role = want.Role
 	got.LastBootAt = want.LastBootAt
-	if err := writeJSON(l.Meta, got); err != nil {
+	if err := writeJSON(l.Meta, got, privateFileMode); err != nil {
 		return Meta{}, fmt.Errorf("recovery: write meta: %w", err)
 	}
 	return got, nil
@@ -209,6 +241,21 @@ func parseBatchFile(name string) (uint64, bool) {
 	return id, true
 }
 
+// ReadBatchRecord returns the batch record for id. ok is false when no
+// record file exists for id, and when the file's batchId differs from
+// id, which ListBatchRecords skips the same way.
+func ReadBatchRecord(l Layout, id uint64) (BatchRecord, bool, error) {
+	var rec BatchRecord
+	found, err := readRecordJSON(batchPath(l, id), &rec)
+	if err != nil {
+		return BatchRecord{}, false, fmt.Errorf("recovery: read batch record %d: %w", id, err)
+	}
+	if !found || rec.BatchID != id {
+		return BatchRecord{}, false, nil
+	}
+	return rec, true, nil
+}
+
 // ListBatchRecords returns every committed batch record, ascending by batchId. A file whose
 // name does not parse as a zero-padded batch id is skipped: a crash between the atomic-write
 // helper's create and its rename leaves a temporary in the same directory. A file whose decoded
@@ -274,7 +321,7 @@ func writeMomentumWindow(l Layout, w []MomentumRef) error {
 	if w == nil {
 		w = []MomentumRef{}
 	}
-	if err := writeJSON(l.Momenta, w); err != nil {
+	if err := writeJSON(l.Momenta, w, privateFileMode); err != nil {
 		return fmt.Errorf("recovery: write momentum window: %w", err)
 	}
 	return nil
@@ -397,16 +444,26 @@ type BundleStore struct {
 	dir string
 }
 
-// NewBundleStore returns a BundleStore over dir, creating it when absent.
+// NewBundleStore returns a BundleStore over dir, creating it when absent and setting it to
+// 0755.
 func NewBundleStore(dir string) (*BundleStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("recovery: create bundle dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, readDirMode); err != nil {
+		return nil, fmt.Errorf("recovery: chmod bundle dir %s: %w", dir, err)
 	}
 	return &BundleStore{dir: dir}, nil
 }
 
 func (b *BundleStore) path(daHash types.Hash) string {
-	return filepath.Join(b.dir, hex.EncodeToString(daHash[:])+bundleExt)
+	return BundlePath(b.dir, daHash)
+}
+
+// BundlePath is the file holding the bundle for daHash in the bundle
+// directory dir.
+func BundlePath(dir string, daHash types.Hash) string {
+	return filepath.Join(dir, hex.EncodeToString(daHash[:])+bundleExt)
 }
 
 // Put writes bundle under daHash atomically. It is idempotent: the name is the content's own
@@ -416,7 +473,7 @@ func (b *BundleStore) Put(daHash types.Hash, bundle []byte) error {
 	if !bytes.Equal(crypto.Hash(bundle), daHash[:]) {
 		return fmt.Errorf("recovery: put bundle %s: bytes do not hash to daHash", daHash)
 	}
-	if err := writeFileAtomic(b.path(daHash), bundle); err != nil {
+	if err := writeFileAtomic(b.path(daHash), bundle, readFileMode); err != nil {
 		return fmt.Errorf("recovery: put bundle %s: %w", daHash, err)
 	}
 	return nil
@@ -450,6 +507,52 @@ func (b *BundleStore) Has(daHash types.Hash) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("recovery: stat bundle %s: %w", daHash, err)
+}
+
+// ReceiptStore persists receipt sidecars (EXECUTOR §21.2) by DAHash, one file each, and
+// satisfies batch.ReceiptStore. Sidecars are retained forever, as bundles are.
+type ReceiptStore struct {
+	dir string
+}
+
+// NewReceiptStore returns a ReceiptStore over dir, creating it when absent and setting it to
+// 0755.
+func NewReceiptStore(dir string) (*ReceiptStore, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("recovery: create receipts dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, readDirMode); err != nil {
+		return nil, fmt.Errorf("recovery: chmod receipts dir %s: %w", dir, err)
+	}
+	return &ReceiptStore{dir: dir}, nil
+}
+
+func (s *ReceiptStore) path(daHash types.Hash) string {
+	return ReceiptsPath(s.dir, daHash)
+}
+
+// ReceiptsPath is the file holding the receipt sidecar for daHash in
+// the receipts directory dir.
+func ReceiptsPath(dir string, daHash types.Hash) string {
+	return filepath.Join(dir, hex.EncodeToString(daHash[:])+receiptExt)
+}
+
+// Put writes sidecar under daHash atomically, replacing any sidecar already stored there. It
+// rejects a sidecar that does not decode, or whose leaves' MerkleRoot is not receiptRoot, and
+// then writes nothing.
+func (s *ReceiptStore) Put(daHash, receiptRoot types.Hash, sidecar []byte) error {
+	_, leaves, err := codec.DecodeReceiptSidecar(sidecar)
+	if err != nil {
+		return fmt.Errorf("recovery: put receipts %s: %w", daHash, err)
+	}
+	got := codec.MerkleRoot(leaves)
+	if got != receiptRoot {
+		return fmt.Errorf("recovery: put receipts %s: sidecar root %s is not receiptRoot %s", daHash, got, receiptRoot)
+	}
+	if err := writeFileAtomic(s.path(daHash), sidecar, readFileMode); err != nil {
+		return fmt.Errorf("recovery: put receipts %s: %w", daHash, err)
+	}
+	return nil
 }
 
 // Commit durably records pos: it snapshots store — tagged with pos.LastInputSeq, the configured
@@ -532,7 +635,7 @@ func Commit(cfg Config, store *state.Store, pos Position, records []BatchRecord,
 	}
 
 	for _, rec := range records {
-		if err := writeJSON(batchPath(cfg.Layout, rec.BatchID), rec); err != nil {
+		if err := writeJSON(batchPath(cfg.Layout, rec.BatchID), rec, readFileMode); err != nil {
 			return fmt.Errorf("recovery: write batch record %d: %w", rec.BatchID, err)
 		}
 	}
@@ -543,7 +646,7 @@ func Commit(cfg Config, store *state.Store, pos Position, records []BatchRecord,
 		}
 	}
 
-	if err := writeJSON(cfg.Layout.Cursor, pos); err != nil {
+	if err := writeJSON(cfg.Layout.Cursor, pos, privateFileMode); err != nil {
 		return fmt.Errorf("recovery: write cursor: %w", err)
 	}
 
@@ -636,24 +739,108 @@ func readJSON(path string, v any) (bool, error) {
 	return true, nil
 }
 
-func writeJSON(path string, v any) error {
+// MaxBatchRecordSize bounds a batch record file read through
+// ReadBatchRecord. A record is indented JSON of a few hundred bytes
+// plus the hex of its commitment; 64 KiB is far above that.
+const MaxBatchRecordSize = 64 << 10
+
+// readRecordJSON is readJSON for one batch record: the read is
+// ReadRegularFile with MaxBatchRecordSize.
+func readRecordJSON(path string, v any) (bool, error) {
+	data, err := ReadRegularFile(path, MaxBatchRecordSize)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return false, fmt.Errorf("decode %s: %w", filepath.Base(path), err)
+	}
+	return true, nil
+}
+
+// ErrTooLarge is wrapped by ReadRegularFile's errors for a file above
+// its size limit.
+var ErrTooLarge = errors.New("too large")
+
+// ReadRegularFile returns the contents of the regular file at path,
+// which must hold at most maxSize bytes. It never follows a symlink
+// at path and never blocks on a FIFO or device, and it checks the
+// size of the open file before it allocates one buffer of that size,
+// so a file written by another user cannot exhaust memory or stall
+// the caller. A missing file reports an error satisfying
+// errors.Is(err, os.ErrNotExist), and a file above maxSize one
+// satisfying errors.Is(err, ErrTooLarge); every other rejection is a
+// plain error.
+func ReadRegularFile(path string, maxSize int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", filepath.Base(path))
+	}
+	if info.Size() > maxSize {
+		return nil, fmt.Errorf("%s is %w: %d bytes, above the %d byte limit", filepath.Base(path), ErrTooLarge, info.Size(), maxSize)
+	}
+	r := io.LimitReader(f, maxSize+1)
+	// One spare byte lets the read at end of file return without
+	// growing the buffer; it grows only for a file that grew after
+	// Stat, up to the limit.
+	data := make([]byte, 0, info.Size()+1)
+	for {
+		n, err := r.Read(data[len(data):cap(data)])
+		data = data[:len(data)+n]
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(data)) > maxSize {
+			break
+		}
+		if len(data) == cap(data) {
+			data = append(data, 0)[:len(data)]
+		}
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("%s is %w: it grew past the %d byte limit", filepath.Base(path), ErrTooLarge, maxSize)
+	}
+	return data, nil
+}
+
+func writeJSON(path string, v any, perm os.FileMode) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, data)
+	return writeFileAtomic(path, data, perm)
 }
 
 // writeFileAtomic writes data to a temporary file in path's directory, syncs and closes it, then
 // renames it over path and syncs the containing directory, so the rename itself is durable and
-// not merely ordered after the file's own content.
-func writeFileAtomic(path string, data []byte) error {
+// not merely ordered after the file's own content. The file gets mode perm, set on the
+// temporary file before its contents are synced, so the rename publishes the final mode whatever
+// the umask.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
 	}
 	tmp := f.Name()
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		os.Remove(tmp)

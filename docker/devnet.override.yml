@@ -1,0 +1,11 @@
+services:
+  pillar:
+    image: go-executor-devnet-znnd:latest
+  pillar2:
+    image: go-executor-devnet-znnd:latest
+  pillar3:
+    image: go-executor-devnet-znnd:latest
+  rpc:
+    image: go-executor-devnet-znnd:latest
+  observer:
+    image: go-executor-devnet-znnd:latest

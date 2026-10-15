@@ -103,6 +103,7 @@ func ListSnapshots(dir string) ([]SnapshotInfo, error) {
 // which a boot always discards. It fails when the file's bytes do not hash to name, and when
 // the snapshot's STFSpecHash differs from stfSpecHash — a snapshot produced by a different STF
 // is never loaded (§16).
+// The open sets the log to mode 0600, whatever its mode was.
 func OpenSnapshot(walPath, dir, name string, stfSpecHash types.Hash) (*Store, error) {
 	body, err := os.ReadFile(filepath.Join(dir, name+snapshotExt))
 	if err != nil {
@@ -124,6 +125,7 @@ func OpenSnapshot(walPath, dir, name string, stfSpecHash types.Hash) (*Store, er
 // OpenEmpty opens walPath with an empty leaf set, discarding any existing WAL content. It is
 // the genesis path: a first boot seeds the domain's StateInit into a store whose log starts
 // empty.
+// The open sets the log to mode 0600, whatever its mode was.
 func OpenEmpty(walPath string) (*Store, error) {
 	return openFresh(walPath, make(map[trie.Path][]byte))
 }
@@ -154,9 +156,13 @@ func (s *Store) TruncateLog() error {
 }
 
 func openFresh(walPath string, leaves map[trie.Path][]byte) (*Store, error) {
-	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("state: open %s: %w", walPath, err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("state: chmod %s: %w", walPath, err)
 	}
 	return newStore(leaves, f), nil
 }

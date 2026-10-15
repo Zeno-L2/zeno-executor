@@ -18,7 +18,7 @@ import (
 )
 
 // MaxBatchInputs is the §25.1 per-batch input count cap.
-const MaxBatchInputs = 64
+const MaxBatchInputs = codec.MaxBatchInputs
 
 // DAMode is the §20 DA mode ordinal; 0 is the only Phase-1 value.
 const DAMode uint8 = 0
@@ -36,6 +36,12 @@ type BundleStore interface {
 	Get(daHash types.Hash) ([]byte, error)
 }
 
+// ReceiptStore persists a batch's receipt sidecar (EXECUTOR §21.2) by DAHash. Put rejects a
+// sidecar whose leaves do not hash to receiptRoot.
+type ReceiptStore interface {
+	Put(daHash, receiptRoot types.Hash, sidecar []byte) error
+}
+
 // Config is a Driver's construction-time configuration. Every field is validated by New.
 type Config struct {
 	DomainID     uint32
@@ -44,6 +50,7 @@ type Config struct {
 	Store        *state.Store
 	Inputs       InputSource
 	Bundles      BundleStore
+	Receipts     ReceiptStore
 	FirstBatchID uint64
 }
 
@@ -111,7 +118,7 @@ type Driver struct {
 	reorged bool
 }
 
-// New returns a Driver over cfg, rejecting a nil Domain, Store, Inputs or Bundles.
+// New returns a Driver over cfg, rejecting a nil Domain, Store, Inputs, Bundles or Receipts.
 func New(cfg Config) (*Driver, error) {
 	if cfg.Domain == nil {
 		return nil, errors.New("batch: Config.Domain is nil")
@@ -124,6 +131,9 @@ func New(cfg Config) (*Driver, error) {
 	}
 	if cfg.Bundles == nil {
 		return nil, errors.New("batch: Config.Bundles is nil")
+	}
+	if cfg.Receipts == nil {
+		return nil, errors.New("batch: Config.Receipts is nil")
 	}
 	return &Driver{cfg: cfg, batchID: cfg.FirstBatchID}, nil
 }
@@ -414,11 +424,7 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	}
 	rec.eff = eff
 
-	if eff.Status != codec.StatusSuccess {
-		if err := checkNonSuccessInvariant(eff); err != nil {
-			return applied{}, err
-		}
-	} else if err := checkClaimedDeposit(eff.ClaimedDeposit, rec.depositAmount); err != nil {
+	if err := CheckEffects(eff, rec.depositAmount); err != nil {
 		return applied{}, err
 	}
 
@@ -511,6 +517,21 @@ func (d *Driver) finishApply(rec applied) (applied, error) {
 	}
 	rec.encodedResult = encoded
 	return rec, nil
+}
+
+// CheckEffects returns an error wrapping ErrEffectsInvariant when eff
+// holds content the executor never commits for an input whose deposit
+// is depositAmount. A non-SUCCESS eff must hold no StateDiff, Events
+// or ClaimedDeposit, no ReturnData or AbortCode outside REVERT, and at
+// most one L1Withdrawal at outbox index 0 with a zero SourceContract.
+// A SUCCESS eff must claim no more than depositAmount. The batch
+// driver halts on the error, and a simulator answers it as a failed
+// simulation.
+func CheckEffects(eff domain.Effects, depositAmount codec.U256) error {
+	if eff.Status != codec.StatusSuccess {
+		return checkNonSuccessInvariant(eff)
+	}
+	return checkClaimedDeposit(eff.ClaimedDeposit, depositAmount)
 }
 
 // checkNonSuccessInvariant enforces edge case 7 / §14.3 / §15: a non-SUCCESS input's Effects

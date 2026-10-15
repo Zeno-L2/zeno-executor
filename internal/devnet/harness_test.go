@@ -61,6 +61,7 @@ var (
 	executorAddress = types.ParseAddressPanic("z1qp3yph55qgresyytz83anynr2f4z39x2z3ej3e")
 	stfSpecHash     = types.HexToHashPanic("0000000000000000000000000000000000000000000000000000000000000001")
 	depositTarget   = types.Hash{0x07}                                              // no contract lives there, so the domain refunds every deposit
+	callTarget      = types.Hash{0x08}                                              // a hash with no contract, the target of the CallL2
 	fuseAmount      = new(big.Int).Mul(big.NewInt(10_000), big.NewInt(100_000_000)) // 10,000 QSR
 )
 
@@ -70,8 +71,9 @@ type devnet struct {
 	c     *znnd.Client
 	r     *settlement.Reader
 	admin *wallet.KeyPair
-	dir   string    // the artifact directory; removed when the test passes
-	exec  *executor // the running executor, checked on every poll; nil when none runs
+	dir   string         // the artifact directory; removed when the test passes
+	exec  *executor      // the running executor, checked on every poll; nil when none runs
+	gws   []*gatewayProc // the running gateways, checked on every poll
 }
 
 // newDevnet checks the environment and returns a driver for the devnet at endpoint.
@@ -152,6 +154,9 @@ func (d *devnet) waitFor(what string, timeout time.Duration, cond func() (done b
 	for {
 		if d.exec != nil {
 			d.exec.alive()
+		}
+		for _, g := range d.gws {
+			g.alive()
 		}
 		done, l, err := cond()
 		if err != nil && errors.Is(err, recovery.ErrHalted) {
@@ -428,6 +433,23 @@ func (d *devnet) deposit(count uint64) uint64 {
 	return h
 }
 
+// callL2 sends a zero-deposit CallL2 into domain 1, waits until its
+// input counter is count and returns the send hash.
+func (d *devnet) callL2(count uint64) types.Hash {
+	d.t.Helper()
+	data, err := definition.ABISettlement.PackMethod(definition.SettlementCallL2MethodName, domainID, callTarget, inputGas, []byte{})
+	if err != nil {
+		d.t.Fatalf("pack %s: %v", definition.SettlementCallL2MethodName, err)
+	}
+	send := d.send(d.admin, types.SettlementContract, types.ZeroTokenStandard, big.NewInt(0), data)
+	h := d.received(send)
+	d.view(h, fmt.Sprintf("input counter %d", count), func(v *settlement.View) (bool, string, error) {
+		n, err := v.DomainInputCounter(domainID)
+		return err == nil && n == count, fmt.Sprintf("input counter %d", n), err
+	})
+	return send
+}
+
 // setDomainPause sets or clears domain 1's submit pause.
 func (d *devnet) setDomainPause(active bool) uint64 {
 	d.t.Helper()
@@ -524,16 +546,17 @@ type executor struct {
 	err    error         // cmd.Wait's result; read only after exited is closed
 }
 
-// buildBinaries builds the executor and the wasm worker without build tags, as a deployment does.
-func buildBinaries(t *testing.T, dir string) (executorBin, workerBin string) {
+// buildBinaries builds the executor, the wasm worker and the gateway
+// without build tags, as a deployment does.
+func buildBinaries(t *testing.T, dir string) (executorBin, workerBin, gatewayBin string) {
 	t.Helper()
 	bin := filepath.Join(dir, "bin") + string(filepath.Separator)
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/digitalSloth/go-executor/cmd/executor", "github.com/digitalSloth/go-executor/cmd/worker-wasm")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/digitalSloth/go-executor/cmd/executor", "github.com/digitalSloth/go-executor/cmd/worker-wasm", "github.com/digitalSloth/go-executor/cmd/gateway")
 	cmd.Env = append(os.Environ(), "GOFLAGS=")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build the executor and worker: %v\n%s", err, out)
+		t.Fatalf("build the executor, worker and gateway: %v\n%s", err, out)
 	}
-	return filepath.Join(bin, "executor"), filepath.Join(bin, "worker-wasm")
+	return filepath.Join(bin, "executor"), filepath.Join(bin, "worker-wasm"), filepath.Join(bin, "gateway")
 }
 
 // writeConfig writes the executor's key and configuration under dir.
@@ -647,13 +670,23 @@ func (e *executor) stop() {
 
 // logHas reports whether the executor's log contains s.
 func (e *executor) logHas(s string) bool {
-	b, err := os.ReadFile(e.log)
+	return logHas(e.log, s)
+}
+
+// logHas reports whether the file at path contains s.
+func logHas(path, s string) bool {
+	b, err := os.ReadFile(path)
 	return err == nil && bytes.Contains(b, []byte(s))
 }
 
 // tail returns the last n lines of the executor's log.
 func (e *executor) tail(n int) string {
-	b, err := os.ReadFile(e.log)
+	return logTail(e.log, n)
+}
+
+// logTail returns the last n lines of the file at path.
+func logTail(path string, n int) string {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("(log unreadable: %v)", err)
 	}

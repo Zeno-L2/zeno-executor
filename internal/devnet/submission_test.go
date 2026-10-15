@@ -23,7 +23,7 @@ import (
 func TestSubmissionOnDevnet(t *testing.T) {
 	t.Logf("phase 1: setup")
 	d := newDevnet(t)
-	executorBin, workerBin := buildBinaries(t, d.dir)
+	executorBin, workerBin, gatewayBin := buildBinaries(t, d.dir)
 	configPath, storage := writeConfig(t, d.dir, workerBin)
 	d.setup()
 	d.setRelayPause(true)
@@ -52,6 +52,9 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	}
 
 	e2 := d.startExecutor("executor-2", executorBin, configPath)
+	local := d.startGateway("gateway-local", gatewayBin, writeGatewayConfig(t, d.dir, "gateway-local", map[string]any{
+		"domainId": domainID, "source": "LOCAL", "executorStoragePath": storage, "workerBinary": workerBin,
+	}))
 	d.waitFor("batch 0 outcome", momenta(20), func() (bool, string, error) {
 		log := sendLog(t, storage)
 		return len(log) >= 2, fmt.Sprintf("%d submission log records", len(log)), nil
@@ -87,6 +90,7 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	t.Logf("phase 3: the submit pause and a PAUSED domain")
 	d.setDomainPause(true)
 	d.deposit(2)
+	call := d.callL2(3)
 	d.setDomainStatus(definition.DomainStatusPaused)
 	d.waitFor("gate warning for batch 1", momenta(15), func() (bool, string, error) {
 		return e2.logHas("domain 1 batch 1 not sent") && e2.logHas("submit pause for domain 1 is set"), "no gate warning in the executor log", nil
@@ -98,22 +102,29 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	if log := sendLog(t, storage); len(log) != 2 {
 		t.Fatalf("submission log holds %d records while the submit pause holds, want 2: %+v", len(log), log)
 	}
+	pend := d.waitReceipt(local, call, "pending", momenta(15))
+	callBatch := pend.BatchID
+	if callBatch != 1 && callBatch != 2 {
+		t.Fatalf("the CallL2 is in batch %d, want batch 1 or 2", callBatch)
+	}
+	t.Logf("phase 3: the CallL2 is in batch %d", callBatch)
 	d.setDomainPause(false)
-	d.waitFor("batch 1 outcome", momenta(20), func() (bool, string, error) {
+	d.waitFor("every batch of phase 3 resolved", momenta(20*callBatch), func() (bool, string, error) {
 		log := sendLog(t, storage)
-		return len(log) >= 4, fmt.Sprintf("%d submission log records", len(log)), nil
+		return uint64(len(log)) >= 2+2*callBatch, fmt.Sprintf("%d submission log records", len(log)), nil
 	})
 	r = sendLog(t, storage)
-	if r[2].BatchID != 1 || r[2].Height != 3 || r[2].Outcome != "" {
-		t.Fatalf("third record is %+v, want the unresolved send of batch 1 at account height 3", r[2])
+	wantLog := expectedLog(callBatch)
+	if err := checkLog(r[:len(wantLog)], wantLog); err != nil {
+		t.Fatal(err)
 	}
-	if r[3].Hash != r[2].Hash || r[3].Outcome != supervisor.OutcomeAccepted {
-		t.Fatalf("fourth record is %+v, want the accepted outcome of %s", r[3], r[2].Hash)
+	for b := uint64(1); b <= callBatch; b++ {
+		v = d.checkAccepted(b, r[2*b])
 	}
-	v = d.checkAccepted(1, r[2])
 	if rec, ok, err := v.DomainRecord(domainID); err != nil || !ok || rec.Status != definition.DomainStatusPaused {
 		t.Fatalf("domain record is %+v (present %v, error %v), want status PAUSED", rec, ok, err)
 	}
+	d.waitReceipt(local, call, "latest", momenta(confirmationDepth+10))
 	d.setDomainStatus(definition.DomainStatusActive)
 
 	// Phase 4: an aligned re-sync.
@@ -126,22 +137,21 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	if _, err := os.Stat(domainDir); !os.IsNotExist(err) {
 		t.Fatalf("%s still exists after removal (stat error %v)", domainDir, err)
 	}
+	last := callBatch + 1
 	d.startExecutor("executor-3", executorBin, configPath)
-	d.deposit(3)
-	d.waitFor("batch 2 outcome", momenta(40), func() (bool, string, error) {
+	d.deposit(4)
+	d.waitFor(fmt.Sprintf("batch %d outcome", last), momenta(40), func() (bool, string, error) {
 		log := sendLog(t, storage)
-		return len(log) >= 6, fmt.Sprintf("%d submission log records", len(log)), nil
+		return uint64(len(log)) >= 2*(last+1), fmt.Sprintf("%d submission log records", len(log)), nil
 	})
 	r = sendLog(t, storage)
-	if r[4].BatchID != 2 || r[4].Height != 4 {
-		t.Fatalf("fifth record is %+v, want batch 2 at account height 4", r[4])
+	if err := checkLog(r[:2*(last+1)], expectedLog(last)); err != nil {
+		t.Fatal(err)
 	}
-	if r[5].Hash != r[4].Hash || r[5].Outcome != supervisor.OutcomeAccepted {
-		t.Fatalf("sixth record is %+v, want the accepted outcome of %s", r[5], r[4].Hash)
-	}
-	v = d.checkAccepted(2, r[4])
-	// Every state root in this run is the zero hash, so acceptance of batch 2 proves input
-	// continuity only. The rebuilt records must also match Settlement's accepted entries.
+	v = d.checkAccepted(last, r[2*last])
+	// Every state root in this run is the zero hash, so acceptance of
+	// the last batch proves input continuity only. The rebuilt records
+	// must also match Settlement's accepted entries.
 	layout, err := recovery.NewLayout(storage, domainID)
 	if err != nil {
 		t.Fatalf("open the domain layout: %v", err)
@@ -150,10 +160,10 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list the rebuilt batch records: %v", err)
 	}
-	if len(records) < 3 {
-		t.Fatalf("rebuilt batch records are %+v, want records for batches 0, 1 and 2", records)
+	if uint64(len(records)) < last+1 {
+		t.Fatalf("rebuilt batch records are %+v, want records for batches 0 to %d", records, last)
 	}
-	for id := uint64(0); id < 3; id++ {
+	for id := uint64(0); id <= last; id++ {
 		rec := records[id]
 		if rec.BatchID != id {
 			t.Fatalf("rebuilt record %d has batch id %d", id, rec.BatchID)
@@ -170,27 +180,21 @@ func TestSubmissionOnDevnet(t *testing.T) {
 			t.Fatalf("rebuilt batch %d differs from Settlement's accepted entry: %v", id, err)
 		}
 	}
-	if h := d.executorHeight(); h != 4 {
-		t.Fatalf("executor address is at account height %d, want 4", h)
+	if h := d.executorHeight(); h != 2+last {
+		t.Fatalf("executor address is at account height %d, want %d", h, 2+last)
 	}
-	wantLog := []struct {
-		batch   uint64
-		height  uint64
-		outcome supervisor.Outcome
-	}{{0, 2, ""}, {0, 2, supervisor.OutcomeAccepted}, {1, 3, ""}, {1, 3, supervisor.OutcomeAccepted}, {2, 4, ""}, {2, 4, supervisor.OutcomeAccepted}}
-	r = sendLog(t, storage)
-	if len(r) != len(wantLog) {
-		t.Fatalf("submission log holds %d records, want %d: %+v", len(r), len(wantLog), r)
+	if err := checkLog(sendLog(t, storage), expectedLog(last)); err != nil {
+		t.Fatal(err)
 	}
-	for i, w := range wantLog {
-		if r[i].BatchID != w.batch || r[i].Height != w.height || r[i].Outcome != w.outcome {
-			t.Fatalf("record %d is %+v, want batch %d at account height %d with outcome %q", i, r[i], w.batch, w.height, w.outcome)
-		}
-		if i%2 == 1 && r[i].Hash != r[i-1].Hash {
-			t.Fatalf("record %d has hash %s, want the hash %s of its send record", i, r[i].Hash, r[i-1].Hash)
-		}
-	}
+	d.waitReceipt(local, call, "finalized", momenta(withdrawalDelay+confirmationDepth+10))
+	d.waitHeadOK(local, momenta(5))
+	remote := d.startGateway("gateway-remote", gatewayBin, writeGatewayConfig(t, d.dir, "gateway-remote", map[string]any{
+		"domainId": domainID, "source": "REMOTE", "upstreams": []string{local.url}, "workerBinary": workerBin,
+	}))
 	t.Logf("phase 5: withdrawals")
-	d.withdrawalPhase(storage)
+	d.withdrawalPhase(storage, last)
+	d.compareGateways(local, remote, last)
+	remote.stop()
+	local.stop()
 	d.exec.stop()
 }

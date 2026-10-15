@@ -41,10 +41,15 @@ func newStore(leaves map[trie.Path][]byte, log *os.File) *Store {
 // Open loads path's write-ahead log, creating it if absent, replaying every well-formed
 // record into memory. A torn trailing record — the signature of a crash mid-append — is
 // discarded rather than treated as corruption; any other malformed record is a hard error.
+// The open sets the log to mode 0600, whatever its mode was.
 func Open(path string) (*Store, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("state: open %s: %w", path, err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("state: chmod %s: %w", path, err)
 	}
 
 	leaves, validLen, err := replayLog(f)

@@ -18,16 +18,17 @@ import (
 // withdrawalPhase clears domain 1's relay pause and checks that the
 // running executor registers each deposit's refund exactly once,
 // releases it, and that Settlement pays it to the depositor.
-func (d *devnet) withdrawalPhase(storage string) {
+func (d *devnet) withdrawalPhase(storage string, last uint64) {
 	t := d.t
 	t.Helper()
+	batches := last + 1
 
 	from := len(sendLog(t, storage))
-	if from != 6 {
-		t.Fatalf("the submission log holds %d records before the relay pause clears, want 6", from)
+	if uint64(from) != 2*batches {
+		t.Fatalf("the submission log holds %d records before the relay pause clears, want %d", from, 2*batches)
 	}
-	if n := withdrawalFiles(t, storage); n != 3 {
-		t.Fatalf("the withdrawals store holds %d batch files before the relay pause clears, want 3", n)
+	if n := withdrawalFiles(t, storage); uint64(n) != batches {
+		t.Fatalf("the withdrawals store holds %d batch files before the relay pause clears, want %d", n, batches)
 	}
 	frontier, err := d.c.FrontierAccountBlock(types.SettlementContract)
 	if err != nil || frontier == nil {
@@ -111,15 +112,15 @@ func (d *devnet) withdrawalPhase(storage string) {
 		}
 		releases++
 	}
-	if len(relays) != 3 || !seenBatch[0] || !seenBatch[1] || !seenBatch[2] {
-		t.Fatalf("the log holds %d relay sends for batches %v, want one each for batches 0, 1 and 2: %+v", len(relays), seenBatch, r)
+	if len(relays) != 3 || !seenBatch[0] || !seenBatch[1] || !seenBatch[last] {
+		t.Fatalf("the log holds %d relay sends for batches %v, want one each for batches 0, 1 and %d: %+v", len(relays), seenBatch, last, r)
 	}
 	if releases < 1 {
 		t.Fatalf("the log holds no ReleaseWithdrawals send: %+v", r)
 	}
 	blocks := map[types.Hash]*nom.AccountBlock{}
 	for i, s := range sends {
-		if want := 5 + uint64(i); s.Height != want {
+		if want := 2 + batches + uint64(i); s.Height != want {
 			t.Fatalf("send %d is %+v, want account height %d", i, s, want)
 		}
 		b, err := d.c.AccountBlockAtHeight(executorAddress, s.Height)
@@ -131,7 +132,7 @@ func (d *devnet) withdrawalPhase(storage string) {
 		}
 		blocks[s.Hash] = b
 	}
-	if h, want := d.executorHeight(), 4+uint64(len(sends)); h != want {
+	if h, want := d.executorHeight(), 1+batches+uint64(len(sends)); h != want {
 		t.Fatalf("executor address is at account height %d, want %d for %d sends", h, want, len(sends))
 	}
 

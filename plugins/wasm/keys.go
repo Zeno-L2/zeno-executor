@@ -14,18 +14,11 @@ import (
 // never by prefix, so a contract keying its own state by a zero-padded big-endian integer
 // never collides with the reserved space.
 var (
-	// keyCodeHash is the post-instrumentation CodeHash (§11.4); its presence means "deployed".
-	keyCodeHash = []byte{0x00, 0x01}
-	// keyPreCodeHash is the pre-instrumentation code_hash, locating the assembled module in the
-	// local code store.
-	keyPreCodeHash = []byte{0x00, 0x02}
-	// keyUpgradePolicy is 0 = IMMUTABLE, 1 = OWNER_UPGRADEABLE.
-	keyUpgradePolicy = []byte{0x00, 0x03}
-	// keyOwner is the caller-domain owner identity; absent unless the policy is
-	// OWNER_UPGRADEABLE.
-	keyOwner = []byte{0x00, 0x04}
-	// keyQuota is the storage quota leaf: purchased:u64 || used:u64, both big-endian (§13.8).
-	keyQuota = []byte{0x00, 0x05}
+	keyCodeHash      = keys.CodeHash
+	keyPreCodeHash   = keys.PreCodeHash
+	keyUpgradePolicy = keys.UpgradePolicy
+	keyOwner         = keys.Owner
+	keyQuota         = keys.Quota
 )
 
 var reservedKeys = [][]byte{keyCodeHash, keyPreCodeHash, keyUpgradePolicy, keyOwner, keyQuota}

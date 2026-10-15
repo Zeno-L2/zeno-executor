@@ -656,7 +656,7 @@ func Rollback(cfg Config, forkParent uint64) (Ready, error) {
 
 	pos := chosen.pos
 	enter(fmt.Sprintf("ROLLBACK to momentum height %d", pos.MomentumHeight))
-	if err := writeJSON(cfg.Layout.Cursor, pos); err != nil {
+	if err := writeJSON(cfg.Layout.Cursor, pos, privateFileMode); err != nil {
 		return Ready{}, fmt.Errorf("recovery: write cursor: %w", err)
 	}
 	if err := PruneAbove(cfg.Layout, pos); err != nil {

@@ -172,6 +172,7 @@ func TestDriverEndToEndThroughWasmPlugin(t *testing.T) {
 		Store:        store,
 		Inputs:       &fakeInputSource{inputs: inputs},
 		Bundles:      newFakeBundleStore(),
+		Receipts:     newFakeReceiptStore(),
 		FirstBatchID: 1,
 	}
 	d, err := New(cfg)
@@ -323,6 +324,7 @@ func TestDriverOwnershipLifecycleReplaysFromDA(t *testing.T) {
 		Store:        store,
 		Inputs:       &fakeInputSource{inputs: inputs},
 		Bundles:      newFakeBundleStore(),
+		Receipts:     newFakeReceiptStore(),
 		FirstBatchID: 1,
 	}
 	d, err := New(cfg)

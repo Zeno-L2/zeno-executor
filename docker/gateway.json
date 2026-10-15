@@ -1,0 +1,16 @@
+{
+  "znndEndpoint": "http://znnd:35997",
+  "networkName": "devnet",
+  "confirmationDepth": 10,
+  "storagePath": "/var/lib/gateway",
+  "listenAddress": "0.0.0.0:35999",
+  "domains": [
+    {
+      "domainId": 1,
+      "source": "LOCAL",
+      "executorStoragePath": "/var/lib/executor",
+      "workerBinary": "/usr/local/bin/worker-wasm"
+    }
+  ],
+  "simulation": { "maxConcurrent": 1 }
+}

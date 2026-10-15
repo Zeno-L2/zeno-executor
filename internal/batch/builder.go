@@ -205,7 +205,9 @@ func encodeAll[T any](items []T, encode func(T) ([]byte, error)) ([][]byte, erro
 }
 
 // assemble builds and self-verifies the batch over records, which MUST be non-empty. batchID is
-// d.batchID; it advances only once assemble succeeds (NextBatch's responsibility).
+// d.batchID; it advances only once assemble succeeds (NextBatch's responsibility). It stores the
+// batch's receipt sidecar after its bundle, so both exist before the caller commits a record
+// naming them (EXECUTOR §16).
 func (d *Driver) assemble(records []applied) (Batch, error) {
 	if len(records) == 0 {
 		return Batch{}, fmt.Errorf("batch: assemble: no records")
@@ -278,6 +280,15 @@ func (d *Driver) assemble(records []applied) (Batch, error) {
 		return Batch{}, err
 	}
 
+	receiptRoot := codec.MerkleRoot(receiptElems)
+	sidecar, err := codec.EncodeReceiptSidecar(receipts)
+	if err != nil {
+		return Batch{}, fmt.Errorf("batch: encode receipt sidecar: %w", err)
+	}
+	if err := d.cfg.Receipts.Put(daHash, receiptRoot, sidecar); err != nil {
+		return Batch{}, fmt.Errorf("batch: receipt store put: %w", err)
+	}
+
 	first, last := records[0], records[len(records)-1]
 
 	commitment := codec.BatchCommitment{
@@ -299,7 +310,7 @@ func (d *Driver) assemble(records []applied) (Batch, error) {
 		PreStateRoot:      first.preStateRoot,
 		PostStateRoot:     last.postStateRoot,
 		InputRoot:         codec.MerkleRoot(inputElems),
-		ReceiptRoot:       codec.MerkleRoot(receiptElems),
+		ReceiptRoot:       receiptRoot,
 		EventRoot:         codec.MerkleRoot(allEventElems),
 		OutboxRoot:        codec.MerkleRoot(allOutboxElems),
 		DAHash:            daHash,

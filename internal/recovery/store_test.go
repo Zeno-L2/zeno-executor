@@ -271,7 +271,7 @@ func TestCursorRoundTrip(t *testing.T) {
 		t.Fatalf("ReadCursor on an empty tree = ok %v, err %v", ok, err)
 	}
 	want := Position{LastInputSeq: 5, PostStateRoot: types.Hash{1}, MomentumHeight: 9, MomentumHash: types.Hash{2}, NextOrdinal: 11, NextBatchID: 3}
-	if err := writeJSON(cfg.Layout.Cursor, want); err != nil {
+	if err := writeJSON(cfg.Layout.Cursor, want, privateFileMode); err != nil {
 		t.Fatal(err)
 	}
 	got, ok, err := ReadCursor(cfg.Layout)
@@ -333,13 +333,13 @@ func TestBundleStorePutRejectsMismatchedHash(t *testing.T) {
 func TestListBatchRecordsSkipsContentIDMismatch(t *testing.T) {
 	cfg := testConfig(t, 4)
 	for _, id := range []uint64{1, 2, 3} {
-		if err := writeJSON(batchPath(cfg.Layout, id), BatchRecord{BatchID: id, Status: StatusBuilt}); err != nil {
+		if err := writeJSON(batchPath(cfg.Layout, id), BatchRecord{BatchID: id, Status: StatusBuilt}, readFileMode); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// File named for id 2 decodes a record claiming a different BatchID: a partial overwrite or a
 	// stray file must not shadow the record its name promises.
-	if err := writeJSON(batchPath(cfg.Layout, 2), BatchRecord{BatchID: 99, Status: StatusBuilt}); err != nil {
+	if err := writeJSON(batchPath(cfg.Layout, 2), BatchRecord{BatchID: 99, Status: StatusBuilt}, readFileMode); err != nil {
 		t.Fatal(err)
 	}
 	recs, err := ListBatchRecords(cfg.Layout)
@@ -358,7 +358,7 @@ func TestListBatchRecordsSkipsContentIDMismatch(t *testing.T) {
 func TestListBatchRecordsNumericOrder(t *testing.T) {
 	cfg := testConfig(t, 4)
 	for _, id := range []uint64{12, 3, 0, 11, 2, 10, 1, 9, 100} {
-		if err := writeJSON(batchPath(cfg.Layout, id), BatchRecord{BatchID: id, Status: StatusBuilt}); err != nil {
+		if err := writeJSON(batchPath(cfg.Layout, id), BatchRecord{BatchID: id, Status: StatusBuilt}, readFileMode); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -658,14 +658,14 @@ func mustMarshal(t *testing.T, v any) []byte {
 func TestWriteFileAtomicSyncsDirectory(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
-	if err := writeFileAtomic(path, []byte("first")); err != nil {
+	if err := writeFileAtomic(path, []byte("first"), privateFileMode); err != nil {
 		t.Fatalf("writeFileAtomic: %v", err)
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != "first" {
 		t.Fatalf("read back = %q, %v", got, err)
 	}
 	// A second write exercises the rename-over-existing-file path the same directory sync guards.
-	if err := writeFileAtomic(path, []byte("second")); err != nil {
+	if err := writeFileAtomic(path, []byte("second"), privateFileMode); err != nil {
 		t.Fatalf("second writeFileAtomic: %v", err)
 	}
 	if got, err := os.ReadFile(path); err != nil || string(got) != "second" {
@@ -755,3 +755,78 @@ func bundleFor(t *testing.T, cfg Config, index uint64, postRoot types.Hash) type
 }
 
 func jsonBytes(v any) ([]byte, error) { return json.Marshal(v) }
+
+func TestResolveLayout(t *testing.T) {
+	dir := t.TempDir()
+	storage := filepath.Join(dir, "s")
+	got := ResolveLayout(storage, 7)
+	if _, err := os.Stat(storage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ResolveLayout created %s: %v", storage, err)
+	}
+	want, err := NewLayout(storage, 7)
+	if err != nil {
+		t.Fatalf("NewLayout: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveLayout = %+v, NewLayout = %+v", got, want)
+	}
+}
+
+func TestReadBatchRecord(t *testing.T) {
+	l, err := NewLayout(t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("NewLayout: %v", err)
+	}
+	if _, ok, err := ReadBatchRecord(l, 3); ok || err != nil {
+		t.Fatalf("absent record: ok %v, err %v", ok, err)
+	}
+	want := BatchRecord{BatchID: 3, DAHash: types.Hash{1}}
+	if err := writeJSON(batchPath(l, 3), want, readFileMode); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+	got, ok, err := ReadBatchRecord(l, 3)
+	if err != nil || !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("read back: %+v, ok %v, err %v", got, ok, err)
+	}
+	if err := writeJSON(batchPath(l, 4), BatchRecord{BatchID: 5}, readFileMode); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+	if _, ok, err := ReadBatchRecord(l, 4); ok || err != nil {
+		t.Fatalf("mismatched batchId: ok %v, err %v", ok, err)
+	}
+	missing := ResolveLayout(filepath.Join(t.TempDir(), "none"), 1)
+	if _, ok, err := ReadBatchRecord(missing, 0); ok || err != nil {
+		t.Fatalf("missing directory: ok %v, err %v", ok, err)
+	}
+}
+
+func TestStorePathsMatchHelpers(t *testing.T) {
+	l, err := NewLayout(t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("NewLayout: %v", err)
+	}
+	bundles, err := NewBundleStore(l.Bundles)
+	if err != nil {
+		t.Fatalf("NewBundleStore: %v", err)
+	}
+	b := []byte("bundle bytes")
+	var h types.Hash
+	copy(h[:], crypto.Hash(b))
+	if err := bundles.Put(h, b); err != nil {
+		t.Fatalf("Put bundle: %v", err)
+	}
+	if _, err := os.Stat(BundlePath(l.Bundles, h)); err != nil {
+		t.Fatalf("bundle file: %v", err)
+	}
+	receipts, err := NewReceiptStore(l.Receipts)
+	if err != nil {
+		t.Fatalf("NewReceiptStore: %v", err)
+	}
+	sidecar, root := sidecarFor(t, 1)
+	if err := receipts.Put(h, root, sidecar); err != nil {
+		t.Fatalf("Put receipts: %v", err)
+	}
+	if _, err := os.Stat(ReceiptsPath(l.Receipts, h)); err != nil {
+		t.Fatalf("receipt file: %v", err)
+	}
+}

@@ -29,7 +29,7 @@ func (r *Reader) MaxBatchWithdrawal(domainID uint32, height uint64, hash types.H
 		return codec.U256{}, fmt.Errorf("settlement: StateRootSpork is not active at height %d (momentum version %d)", height, m.Version)
 	}
 	// Build the view from this momentum: a second fetch could return a different momentum.
-	v := &View{Height: height, c: r.c, root: m.StateRoot}
+	v := &View{Height: height, c: r.c, root: m.StateRoot, time: m.TimestampUnix}
 
 	cfg, ok, err := v.AssetConfig(domainID, types.Hash(asset))
 	if err != nil {

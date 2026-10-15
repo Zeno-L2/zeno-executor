@@ -3,12 +3,12 @@ package wasm
 import (
 	"fmt"
 
-	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
 	"github.com/digitalSloth/go-executor/domain"
 	"github.com/digitalSloth/go-executor/internal/codec"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/engine"
+	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
@@ -135,7 +135,7 @@ func buildFrame(chainID types.Hash, ctx domain.InputContext, args callArgs, code
 
 // callerHash is the §9.2/§27.0/§14.1 L1 caller identity: SHA3-256("L1_CALLER:" || raw 20 address bytes).
 func callerHash(addr types.Address) types.Hash {
-	return hashOf(crypto.Hash([]byte("L1_CALLER:"), addr[:]))
+	return keys.Caller(addr)
 }
 
 // loadInstrumented returns the instrumented module for codeHash, re-deriving it from the
