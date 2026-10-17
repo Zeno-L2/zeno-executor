@@ -223,6 +223,7 @@ func simEcho(si simInput) domain.Effects {
 	data := binary.BigEndian.AppendUint64(nil, g)
 	data = binary.BigEndian.AppendUint64(data, si.ctx.MomentumHeight)
 	data = binary.BigEndian.AppendUint64(data, si.ctx.MomentumTime)
+	data = append(data, si.ctx.MomentumHash[:]...)
 	data = append(data, si.ctx.L1Sender[:]...)
 	return domain.Effects{
 		Status:         codec.StatusSuccess,

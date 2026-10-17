@@ -3,7 +3,6 @@ package batch
 import (
 	"encoding/binary"
 	"fmt"
-	"path/filepath"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -24,10 +23,7 @@ func be8(i int) []byte {
 // growing state imposes on every absent-key input regardless of the plasma_limit it is charged.
 func BenchmarkAbsentKeyWitness(b *testing.B) {
 	for _, n := range []int{1000, 100000, 1000000} {
-		store, err := state.Open(filepath.Join(b.TempDir(), "state.wal"))
-		if err != nil {
-			b.Fatalf("state.Open: %v", err)
-		}
+		store := state.OpenEmpty()
 
 		leaves := make([]domain.StateDiffEntry, n)
 		for i := 0; i < n; i++ {

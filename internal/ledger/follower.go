@@ -37,21 +37,22 @@ type MomentumSource interface {
 type Config struct {
 	// DomainID is the domain whose subsequence this follower emits.
 	DomainID uint32
-	// ConfirmationDepth is how many momenta behind the frontier are treated as confirmed
-	// (SPEC §4.3). It MUST be at least 1.
+	// ConfirmationDepth is how many momenta behind the frontier are
+	// treated as confirmed. It MUST be at least 1.
 	ConfirmationDepth uint64
 	// StartHeight is the first momentum height to read. Momentum heights are 1-based, so it
 	// MUST be at least 1.
 	StartHeight uint64
-	// StartOrdinal is the domain ordinal of the first input Settlement admits for DomainID
-	// at or above StartHeight: the next expected ordinal (SPEC §4.6). It is 0 for a fresh
-	// stream.
+	// StartOrdinal is the domain ordinal of the first input Settlement
+	// admits for DomainID at or above StartHeight: the next expected
+	// ordinal. It is 0 for a fresh stream.
 	//
-	// Resume is momentum-granular: StartHeight is the momentum after the resume point and
-	// StartOrdinal is that Checkpoint's NextOrdinal. A batch boundary MAY fall inside a
-	// momentum (SPEC §4.6), so a resumed follower can re-emit inputs the caller has already
-	// committed. The Follower does not detect or reconcile that: dropping them belongs to the
-	// caller's checkpoint/resume logic.
+	// Resume is momentum-granular: StartHeight is the momentum after
+	// the resume point and StartOrdinal is that Checkpoint's
+	// NextOrdinal. A batch boundary MAY fall inside a momentum, so a
+	// resumed follower can re-emit inputs the caller has already
+	// committed. The Follower does not detect or reconcile that:
+	// dropping them belongs to the caller's checkpoint/resume logic.
 	StartOrdinal uint64
 	// MaxBufferedInputs bounds how many inputs one refill buffers. Once the buffer holds at
 	// least this many, refill stops processing the current ranged read at that momentum
@@ -202,8 +203,8 @@ func (f *Follower) pop() (Input, bool) {
 	return in, true
 }
 
-// drainTerminal implements steps 2-3 of Next against an empty buffer: the permanent latch,
-// then the one-shot pending reorg.
+// drainTerminal handles Next's terminal states against an empty buffer:
+// the permanent latch, then the one-shot pending reorg.
 func (f *Follower) drainTerminal() (Input, bool, error, bool) {
 	if f.halted != nil {
 		return Input{}, false, f.halted, true
@@ -216,26 +217,29 @@ func (f *Follower) drainTerminal() (Input, bool, error, bool) {
 	return Input{}, false, nil, false
 }
 
-// LastEmittedIndex returns the globalInputIndex of the last input Next returned. ok is false
-// before the first input. This is the follower's own read cursor; it is not SPEC's
-// lastInputSeq, which is the per-domain cursor Settlement stores when it accepts a batch, and
-// nothing in this package commits or transmits it.
+// LastEmittedIndex returns the globalInputIndex of the last input Next
+// returned. ok is false before the first input. This is the follower's
+// own read cursor; it is not lastInputSeq, the per-domain cursor
+// Settlement stores when it accepts a batch, and nothing in this
+// package commits or transmits it.
 func (f *Follower) LastEmittedIndex() (index uint64, ok bool) {
 	return f.cursor, f.cursorSet
 }
 
-// ConsumedMomentum is one momentum a Follower has fully walked, in the shape EXECUTOR §16's
-// momentum_hashes/ records it.
+// ConsumedMomentum is one momentum a Follower has fully walked, in the
+// shape recovery's momentum_hashes/ window records it.
 type ConsumedMomentum struct {
 	Height uint64
 	Hash   types.Hash
 }
 
-// RecentMomenta returns the momenta this Follower has most recently consumed, ascending by
-// height and contiguous — a Follower consumes every confirmed momentum in order, including one
-// holding nothing for its domain — at most ConfirmationDepth+1 entries. The caller persists it:
-// a Follower's link check lives in memory and cannot see a reorg that landed while the process
-// was down, and a window this long is exactly the depth within which §14 permits a rollback.
+// RecentMomenta returns the momenta this Follower has most recently
+// consumed, ascending by height and contiguous (a Follower consumes
+// every confirmed momentum in order, including one holding nothing for
+// its domain), at most ConfirmationDepth+1 entries. The caller persists
+// it: a Follower's link check lives in memory and cannot see a reorg
+// that landed while the process was down, and a window this long is
+// exactly the depth within which a rollback is permitted.
 func (f *Follower) RecentMomenta() []ConsumedMomentum {
 	return append([]ConsumedMomentum(nil), f.recent...)
 }
@@ -259,10 +263,11 @@ func (f *Follower) Checkpoint() (Checkpoint, bool) {
 	return Checkpoint{Height: f.lastHeight, Hash: f.lastHash, NextOrdinal: f.nextOrdinal}, true
 }
 
-// ErrSourceRead reports that a MomentumSource or AssignmentSource read failed, or that the
-// source could not back an entry's send momentum. It is the machine-readable form of the
-// unlatched error class Next documents: nothing advanced and nothing latched, so the caller
-// may retry, which EXECUTOR §15 requires for an unavailable znnd.
+// ErrSourceRead reports that a MomentumSource or AssignmentSource read
+// failed, or that the source could not back an entry's send momentum.
+// It is the machine-readable form of the unlatched error class Next
+// documents: nothing advanced and nothing latched, so the caller may
+// retry, as an unavailable znnd calls for.
 var ErrSourceRead = errors.New("ledger: momentum source read")
 
 // ReorgError reports that the ledger no longer extends the last momentum this follower
@@ -352,9 +357,10 @@ func (f *Follower) refill() error {
 				return err
 			}
 			if ceilingExceeded {
-				// Not malformed content: the source returned a momentum beyond what count
-				// asked for. Stop this call without an error, the same as reaching the
-				// ceiling before this momentum was ever read — see Edge cases.
+				// Not malformed content: the source returned a momentum
+				// beyond what count asked for. Stop this call without
+				// an error, the same as reaching the ceiling before
+				// this momentum was ever read.
 				return nil
 			}
 			if !stop && f.limited && len(f.buf) > 0 && f.buf[len(f.buf)-1].Ctx.GlobalInputIndex >= f.limit {
@@ -371,16 +377,19 @@ func (f *Follower) refill() error {
 	return nil
 }
 
-// processMomentum validates dm, checks the link, cross-checks its account-blocks against its
-// content, reads Settlement's assignment for it and commits the resulting inputs atomically.
-// read holds the momenta of the same ranged read that precede dm, and lk is the read's linked
-// record (see linked). It reports stop == true when
-// the refill loop must not process any further momentum this call: either a *ReorgError landed
-// in pendingReorg, or a fault landed in halted. A non-nil err is a read failure matching
-// ErrSourceRead: nothing changed, and the caller retries. ceilingExceeded == true is
-// a distinct, non-error outcome (see Edge cases): the momentum's height is beyond what the
-// requested window's count should ever have returned, so nothing here failed validation — the
-// refill simply stops, exactly as if the ceiling had been reached before this entry was read.
+// processMomentum validates dm, checks the link, cross-checks its
+// account-blocks against its content, reads Settlement's assignment for
+// it and commits the resulting inputs atomically. read holds the
+// momenta of the same ranged read that precede dm, and lk is the read's
+// linked record (see linked). It reports stop == true when the refill
+// loop must not process any further momentum this call: either a
+// *ReorgError landed in pendingReorg, or a fault landed in halted. A
+// non-nil err is a read failure matching ErrSourceRead: nothing
+// changed, and the caller retries. ceilingExceeded == true is a
+// distinct, non-error outcome: the momentum's height is beyond what the
+// requested window's count should ever have returned, so nothing here
+// failed validation. The refill simply stops, exactly as if the ceiling
+// had been reached before this entry was read.
 func (f *Follower) processMomentum(dm *nom.DetailedMomentum, ceiling uint64, read []*nom.DetailedMomentum, lk *linked) (stop, ceilingExceeded bool, err error) {
 	if dm == nil {
 		f.halted = errors.New("ledger: momentum entry is nil")

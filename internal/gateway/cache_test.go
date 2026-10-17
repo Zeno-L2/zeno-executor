@@ -52,18 +52,18 @@ func exists(path string) bool {
 
 func TestDiscardCache(t *testing.T) {
 	storage := t.TempDir()
-	for _, f := range []string{"1/snapshots/a", "1/state/wal", "1/index/b", "1/bundles/c", "1/receipts/d", "2/snapshots/e", "keep.txt"} {
+	for _, f := range []string{"1/snapshots/a", "1/index/b", "1/bundles/c", "1/receipts/d", "1/state/wal", "2/snapshots/e", "keep.txt"} {
 		mkfile(t, filepath.Join(storage, f))
 	}
 	if err := discardCache(storage, 1); err != nil {
 		t.Fatalf("discardCache: %v", err)
 	}
-	for _, gone := range []string{"1/snapshots", "1/state", "1/index"} {
+	for _, gone := range []string{"1/snapshots", "1/index"} {
 		if exists(filepath.Join(storage, gone)) {
 			t.Errorf("%s still exists", gone)
 		}
 	}
-	for _, kept := range []string{"1", "1/bundles/c", "1/receipts/d", "2/snapshots/e", "keep.txt"} {
+	for _, kept := range []string{"1", "1/bundles/c", "1/receipts/d", "1/state/wal", "2/snapshots/e", "keep.txt"} {
 		if !exists(filepath.Join(storage, kept)) {
 			t.Errorf("%s was removed", kept)
 		}
@@ -238,7 +238,7 @@ func TestOpenChainDiscards(t *testing.T) {
 			if err != nil || len(infos) != 1 || binary.BigEndian.Uint64(infos[0].Header.Meta) != 2 {
 				t.Fatalf("after the poll: snapshots %v, %v; want one tagged 2", infos, err)
 			}
-			store, err := state.OpenSnapshot(filepath.Join(t.TempDir(), "wal"), snaps, infos[0].Name, fixtureSTF)
+			store, err := state.OpenSnapshot(snaps, infos[0].Name, fixtureSTF)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -168,13 +168,21 @@ func Socketpair() (supervisorEnd, workerEnd *os.File, err error) {
 // SealInheritedFDs marks every open descriptor at or above 3 close-on-exec, so only
 // descriptors an exec.Cmd explicitly passes reach a child.
 func SealInheritedFDs() error {
-	entries, err := os.ReadDir(fdDir)
+	dir, err := os.Open(fdDir)
+	if err != nil {
+		return fmt.Errorf("workerproc: seal inherited descriptors: %w", err)
+	}
+	defer dir.Close()
+
+	// Names only: a stat of each entry would hit the listing's own descriptor, which
+	// is already closed on some hosts.
+	names, err := dir.Readdirnames(-1)
 	if err != nil {
 		return fmt.Errorf("workerproc: seal inherited descriptors: %w", err)
 	}
 
-	for _, entry := range entries {
-		fd, err := strconv.Atoi(entry.Name())
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
 		if err != nil {
 			continue
 		}

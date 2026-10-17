@@ -122,7 +122,6 @@ func testConfig(t *testing.T, depth uint64) Config {
 		Layout:            l,
 		DomainID:          1,
 		ExecutorID:        "exec-1",
-		Role:              "EXECUTOR",
 		STFSpecHash:       testSTF,
 		ConfirmationDepth: depth,
 		Domain:            fakeDomain{},
@@ -153,10 +152,7 @@ type committer struct {
 
 func newCommitter(t *testing.T, cfg Config, salt byte) *committer {
 	t.Helper()
-	store, err := state.OpenEmpty(cfg.Layout.StateWAL)
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { store.Close() })
 	return &committer{t: t, cfg: cfg, store: store, salt: salt, seqMul: 1}
 }
@@ -398,9 +394,6 @@ func TestCommitWritesEverything(t *testing.T) {
 		snaps[0].info.Header.STFSpecHash != testSTF {
 		t.Fatalf("snapshots = %+v, %v", snaps, err)
 	}
-	if fi, err := os.Stat(cfg.Layout.StateWAL); err != nil || fi.Size() != 0 {
-		t.Fatalf("state log after Commit: %v, %v", fi, err)
-	}
 }
 
 func TestRetentionLadder(t *testing.T) {
@@ -567,10 +560,7 @@ func TestCommitWindowReconciliation(t *testing.T) {
 
 func TestCommitRejectsMalformedPosition(t *testing.T) {
 	cfg := testConfig(t, 4)
-	store, err := state.OpenEmpty(cfg.Layout.StateWAL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := state.OpenEmpty()
 	defer store.Close()
 
 	for name, pos := range map[string]Position{
@@ -592,10 +582,7 @@ func TestCommitRejectsMalformedPosition(t *testing.T) {
 // hash, is a committable position at any input sequence.
 func TestCommitAcceptsZeroRootAtNonzeroSeq(t *testing.T) {
 	cfg := testConfig(t, 4)
-	store, err := state.OpenEmpty(cfg.Layout.StateWAL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := state.OpenEmpty()
 	defer store.Close()
 
 	pos := Position{MomentumHeight: 1, MomentumHash: types.Hash{1}, LastInputSeq: 3}
@@ -690,10 +677,7 @@ func TestPruneAbove(t *testing.T) {
 	// Snapshots are written by hand for the two shapes no commit sequence produces.
 	writeSnap := func(pos Position, leaf byte) {
 		t.Helper()
-		s, err := state.OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := state.OpenEmpty()
 		defer s.Close()
 		if _, err := s.Apply([]domain.StateDiffEntry{{Path: leafPath(uint64(leaf)), Value: []byte{leaf}}}); err != nil {
 			t.Fatal(err)
@@ -769,6 +753,28 @@ func TestResolveLayout(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("ResolveLayout = %+v, NewLayout = %+v", got, want)
+	}
+}
+
+// NewLayout creates exactly the directories the executor writes to. A
+// domain tree has no state/ directory: the leaf set lives in memory
+// and snapshots/ holds its only durable image.
+func TestNewLayoutCreatesNoStateDirectory(t *testing.T) {
+	l, err := NewLayout(t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("NewLayout: %v", err)
+	}
+	entries, err := os.ReadDir(l.Root)
+	if err != nil {
+		t.Fatalf("read %s: %v", l.Root, err)
+	}
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Name()] = true
+	}
+	want := map[string]bool{"snapshots": true, "bundles": true, "receipts": true, "batches": true, "momentum_hashes": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("domain tree entries = %v, want %v", got, want)
 	}
 }
 

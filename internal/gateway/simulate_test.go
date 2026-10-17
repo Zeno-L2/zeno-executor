@@ -219,11 +219,16 @@ func (f fakeEnforcer) Enforcement() (bool, bool, string) { return f.limits, f.ui
 // fdCount returns the number of open descriptors of the test process.
 func fdCount(t *testing.T) int {
 	t.Helper()
-	entries, err := os.ReadDir("/dev/fd")
+	dir, err := os.Open("/dev/fd")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(entries)
+	defer dir.Close()
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(names)
 }
 
 // simRig is a chain with a Settlement view and a server over it.
@@ -237,16 +242,20 @@ type simRig struct {
 
 const simMomentumTime = 1_700_000_000
 
+var simMomentumHash = types.Hash{0x5A, 0xA5}
+
 // simChain returns history A with batch 0 accepted and finalized,
 // batches 1 and 2 accepted and batches 3 and 4 pending. The fake view
-// reads at height 10 and momentum time simMomentumTime. Latest is
-// batch 2 (last input 6) and pending batch 4 (last input 8).
+// reads at height 10, momentum time simMomentumTime and momentum hash
+// simMomentumHash. Latest is batch 2 (last input 6) and pending batch 4
+// (last input 8).
 func simChain(t *testing.T) *simRig {
 	t.Helper()
 	dir, cs := buildA(t)
 	s := newFakeSettlement()
 	s.height = 10
 	s.momentumTime = simMomentumTime
+	s.momentumHash = simMomentumHash
 	s.accept(cs[0], 5)
 	s.accept(cs[1], 20)
 	s.accept(cs[2], 21)
@@ -292,6 +301,7 @@ type simOut struct {
 	InputIndex     uint64 `json:"inputIndex"`
 	MomentumHeight uint64 `json:"momentumHeight"`
 	MomentumTime   uint64 `json:"momentumTime"`
+	MomentumHash   string `json:"momentumHash"`
 	Status         string `json:"status"`
 	GasUsed        uint64 `json:"gasUsed"`
 	AbortCode      int32  `json:"abortCode"`
@@ -588,14 +598,14 @@ func TestSimulateInputs(t *testing.T) {
 	}
 	out := simulateOK(t, r.srv, simCallJSON("", 1000), `"latest"`)
 	if out.DomainID != 1 || out.BatchID != 2 || out.PostStateRoot != r.cs[2].PostStateRoot.String() || out.Verified || !out.Simulated ||
-		out.InputIndex != 9 || out.MomentumHeight != 10 || out.MomentumTime != simMomentumTime || out.Status != "SUCCESS" ||
+		out.InputIndex != 9 || out.MomentumHeight != 10 || out.MomentumTime != simMomentumTime || out.MomentumHash != simMomentumHash.String() || out.Status != "SUCCESS" ||
 		out.ContractID != simTarget.String() || out.ReturnData != fmt.Sprintf("%x", "echo") {
 		t.Fatalf("result = %+v", out)
 	}
 	if len(out.StateDiff) != 1 || out.StateDiff[0].Value == nil || *out.StateDiff[0].Value != fmt.Sprintf("%x", echoWant) {
 		t.Fatalf("stateDiff = %+v, want the input %x", out.StateDiff, echoWant)
 	}
-	wantData := fmt.Sprintf("%x%x%x%x", be64(9), be64(10), be64(simMomentumTime), simSender[:])
+	wantData := fmt.Sprintf("%x%x%x%x%x", be64(9), be64(10), be64(simMomentumTime), simMomentumHash[:], simSender[:])
 	if len(out.Events) != 1 || out.Events[0].Data != wantData || out.Events[0].InputIndex != 9 || out.Events[0].Topics == nil {
 		t.Fatalf("events = %+v, want data %s", out.Events, wantData)
 	}
@@ -645,6 +655,35 @@ func TestSimulateInputs(t *testing.T) {
 	}
 	if p, _ := value(pC, `"latest"`); p {
 		t.Fatalf("pC at latest is present")
+	}
+}
+
+func TestSimulateMomentumHash(t *testing.T) {
+	bin := simBinaries(t)
+	r := simChain(t)
+	startSims(t, r.srv, bin, SimulationConfig{MaxConcurrent: 1}, nil)
+
+	a := simulateOK(t, r.srv, simCallJSON("", 1000), `"latest"`)
+	if a.MomentumHash != simMomentumHash.String() {
+		t.Fatalf("momentumHash = %s, want %s", a.MomentumHash, simMomentumHash)
+	}
+
+	// A poll stores a new view. The fake view reads the live
+	// settlement, so the poll keeps the test on the path a running
+	// gateway takes.
+	other := types.Hash{0xB7, 0x7B}
+	r.set.mu.Lock()
+	r.set.momentumHash = other
+	r.set.mu.Unlock()
+	requireTags(t, doPoll(t, r.r), 4, 2, 0, StatusOK)
+
+	b := simulateOK(t, r.srv, simCallJSON("", 1000), `"latest"`)
+	if b.MomentumHash != other.String() || b.MomentumHash == a.MomentumHash {
+		t.Fatalf("momentumHash after the view changed = %s, want %s (before: %s)", b.MomentumHash, other, a.MomentumHash)
+	}
+	wantData := fmt.Sprintf("%x%x%x%x%x", be64(9), be64(10), be64(simMomentumTime), other[:], simSender[:])
+	if len(b.Events) != 1 || b.Events[0].Data != wantData {
+		t.Fatalf("events = %+v, want data %s: the member must equal the hash the simulator ran with", b.Events, wantData)
 	}
 }
 
@@ -1545,10 +1584,11 @@ func simModuleCall(x types.Address, c types.Hash) string {
 
 func TestSimulateEqualsBatch(t *testing.T) {
 	d, x := types.Address{0xD1}, types.Address{0xA1}
-	c1, c2 := contractIDOf(d, 3), contractIDOf(d, 6)
+	c1, c2, c3 := contractIDOf(d, 3), contractIDOf(d, 6), contractIDOf(d, 9)
 
 	execMod := loadModule(t, "EXEC-009")
 	abortMod := loadModule(t, "CV-ABORT-1")
+	frameMod := loadModule(t, "CV-FRAME-1")
 	// The plugin faults a result blob whose input index or contract
 	// differs from the executing call's, so the module's fixed blob is
 	// rewritten to call 1's index and contract, keeping every width.
@@ -1560,7 +1600,7 @@ func TestSimulateEqualsBatch(t *testing.T) {
 	if n := bytes.Count(execMod, contract); n != 2 {
 		t.Fatalf("EXEC-009's blob names contract 0x11 x 32 %d times, want 2", n)
 	}
-	execMod = bytes.ReplaceAll(execMod, index, binary.BigEndian.AppendUint64(nil, 8))
+	execMod = bytes.ReplaceAll(execMod, index, binary.BigEndian.AppendUint64(nil, 11))
 	execMod = bytes.ReplaceAll(execMod, contract, c1[:])
 
 	plugin, err := wasm.New(wasm.Config{NetworkName: "test", CodeStorePath: t.TempDir()})
@@ -1583,7 +1623,7 @@ func TestSimulateEqualsBatch(t *testing.T) {
 			batches = append(batches, nil)
 		}
 		batches[b] = append(batches[b], ledger.Input{
-			Ctx:     domain.InputContext{GlobalInputIndex: g, L1Sender: sender, SourceData: chunk, MomentumHeight: 10, MomentumTime: simMomentumTime},
+			Ctx:     domain.InputContext{GlobalInputIndex: g, L1Sender: sender, SourceData: chunk, MomentumHeight: 10, MomentumTime: simMomentumTime, MomentumHash: simMomentumHash},
 			Payload: data,
 		})
 	}
@@ -1599,19 +1639,24 @@ func TestSimulateEqualsBatch(t *testing.T) {
 	}
 	deploy(execMod)
 	deploy(abortMod)
+	deploy(frameMod)
 	add(0, d, codec.BuyStorageArgs{ContractID: c1, Bytes: 65_536}, nil)
 	add(1, x, codec.CallL2Args{TargetContract: c1, PlasmaLimit: 10_000_000}, nil)
 	add(2, x, codec.CallL2Args{TargetContract: c2, PlasmaLimit: 10_000_000}, nil)
+	add(3, x, codec.CallL2Args{TargetContract: c3, PlasmaLimit: 10_000_000}, nil)
 
 	dir := t.TempDir()
 	cs := buildFrom(t, dir, nil, plugin, batches)
 	rec1 := readFile(t, recordPath(layoutOf(dir), 1))
+	rec2 := readFile(t, recordPath(layoutOf(dir), 2))
 	removeRecord(t, dir, 1)
 	removeRecord(t, dir, 2)
+	removeRecord(t, dir, 3)
 
 	s := newFakeSettlement()
 	s.height = 10
 	s.momentumTime = simMomentumTime
+	s.momentumHash = simMomentumHash
 	s.accept(cs[0], 100)
 	r := newIndexedChainWith(t, dir, s, senders)
 	requireTags(t, doPoll(t, r), 0, 0, -1, StatusOK)
@@ -1656,7 +1701,7 @@ func TestSimulateEqualsBatch(t *testing.T) {
 			t.Errorf("preview effects differ from the bundle record:\npreview %+v\nbatch   %+v", out, exp)
 		}
 		if out.BatchID != uint64(k-1) || out.PostStateRoot != cs[k-1].PostStateRoot.String() || out.MomentumHeight != 10 ||
-			out.MomentumTime != simMomentumTime || out.Verified || !out.Simulated {
+			out.MomentumTime != simMomentumTime || out.MomentumHash != simMomentumHash.String() || out.Verified || !out.Simulated {
 			t.Errorf("preview context = %+v", out)
 		}
 		for i, o := range out.Outbox {
@@ -1677,15 +1722,24 @@ func TestSimulateEqualsBatch(t *testing.T) {
 			if rc.Status != codec.StatusRevert || rc.AbortCode != 7 || !bytes.Equal(want.ReturnData, wantRet) {
 				t.Errorf("batch 2 outcome = %v abort %d, %d return bytes", rc.Status, rc.AbortCode, len(want.ReturnData))
 			}
+		case 3:
+			if rc.Status != codec.StatusSuccess || !bytes.Equal(want.ReturnData, simMomentumHash[:]) {
+				t.Errorf("batch 3 outcome = %v with return data %x, want SUCCESS with the momentum hash %x", rc.Status, want.ReturnData, simMomentumHash[:])
+			}
 		}
 	}
 
-	compare(t, simulateOK(t, srv, simModuleCall(x, c1), `"latest"`), 8, 1)
+	compare(t, simulateOK(t, srv, simModuleCall(x, c1), `"latest"`), 11, 1)
 
 	writeFile(t, recordPath(layoutOf(dir), 1), rec1)
 	s.accept(cs[1], 100)
 	requireTags(t, doPoll(t, r), 1, 1, -1, StatusOK)
-	compare(t, simulateOK(t, srv, simModuleCall(x, c2), `"latest"`), 9, 2)
+	compare(t, simulateOK(t, srv, simModuleCall(x, c2), `"latest"`), 12, 2)
+
+	writeFile(t, recordPath(layoutOf(dir), 2), rec2)
+	s.accept(cs[2], 100)
+	requireTags(t, doPoll(t, r), 2, 2, -1, StatusOK)
+	compare(t, simulateOK(t, srv, simModuleCall(x, c3), `"latest"`), 13, 3)
 }
 
 // BenchmarkSimulateProve measures the gateway's cost of one state read:

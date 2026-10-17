@@ -150,6 +150,7 @@ func TestDecodeAssignedInputVectors(t *testing.T) {
 			GlobalInputIndex: 100 + uint64(i),
 			MomentumHeight:   7,
 			MomentumTime:     dm.Momentum.TimestampUnix,
+			MomentumHash:     momHash(7),
 			L1Sender:         testAddr(byte(0x40 + i)),
 		}
 		if in.Args.Kind() == codec.DeployChunk {

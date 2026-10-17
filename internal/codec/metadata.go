@@ -6,7 +6,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// Contract metadata upgrade policy ordinals (§27.12).
+// Contract metadata upgrade policy ordinals.
 const (
 	PolicyImmutable        uint8 = 0
 	PolicyOwnerUpgradeable uint8 = 1
@@ -16,17 +16,19 @@ const (
 // DecodeContractMetadata requires.
 const ContractMetadataVersion uint16 = 1
 
-// ContractMetadata is the §27.12 metadata a deploy carries and a finalize validates.
+// ContractMetadata is the metadata a deploy carries and a finalize
+// validates.
 type ContractMetadata struct {
 	Version       uint16
 	UpgradePolicy uint8
 	Owner         types.Address
 }
 
-// DecodeContractMetadata decodes a canonical ContractMetadata encoding and validates it
-// against §27.12: an unknown version is rejected before any further field is read, since a
-// later version may append fields the current one does not know how to skip; the
-// policy/owner consistency rule is checked last.
+// DecodeContractMetadata decodes a canonical ContractMetadata encoding
+// and validates it: an unknown version is rejected before any further
+// field is read, since a later version may append fields the current
+// one does not know how to skip; the policy/owner consistency rule is
+// checked last.
 func DecodeContractMetadata(b []byte) (ContractMetadata, error) {
 	m, err := decodeContractMetadataBody(newReader(b))
 	if err != nil {

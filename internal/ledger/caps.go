@@ -9,11 +9,12 @@ import (
 	"github.com/digitalSloth/go-executor/internal/codec"
 )
 
-// CapSource returns, for each asset in assets and in that order, the MaxBatchWithdrawal of
-// domainID's AssetConfig in Settlement state at the end of the momentum (height, hash), or zero
-// for an asset with no AssetConfig (SPEC §27.9). assets holds 1 to codec.MaxAssetsPerBatch
-// entries. An error wrapping recovery.ErrHalted is a consistency fault; any other error is an
-// outage.
+// CapSource returns, for each asset in assets and in that order, the
+// MaxBatchWithdrawal of domainID's AssetConfig in Settlement state at
+// the end of the momentum (height, hash), or zero for an asset with no
+// AssetConfig. assets holds 1 to codec.MaxAssetsPerBatch entries. An
+// error wrapping recovery.ErrHalted is a consistency fault; any other
+// error is an outage.
 type CapSource interface {
 	MaxBatchWithdrawals(domainID uint32, height uint64, hash types.Hash, assets []codec.AssetID) ([]codec.U256, error)
 }

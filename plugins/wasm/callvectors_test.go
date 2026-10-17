@@ -35,10 +35,36 @@ func seedQuota(cid types.Hash, leaves map[domain.Path][]byte, purchased uint64) 
 	return out
 }
 
-// blobOffset is where a fixture's pre-encoded ContractEffects blob is placed when it is the
-// module's only data segment. It is clear of the input frame, which the runtime writes at
-// offset 0 after segment initialization (§7.3, §27.1).
+// blobOffset is where a fixture's pre-encoded ContractEffects blob is
+// placed when it is the module's only data segment. It is clear of the
+// input frame, which the runtime writes at offset 0 after segment
+// initialization.
 const blobOffset = 1024
+
+// frameMomentumHashOffset and frameInputIndexOffset are the byte
+// offsets of momentum_hash and input_index in the input frame. They are
+// literal numbers, never computed from internal/codec, so a vector that
+// reads them pins the layout independently of the encoder.
+const (
+	frameMomentumHashOffset = 146
+	frameInputIndexOffset   = 178
+)
+
+// frameCopy copies words 8-byte words from src to dst within memory.
+// Each word is i32.const dst; i32.const src; i64.load; i64.store, both
+// with alignment 0 and offset 0.
+func frameCopy(dst, src uint32, words int) []byte {
+	var b []byte
+	for k := 0; k < words; k++ {
+		b = append(b, 0x41)
+		b = appendVarS64(b, int64(dst)+int64(8*k))
+		b = append(b, 0x41)
+		b = appendVarS64(b, int64(src)+int64(8*k))
+		b = append(b, 0x29, 0x00, 0x00)
+		b = append(b, 0x37, 0x00, 0x00)
+	}
+	return b
+}
 
 // returnBlobBody is the tail every returning fixture ends with: i64.const (offset<<32)|len; end.
 func returnBlobBody(offset uint32, blobLen int) []byte {
@@ -195,13 +221,15 @@ func testAsset() codec.AssetID {
 	return a
 }
 
-// stdCtx is the domain.InputContext every call-path vector in this file shares beyond its own
-// GlobalInputIndex: the spine's momentum_height/momentum_time and l1_sender.
+// stdCtx is the domain.InputContext every call-path vector in this
+// file shares beyond its own GlobalInputIndex: the spine's
+// momentum_height, momentum_time and momentum_hash, and l1_sender.
 func stdCtx(idx uint64) domain.InputContext {
 	return domain.InputContext{
 		GlobalInputIndex: idx,
 		MomentumHeight:   1000,
 		MomentumTime:     1700000000,
+		MomentumHash:     momentumHashAt(1000),
 		L1Sender:         repeatedAddr(0x01),
 	}
 }
@@ -210,8 +238,8 @@ func stdCtx(idx uint64) domain.InputContext {
 // boundary plasma_limit (the four CV-OOG-* vectors).
 const callPlasmaLimit = 10_000_000
 
-// cid1/cid2 are the two ContractIDs this ticket's vectors use: cid1 for the regenerated
-// EXEC-00x group (batch_id 1), cid2 for every CV-*/EXEC-DEP-* vector (batch_id 2).
+// cid1 is the ContractID of the EXEC-00x group (batch_id 1); cid2 is
+// the ContractID of every CV-*/EXEC-DEP-* vector (batch_id 2).
 var (
 	cid1 = repeatedHash(0x11)
 	cid2 = repeatedHash(0x33)
@@ -261,8 +289,9 @@ func effectsBlob(t *testing.T, mutate func(idx uint64, eff *codec.ContractEffect
 	}
 }
 
-// callVectors returns every gap-coverage call-shape vectorSpec this ticket adds, in the file's
-// table order. unsupportedVector (shape unsupported_kind) is generated separately.
+// callVectors returns every gap-coverage call-shape vectorSpec, in the
+// file's table order. unsupportedVector (shape unsupported_kind) is
+// generated separately.
 func callVectors(t *testing.T) []vectorSpec {
 	t.Helper()
 
@@ -1561,8 +1590,8 @@ func callVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
-	// --- validation order (§10.6): CV-ORDER-1..13. Each row trips two conditions, so its status
-	// names the one the runtime checks first.
+	// --- validation order: CV-ORDER-1..13. Each row trips two
+	// conditions, so its status names the one the runtime checks first.
 
 	reservedWrite := codec.LocalStateDiffEntry{LocalKey: append([]byte(nil), keyCodeHash...), Value: []byte{0x01}}
 	plainWrite := codec.LocalStateDiffEntry{LocalKey: []byte("x"), Value: []byte{0x01}}
@@ -1832,6 +1861,30 @@ func callVectors(t *testing.T) []vectorSpec {
 	specs = append(specs, blobOrderVectors(t, nextIndex)...)
 	specs = append(specs, abortVectors(t, nextIndex)...)
 
+	{
+		idx := nextIndex()
+		sentinel := bytes.Repeat([]byte{0xEE}, 32)
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, ReturnData: sentinel})
+		if n := bytes.Count(blob, sentinel); n != 1 {
+			t.Fatalf("CV-FRAME-1: the sentinel occurs %d times in the blob, want 1", n)
+		}
+		at := uint32(bytes.Index(blob, sentinel))
+		body := frameCopy(blobOffset+2, frameInputIndexOffset, 1)
+		body = append(body, frameCopy(blobOffset+at, frameMomentumHashOffset, 4)...)
+		body = append(body, returnBlobBody(blobOffset, len(blob))...)
+		specs = append(specs, vectorSpec{
+			ID:         "CV-FRAME-1",
+			Purpose:    "the contract returns the frame's `momentum_hash` as its `ReturnData` and takes its `input_index` from the frame: `SUCCESS`, and `return_hash` commits the momentum hash",
+			Shape:      "call",
+			BatchID:    2,
+			Ctx:        stdCtx(idx),
+			Args:       codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID: cid2,
+			Module:     blobModuleBody(blob, body),
+			WantStatus: codec.StatusSuccess,
+		})
+	}
+
 	return specs
 }
 
@@ -1933,8 +1986,9 @@ func capsOf(capValue uint64, assets ...codec.AssetID) capTable {
 	return out
 }
 
-// unsupportedVector returns EXEC-UNSUP-1's vectorSpec: input_kind 8 is outside the Phase-1 set,
-// so DecodeInput returns Input{Unsupported: true} and Apply commits UNSUPPORTED_OPERATION (§15).
+// unsupportedVector returns EXEC-UNSUP-1's vectorSpec: input_kind 8 is
+// outside the implemented set {0..7}, so DecodeInput returns
+// Input{Unsupported: true} and Apply commits UNSUPPORTED_OPERATION.
 func unsupportedVector() vectorSpec {
 	return vectorSpec{
 		ID:      "EXEC-UNSUP-1",
@@ -1945,6 +1999,7 @@ func unsupportedVector() vectorSpec {
 			GlobalInputIndex: 3000,
 			MomentumHeight:   1000,
 			MomentumTime:     1700000000,
+			MomentumHash:     momentumHashAt(1000),
 			L1Sender:         repeatedAddr(0x01),
 		},
 		WantStatus: codec.StatusUnsupportedOperation,

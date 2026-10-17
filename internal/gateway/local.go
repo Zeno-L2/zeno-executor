@@ -34,9 +34,9 @@ type Source interface {
 	bundlePath(daHash types.Hash) string
 }
 
-// LocalSource reads one executor domain directory's read interface
-// (EXECUTOR §16): batches/, bundles/ and receipts/ only. It never
-// creates, writes or changes the mode of anything.
+// LocalSource reads one executor domain directory's read interface:
+// batches/, bundles/ and receipts/ only. It never creates, writes or
+// changes the mode of anything.
 type LocalSource struct {
 	layout recovery.Layout
 }

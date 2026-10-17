@@ -15,7 +15,7 @@ var table = mustParseGasTable(gasTableJSON)
 // Opcode is a single-byte WebAssembly Core 1.0 MVP opcode.
 type Opcode byte
 
-// HostFn identifies one of the three Phase 1 host imports.
+// HostFn identifies one of the three host imports.
 type HostFn uint8
 
 const (
@@ -190,9 +190,9 @@ func BrTableCost(targets int) uint64 {
 // returns -1, grows nothing, and charges the base only -- no per-page charge for the
 // rejected pages.
 //
-// The instrumentation ticket emits the per-page charge inside the instrumented WASM and
-// needs the raw per-page constant as an i64.const; it obtains that constant as
-// MemoryGrowPageCost(1).
+// Instrumentation emits the per-page charge inside the instrumented
+// WASM and needs the raw per-page constant as an i64.const; it obtains
+// that constant as MemoryGrowPageCost(1).
 func MemoryGrowPageCost(pages uint32) uint64 {
 	return table.MemoryModel.MemoryGrowPerPage * uint64(pages)
 }

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"math"
 	"math/big"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -438,7 +437,7 @@ func TestSettleAttribution(t *testing.T) {
 
 	t.Run("OutboxForgedZero", func(t *testing.T) {
 		eff := validEffects(s, 500)
-		eff.Outbox[0].SourceContract = types.Hash{} // the SPEC.md:1190 refund sentinel
+		eff.Outbox[0].SourceContract = types.Hash{} // the refund sentinel
 		got, err := s.settle(engine.Outcome{Kind: engine.Returned, GasUsed: metered, ResultBlob: encodeEffects(t, eff)})
 		if err != nil {
 			t.Fatalf("settle: %v", err)
@@ -453,7 +452,7 @@ func TestSettleAttribution(t *testing.T) {
 		zeroContract := s
 		zeroContract.ContractID = types.Hash{}
 		eff := validEffects(zeroContract, 500)
-		eff.Outbox[0].SourceContract = types.Hash{} // the SPEC.md:1190 refund sentinel
+		eff.Outbox[0].SourceContract = types.Hash{} // the refund sentinel
 		got, err := zeroContract.settle(engine.Outcome{Kind: engine.Returned, GasUsed: metered, ResultBlob: encodeEffects(t, eff)})
 		if err != nil {
 			t.Fatalf("settle: %v", err)
@@ -588,9 +587,9 @@ func TestSettleStep3PositionalPrecedence(t *testing.T) {
 	})
 }
 
-// TestSettleOutboxAtCapacityAppendsRefund freezes the §27.4 exemption: a contract at
-// MaxOutboxPerExecution messages with a non-zero remainder still gets its refund, in the
-// ExecutionResult's 33rd slot.
+// TestSettleOutboxAtCapacityAppendsRefund freezes the outbox exemption:
+// a contract at MaxOutboxPerExecution messages with a non-zero
+// remainder still gets its refund, in the ExecutionResult's 33rd slot.
 func TestSettleOutboxAtCapacityAppendsRefund(t *testing.T) {
 	s := baseSettlement()
 	eff := validEffects(s, 500)
@@ -651,10 +650,7 @@ func TestSettleReceiptAbortCode(t *testing.T) {
 
 	newAccessor := func(t *testing.T) *state.Accessor {
 		t.Helper()
-		store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-		if err != nil {
-			t.Fatalf("state.Open: %v", err)
-		}
+		store := state.OpenEmpty()
 		t.Cleanup(func() { store.Close() })
 		return store.Accessor()
 	}
@@ -852,9 +848,10 @@ func withdrawalAsset(b byte) codec.AssetID {
 	return a
 }
 
-// TestSettleStep5aCaps covers how step 5a reads the per-asset cap from the input's Caps lookup
-// (§27.9): per-asset totals, an asset with no AssetConfig (cap 0), the ascending lookup order,
-// a lookup error and a missing lookup.
+// TestSettleStep5aCaps covers how step 5a reads the per-asset cap from
+// the input's Caps lookup: per-asset totals, an asset with no
+// AssetConfig (cap 0), the ascending lookup order, a lookup error and a
+// missing lookup.
 func TestSettleStep5aCaps(t *testing.T) {
 	const metered = uint64(1000)
 	assetA, assetB, assetC := withdrawalAsset(1), withdrawalAsset(2), withdrawalAsset(3)
@@ -955,8 +952,9 @@ func TestSettleStep5aCaps(t *testing.T) {
 	})
 }
 
-// TestSettleStep5aRejects covers the four ways the per-asset withdrawal cap (§27.9, §10.6)
-// rejects an input with RUNTIME_FAULT at the metered gas, before the §10.4 effect charge runs.
+// TestSettleStep5aRejects covers the four ways the per-asset withdrawal
+// cap rejects an input with RUNTIME_FAULT at the metered gas, before
+// the effect charge runs.
 func TestSettleStep5aRejects(t *testing.T) {
 	cap := twoPow255()
 	metered := uint64(1000)

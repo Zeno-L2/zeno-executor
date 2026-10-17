@@ -1,7 +1,8 @@
 package codec
 
-// Phase-1 version constants (§24). Every version field this package encodes is one of
-// these, checked first on decode and rejected with ErrUnknownVersion on mismatch.
+// Version constants. Every version field this package encodes is one
+// of these, checked first on decode and rejected with
+// ErrUnknownVersion on mismatch.
 const (
 	ProtocolVersion        uint16 = 1
 	RuntimeProfileVersion  uint16 = 1
@@ -14,8 +15,8 @@ const (
 	DAModeVersion          uint16 = 1
 )
 
-// Limits enforced by the codec (§25.1). These are exactly the bounds named inside the §27
-// grammar blocks; the codec enforces no other size or range check (§27.0).
+// Limits enforced by the codec. The codec enforces no other size or
+// range check.
 const (
 	MaxStateKeySize       = 32
 	MaxStateValueSize     = 16 << 10
@@ -24,28 +25,30 @@ const (
 	MaxEventDataSize      = 1 << 10
 	MaxTopicsPerEvent     = 4
 	MaxOutboxPerExecution = 32
-	// MaxOutboxPerResult is the ExecutionResult outbox bound (§27.4): the contract's own
-	// MaxOutboxPerExecution messages plus one slot for the runtime-emitted deposit refund
-	// (§18.5), which sits outside the contract's own cap.
+	// MaxOutboxPerResult is the ExecutionResult outbox bound: the
+	// contract's own MaxOutboxPerExecution messages plus one slot for
+	// the runtime-emitted deposit refund, which sits outside the
+	// contract's own cap.
 	MaxOutboxPerResult   = MaxOutboxPerExecution + 1
 	MaxOutboxPayloadSize = 8 << 10
 	MaxAssetsPerBatch    = 16
 	MaxCallPayload       = 8 << 10
-	// MaxReturnData bounds an ExecutionResult's ReturnData (§27.1a, §14.3), which on REVERT is
-	// the revert data (§15). It does not bound a ContractEffects blob's ReturnData: an
-	// oversized one must decode, so that step 7 rejects it as RESULT_TOO_LARGE (§10.6).
+	// MaxReturnData bounds an ExecutionResult's ReturnData, which on
+	// REVERT is the revert data. It does not bound a ContractEffects
+	// blob's ReturnData: an oversized one must decode, so that
+	// plugins/wasm's step 7 rejects it as RESULT_TOO_LARGE.
 	MaxReturnData = 4 << 10
-	// MaxMerkleProofDepth bounds the step count of a MerkleProof
-	// (§27.3, §25.1).
+	// MaxMerkleProofDepth bounds the step count of a MerkleProof.
 	MaxMerkleProofDepth = 32
 )
 
-// OutboxMessage kind ordinals (§27.4).
+// OutboxMessage kind ordinals.
 const (
 	KindL2Delivery   uint8 = 0
 	KindL1Withdrawal uint8 = 1
 )
 
-// EmptyValueLength is the §27.2 EMPTY deletion sentinel: a StateDiff value length prefix of
-// 0xFFFFFFFF marks deletion rather than a present value of that length.
+// EmptyValueLength is the EMPTY deletion sentinel: a StateDiff value
+// length prefix of 0xFFFFFFFF marks deletion rather than a present
+// value of that length.
 const EmptyValueLength uint32 = 0xFFFFFFFF

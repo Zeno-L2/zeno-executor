@@ -13,10 +13,11 @@ import (
 	"github.com/digitalSloth/go-executor/internal/codec"
 )
 
-// ErrAssignmentFault marks a consistency fault in Settlement's assignment (SPEC §4.6): an
-// assignment that cannot be reconciled with the momentum content it names. Examples are a
-// send that is not in the momentum content, a send whose method does not decode as an input
-// method, and a send that names another domain.
+// ErrAssignmentFault marks a consistency fault in Settlement's
+// assignment: an assignment that cannot be reconciled with the momentum
+// content it names. Examples are a send that is not in the momentum
+// content, a send whose method does not decode as an input method, and
+// a send that names another domain.
 var ErrAssignmentFault = errors.New("ledger: assignment consistency fault")
 
 // ABI argument structs for the eight input methods. The go-zenon ABI maps each argument to
@@ -192,6 +193,7 @@ func DecodeAssignedInput(domainID uint32, dm *nom.DetailedMomentum, globalInputI
 			GlobalInputIndex: globalInputIndex,
 			MomentumHeight:   dm.Momentum.Height,
 			MomentumTime:     dm.Momentum.TimestampUnix,
+			MomentumHash:     dm.Momentum.Hash,
 			L1Sender:         b.Address,
 			SourceData:       sourceData,
 		},

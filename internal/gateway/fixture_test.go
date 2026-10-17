@@ -149,10 +149,7 @@ func buildFrom(t *testing.T, storage string, genesis []domain.StateDiffEntry, do
 	if err != nil {
 		t.Fatalf("NewReceiptStore: %v", err)
 	}
-	store, err := state.OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 	if len(genesis) > 0 {
 		if _, err := store.Apply(genesis); err != nil {
@@ -300,12 +297,14 @@ type fakeSettlement struct {
 	processedErr   error
 	processedCalls int
 	processedHang  chan struct{}
-	// momentumTime is the unix time Momentum reports. caps holds the
-	// MaxBatchWithdrawal AssetConfig reports per asset; an asset with
-	// no entry has no config. capsErr is AssetConfig's error when set.
-	// capsCalls counts its calls. A non-nil capsHang makes each call
-	// wait for it to close, outside mu.
+	// momentumTime and momentumHash are the unix time and hash
+	// Momentum reports. caps holds the MaxBatchWithdrawal AssetConfig
+	// reports per asset; an asset with no entry has no config. capsErr
+	// is AssetConfig's error when set. capsCalls counts its calls. A
+	// non-nil capsHang makes each call wait for it to close, outside
+	// mu.
 	momentumTime uint64
+	momentumHash types.Hash
 	caps         map[types.Hash]*big.Int
 	capsErr      error
 	capsCalls    int
@@ -364,10 +363,10 @@ func (v fakeView) OutboxProcessed(id types.Hash) (bool, error) {
 	return ok, err
 }
 
-func (v fakeView) Momentum() (uint64, uint64) {
+func (v fakeView) Momentum() (uint64, uint64, types.Hash) {
 	v.f.mu.Lock()
 	defer v.f.mu.Unlock()
-	return v.f.height, v.f.momentumTime
+	return v.f.height, v.f.momentumTime, v.f.momentumHash
 }
 
 func (v fakeView) AssetConfig(_ uint32, asset types.Hash) (*definition.AssetConfig, bool, error) {
@@ -468,7 +467,6 @@ func (s *logSink) dump() string {
 type rig struct {
 	c       *Chain
 	final   *state.Store
-	wal     string
 	snaps   string
 	log     *logSink
 	idx     *Index
@@ -478,11 +476,7 @@ type rig struct {
 // newTestChain returns an engine over the executor directory storage.
 func newTestChain(t *testing.T, storage string, s *fakeSettlement) *rig {
 	t.Helper()
-	wal := filepath.Join(t.TempDir(), "wal")
-	final, err := state.OpenEmpty(wal)
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
+	final := state.OpenEmpty()
 	t.Cleanup(func() { _ = final.Close() })
 	sink := &logSink{}
 	snaps := t.TempDir()
@@ -494,7 +488,7 @@ func newTestChain(t *testing.T, storage string, s *fakeSettlement) *rig {
 		Snapshots:  snaps,
 		Logf:       sink.logf,
 	})
-	return &rig{c: c, final: final, wal: wal, snaps: snaps, log: sink}
+	return &rig{c: c, final: final, snaps: snaps, log: sink}
 }
 
 // openTestChain boots an engine through OpenChain for domain 1.
@@ -531,10 +525,7 @@ func snapshotAt(t *testing.T, dir string, leaves []domain.StateDiffEntry, stf ty
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store, err := state.OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
+	store := state.OpenEmpty()
 	defer store.Close()
 	if _, err := store.Apply(leaves); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -620,7 +611,7 @@ func (v hangingView) OutboxProcessed(id types.Hash) (bool, error) {
 	return v.view.OutboxProcessed(id)
 }
 
-func (v hangingView) Momentum() (uint64, uint64) { return v.view.Momentum() }
+func (v hangingView) Momentum() (uint64, uint64, types.Hash) { return v.view.Momentum() }
 
 func (v hangingView) AssetConfig(domainID uint32, asset types.Hash) (*definition.AssetConfig, bool, error) {
 	return v.view.AssetConfig(domainID, asset)

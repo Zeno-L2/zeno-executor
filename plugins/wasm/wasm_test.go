@@ -34,7 +34,8 @@ func TestNewRejectsUnusableStorePath(t *testing.T) {
 	}
 }
 
-// encodeInput is a small test helper that builds a canonical §27.5 payload for args.
+// encodeInput is a small test helper that builds a canonical payload
+// for args.
 func encodeInput(t *testing.T, args codec.InputArgs) []byte {
 	t.Helper()
 	b, err := codec.Input{SourceAccountBlockHash: types.Hash{}, Args: args}.Encode()
@@ -77,7 +78,7 @@ func TestDecodeInputAcceptsAllEightKinds(t *testing.T) {
 				t.Fatalf("DecodeInput: got %T, want wasm.Input", got)
 			}
 			if in.Unsupported {
-				t.Fatal("DecodeInput: Unsupported = true for a Phase-1 kind")
+				t.Fatal("DecodeInput: Unsupported = true for an implemented kind")
 			}
 			if in.Args.Kind() != tc.args.Kind() {
 				t.Fatalf("DecodeInput: kind = %d, want %d", in.Args.Kind(), tc.args.Kind())
@@ -89,8 +90,9 @@ func TestDecodeInputAcceptsAllEightKinds(t *testing.T) {
 func TestDecodeInputUnsupportedKindNoError(t *testing.T) {
 	p := newTestPlugin(t)
 
-	// input_kind = 8 is outside the Phase-1 set {0..7}; the tail is irrelevant since
-	// codec.DecodeInput rejects on the kind byte before reading it.
+	// input_kind = 8 is outside the implemented set {0..7}; the tail is
+	// irrelevant since codec.DecodeInput rejects on the kind byte
+	// before reading it.
 	payload := append([]byte{8}, make([]byte, 32)...)
 
 	got, err := p.DecodeInput(domain.InputContext{}, payload)

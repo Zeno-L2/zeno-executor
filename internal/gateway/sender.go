@@ -12,8 +12,8 @@ import (
 )
 
 // SenderSource reads the L1 sender of the send block hashed sendHash,
-// an input of domain domainID (EXECUTOR §21.6). The index wraps every
-// call in a deadline.
+// an input of domain domainID. The index wraps every call in a
+// deadline.
 type SenderSource interface {
 	Sender(domainID uint32, sendHash types.Hash) (types.Address, error)
 }

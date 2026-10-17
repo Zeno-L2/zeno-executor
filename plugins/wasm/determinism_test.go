@@ -1,21 +1,22 @@
 package wasm
 
-// This file proves determinism across cache warmth, not just across inputs: SPEC v1.8.0 §20
-// (SPEC.md:971) requires the set of observed keys be a deterministic function of the input and
-// the pre-state alone, and that no local cache, memoization or other node-local state may
-// change which keys are observed, since two honest nodes would otherwise commit different
-// DAHash values for the same batch. §7.3 requires
-// a byte-identical ExecutionResult across compliant runtimes. TestDeterminismCacheMatrix runs
-// every frozen conformance vector three times in each of four compiled-module-cache /
-// code-store cache states and byte-compares every committed outcome field against the vector's
-// frozen row; TestDeterminismWitnessBackendTripwire proves the comparison itself is not
-// vacuous.
+// This file proves determinism across cache warmth, not just across
+// inputs: the set of observed keys must be a deterministic function of
+// the input and the pre-state alone, and no local cache, memoization or
+// other node-local state may change which keys are observed, since two
+// honest nodes would otherwise commit different DAHash values for the
+// same batch. A byte-identical ExecutionResult is also required across
+// compliant runtimes. TestDeterminismCacheMatrix runs every frozen
+// conformance vector three times in each of four cache states
+// (compiled-module cache and code-store) and byte-compares every
+// committed outcome field against the vector's frozen row;
+// TestDeterminismWitnessBackendTripwire proves the comparison itself is
+// not vacuous.
 
 import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -163,15 +164,13 @@ func runVector(t *testing.T, p *Plugin, vec vectorJSON, coldCache bool) runOutco
 		GlobalInputIndex: vec.GlobalInputIndex,
 		MomentumHeight:   vec.MomentumHeight,
 		MomentumTime:     vec.MomentumTime,
+		MomentumHash:     mustHash(t, vec.MomentumHash),
 		L1Sender:         mustAddress(t, vec.L1Sender),
 		SourceData:       mustHex(t, vec.SourceDataHex),
 		Caps:             capTableFromJSON(t, vec.WithdrawalCaps),
 	}
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-	if err != nil {
-		t.Fatalf("runVector: %s: state.Open: %v", vec.ID, err)
-	}
+	store := state.OpenEmpty()
 	defer store.Close()
 
 	paths, values := leavesFromPreState(t, vec.PreState)
@@ -397,6 +396,7 @@ func TestDeterminismWitnessBackendTripwire(t *testing.T) {
 		GlobalInputIndex: vec.GlobalInputIndex,
 		MomentumHeight:   vec.MomentumHeight,
 		MomentumTime:     vec.MomentumTime,
+		MomentumHash:     mustHash(t, vec.MomentumHash),
 		L1Sender:         mustAddress(t, vec.L1Sender),
 		SourceData:       mustHex(t, vec.SourceDataHex),
 		Caps:             capTableFromJSON(t, vec.WithdrawalCaps),

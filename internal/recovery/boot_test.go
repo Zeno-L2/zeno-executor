@@ -1,8 +1,10 @@
 package recovery
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -80,10 +82,7 @@ func storeRoot(t *testing.T, s *state.Store) types.Hash {
 // the single leaf named by leaf, the way a crash orphan or a substituted file looks on disk.
 func writeSnapshotAt(t *testing.T, cfg Config, pos Position, leaf uint64, stf types.Hash) string {
 	t.Helper()
-	s, err := state.OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := state.OpenEmpty()
 	defer s.Close()
 	if _, err := s.Apply([]domain.StateDiffEntry{{Path: leafPath(leaf), Value: []byte("other")}}); err != nil {
 		t.Fatal(err)
@@ -110,10 +109,7 @@ func TestBootFresh(t *testing.T) {
 	if !rdy.Fresh || rdy.Position != (Position{}) || rdy.HaveAnchor || rdy.VerifyAnchor {
 		t.Fatalf("Ready = %+v, want fresh, zero position, no anchor", rdy)
 	}
-	want, err := state.OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	want := state.OpenEmpty()
 	defer want.Close()
 	if _, err := want.Apply([]domain.StateDiffEntry{{Path: leafPath(1), Value: []byte("a")}, {Path: leafPath(2), Value: []byte("b")}}); err != nil {
 		t.Fatal(err)
@@ -146,6 +142,33 @@ func TestBootAfterCommit(t *testing.T) {
 	}
 }
 
+// TestBootDropsWritesAfterTheLastCommit pins that a boot restores the
+// store from the cursor's snapshot alone: a write applied after the
+// last commit is gone, and the runtime re-derives it from the ledger
+// above the cursor.
+func TestBootDropsWritesAfterTheLastCommit(t *testing.T) {
+	cfg := testConfig(t, 4)
+	c := newCommitter(t, cfg, 0)
+	c.commitEach(1, 1, 3)
+	want, _, _ := ReadCursor(cfg.Layout)
+	ahead, err := c.store.Apply([]domain.StateDiffEntry{{Path: leafPath(99), Value: []byte("uncommitted")}})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if ahead == want.PostStateRoot {
+		t.Fatal("the write after the last commit left the root unchanged")
+	}
+	cfg.Momenta = newChainSource(6, 0)
+
+	rdy := mustBoot(t, cfg)
+	if rdy.Fresh || rdy.Position != want {
+		t.Fatalf("Position = %+v (fresh %v), want %+v", rdy.Position, rdy.Fresh, want)
+	}
+	if storeRoot(t, rdy.Store) != want.PostStateRoot {
+		t.Fatal("the booted store holds a write applied after the last commit")
+	}
+}
+
 // TestBootAcceptsZeroRootAtNonzeroSeq pins that a domain whose state is still empty, so its root
 // is the zero hash, boots from its own cursor at a non-zero input sequence.
 func TestBootAcceptsZeroRootAtNonzeroSeq(t *testing.T) {
@@ -165,11 +188,53 @@ func TestBootAcceptsZeroRootAtNonzeroSeq(t *testing.T) {
 }
 
 func TestBootRejectsAnotherIdentity(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"executorId": func(c *Config) { c.ExecutorID = "someone-else" },
+		"domainId":   func(c *Config) { c.DomainID++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := buildTree(t, 4, 2)
+			cfg.Momenta = newChainSource(6, 0)
+			mustBoot(t, cfg)
+			created, err := os.ReadFile(cfg.Layout.Meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seeded := []byte(fmt.Sprintf(`{"executorId":%q,"domainId":%d}`, cfg.ExecutorID, cfg.DomainID))
+			if bytes.Equal(created, seeded) {
+				t.Fatalf("seeded meta.json %q matches what boot writes; the write-once check would prove nothing", seeded)
+			}
+			if err := os.WriteFile(cfg.Layout.Meta, seeded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mustBoot(t, cfg)
+			if again, err := os.ReadFile(cfg.Layout.Meta); err != nil || !bytes.Equal(again, seeded) {
+				t.Fatalf("meta.json rewritten on a matching boot: %q, then %q (%v)", seeded, again, err)
+			}
+			mutate(&cfg)
+			if err := mustHalt(t, cfg); !strings.Contains(err.Error(), "storage tree belongs to") {
+				t.Fatalf("Boot error = %v, want the identity refusal", err)
+			}
+		})
+	}
+}
+
+func TestBootWritesOnlyTheStorageIdentity(t *testing.T) {
 	cfg := buildTree(t, 4, 2)
 	cfg.Momenta = newChainSource(6, 0)
 	mustBoot(t, cfg)
-	cfg.ExecutorID = "someone-else"
-	mustHalt(t, cfg)
+	raw, err := os.ReadFile(cfg.Layout.Meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys map[string]any
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("meta.json %q: %v", raw, err)
+	}
+	want := map[string]any{"domainId": float64(cfg.DomainID), "executorId": cfg.ExecutorID}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("meta.json holds %v, want exactly %v", keys, want)
+	}
 }
 
 func TestBootRejectsMalformedCursor(t *testing.T) {

@@ -12,9 +12,9 @@ import (
 	"github.com/digitalSloth/go-executor/internal/ledger"
 )
 
-// specRoot is the §27.3 Merkle root over leaves, written from the SPEC
-// text: for an odd node count at a level, the last node is promoted
-// unchanged. It rejects an empty leaf list.
+// specRoot is the Merkle root over leaves, written independently of
+// codec.MerkleRoot: for an odd node count at a level, the last node is
+// promoted unchanged. It rejects an empty leaf list.
 func specRoot(t *testing.T, leaves [][]byte) types.Hash {
 	t.Helper()
 	if len(leaves) == 0 {

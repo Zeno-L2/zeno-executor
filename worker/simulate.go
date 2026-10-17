@@ -121,6 +121,7 @@ func runSimulation(plugin domain.Domain, ch *simChannel, sim simipc.Simulate) si
 		GlobalInputIndex: sim.GlobalInputIndex,
 		MomentumHeight:   sim.MomentumHeight,
 		MomentumTime:     sim.MomentumTime,
+		MomentumHash:     sim.MomentumHash,
 		L1Sender:         sim.L1Sender,
 		Caps:             simCaps{ch},
 	}, sim.InputData)

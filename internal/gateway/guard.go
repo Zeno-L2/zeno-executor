@@ -216,16 +216,14 @@ func checkOwnedDir(path string) error {
 }
 
 // guardCache checks the cache tree at root (<storagePath>/<id>)
-// before the gateway creates, truncates or removes anything in it.
-// storagePath, root, state/, snapshots/, index/, bundles/ and
-// receipts/ must each be absent or a real directory owned by the
-// effective uid, state/wal must not
-// be a symlink, and root must hold no executor marker.
+// before the gateway creates or removes anything in it. storagePath,
+// root, snapshots/, index/, bundles/ and receipts/ must each be absent
+// or a real directory owned by the effective uid, and root must hold
+// no executor marker.
 func guardCache(root string) error {
 	for _, dir := range []string{
 		filepath.Dir(root),
 		root,
-		filepath.Join(root, "state"),
 		filepath.Join(root, "snapshots"),
 		filepath.Join(root, "index"),
 		filepath.Join(root, "bundles"),
@@ -234,10 +232,6 @@ func guardCache(root string) error {
 		if err := checkOwnedDir(dir); err != nil {
 			return err
 		}
-	}
-	wal := filepath.Join(root, "state", "wal")
-	if fi, err := os.Lstat(wal); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
-		return fmt.Errorf("gateway: %s is a symlink", wal)
 	}
 	for _, m := range executorMarkers {
 		if _, err := os.Lstat(filepath.Join(root, m)); err == nil {

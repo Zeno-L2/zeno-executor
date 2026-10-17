@@ -6,10 +6,11 @@ import (
 	"github.com/digitalSloth/go-executor/internal/codec"
 )
 
-// refund is the §18.5 deposit settlement, run on every path: the remainder is
-// deposit_amount − claimed (the caller passes a zero claim on any failure), a zero remainder
-// emits no message, and otherwise exactly one runtime-emitted L1 withdrawal is placed at
-// outboxIndex — the number of retained contract messages (SPEC.md:1190).
+// refund is the deposit settlement, run on every path: the remainder is
+// deposit_amount − claimed (the caller passes a zero claim on any
+// failure), a zero remainder emits no message, and otherwise exactly
+// one runtime-emitted L1 withdrawal is placed at outboxIndex, the
+// number of retained contract messages.
 func (s settlement) refund(claimed codec.U256, outboxIndex uint32) []codec.OutboxMessage {
 	remainder := subU256(s.DepositAmount, claimed)
 	if remainder == (codec.U256{}) {

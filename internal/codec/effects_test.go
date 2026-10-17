@@ -34,10 +34,43 @@ func sampleFrame() ExecutionInputFrame {
 		CodeHash:       fillHash(0x04),
 		MomentumHeight: 100,
 		MomentumTime:   200,
+		MomentumHash:   fillHash(0x05),
 		InputIndex:     7,
 		DepositAsset:   AssetIDFromZTS(types.ZnnTokenStandard),
 		DepositAmount:  U256{31: 42},
 		Payload:        []byte("payload"),
+	}
+}
+
+// TestExecutionInputFrameLayout pins the frame's byte offsets by
+// literal numbers, independent of the encoder.
+func TestExecutionInputFrameLayout(t *testing.T) {
+	f := sampleFrame()
+	b, err := f.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if want := 254 + len(f.Payload); len(b) != want {
+		t.Fatalf("frame length %d, want %d", len(b), want)
+	}
+	u64 := func(from int) uint64 { return binary.BigEndian.Uint64(b[from : from+8]) }
+	if got := u64(130); got != 100 {
+		t.Errorf("momentum_height at 130 = %d, want 100", got)
+	}
+	if got := u64(138); got != 200 {
+		t.Errorf("momentum_time at 138 = %d, want 200", got)
+	}
+	if want := fillHash(0x05); !bytes.Equal(b[146:178], want[:]) {
+		t.Errorf("momentum_hash at 146 = %x, want %x", b[146:178], want[:])
+	}
+	if got := u64(178); got != 7 {
+		t.Errorf("input_index at 178 = %d, want 7", got)
+	}
+	if got := binary.BigEndian.Uint32(b[250:254]); got != uint32(len(f.Payload)) {
+		t.Errorf("payload length at 250 = %d, want %d", got, len(f.Payload))
+	}
+	if !bytes.Equal(b[254:], []byte("payload")) {
+		t.Errorf("payload at 254 = %q, want %q", b[254:], "payload")
 	}
 }
 
@@ -53,7 +86,7 @@ func TestExecutionInputFrameRoundTrip(t *testing.T) {
 	}
 	if got.ContextVersion != f.ContextVersion || got.ChainID != f.ChainID || got.Caller != f.Caller ||
 		got.ContractID != f.ContractID || got.CodeHash != f.CodeHash || got.MomentumHeight != f.MomentumHeight ||
-		got.MomentumTime != f.MomentumTime || got.InputIndex != f.InputIndex || got.DepositAsset != f.DepositAsset ||
+		got.MomentumTime != f.MomentumTime || got.MomentumHash != f.MomentumHash || got.InputIndex != f.InputIndex || got.DepositAsset != f.DepositAsset ||
 		got.DepositAmount != f.DepositAmount || !bytes.Equal(got.Payload, f.Payload) {
 		t.Errorf("got %+v, want %+v", got, f)
 	}
@@ -234,10 +267,10 @@ func TestOutboxIDDeterministic(t *testing.T) {
 	}
 }
 
-// TestOutboxIDPreimageFormat independently re-derives the §17.3 preimage bytes
-// (domainId:u32 || batchId:u64 || inputIndex:u64 || outboxIndex:u32) with plain
-// encoding/binary calls, never via the codec's writer, to pin the field widths and
-// order (domainId as u32).
+// TestOutboxIDPreimageFormat independently re-derives the preimage
+// bytes (domainId:u32 || batchId:u64 || inputIndex:u64 ||
+// outboxIndex:u32) with plain encoding/binary calls, never via the
+// codec's writer, to pin the field widths and order (domainId as u32).
 func TestOutboxIDPreimageFormat(t *testing.T) {
 	domainID := uint32(7)
 	batchID := uint64(1234)
@@ -581,9 +614,10 @@ func TestOutboxListOverCapRejected(t *testing.T) {
 	})
 }
 
-// TestExecutionResultOutboxAtMaxPerResultAccepted freezes the §27.4 exemption: an
-// ExecutionResult carrying exactly MaxOutboxPerResult messages — the contract's own
-// MaxOutboxPerExecution plus the runtime's refund slot — round-trips.
+// TestExecutionResultOutboxAtMaxPerResultAccepted freezes the outbox
+// exemption: an ExecutionResult carrying exactly MaxOutboxPerResult
+// messages (the contract's own MaxOutboxPerExecution plus the
+// runtime's refund slot) round-trips.
 func TestExecutionResultOutboxAtMaxPerResultAccepted(t *testing.T) {
 	e := sampleExecutionResult(0)
 	e.Outbox = make([]OutboxMessage, MaxOutboxPerResult)

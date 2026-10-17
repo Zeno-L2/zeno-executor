@@ -1520,7 +1520,7 @@ func TestServeAssignment(t *testing.T) {
 	run := func(t *testing.T, reply func() ([]ledger.AssignmentEntry, error)) (*ipc.Client, *call) {
 		t.Helper()
 		sEnd, wEnd := newChannel(t)
-		w := WorkerConfig{DomainID: 9, Role: "EXECUTOR", STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
+		w := WorkerConfig{DomainID: 9, STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
 		cfg := Config{ExecutorAddress: types.Address{0x09}, NetworkName: "devnet", ConfirmationDepth: 10, StoragePath: "/var/lib/executor"}
 		if err := ipc.WriteMessage(sEnd, cfg.workerConfig(w)); err != nil {
 			t.Fatalf("WriteMessage config: %v", err)
@@ -1598,7 +1598,7 @@ func TestServeCap(t *testing.T) {
 	run := func(t *testing.T, reply func() ([]codec.U256, error)) (*ipc.Client, *[]call) {
 		t.Helper()
 		sEnd, wEnd := newChannel(t)
-		w := WorkerConfig{DomainID: 9, Role: "EXECUTOR", STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
+		w := WorkerConfig{DomainID: 9, STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
 		cfg := Config{ExecutorAddress: types.Address{0x09}, NetworkName: "devnet", ConfirmationDepth: 10, StoragePath: "/var/lib/executor"}
 		if err := ipc.WriteMessage(sEnd, cfg.workerConfig(w)); err != nil {
 			t.Fatalf("WriteMessage config: %v", err)
@@ -1656,7 +1656,7 @@ func TestServeAgainstRealClient(t *testing.T) {
 
 	executor := types.Address{0x09}
 	cfg := Config{ExecutorAddress: executor, NetworkName: "devnet", ConfirmationDepth: 10, StoragePath: "/var/lib/executor"}
-	w := WorkerConfig{DomainID: 1, Role: "EXECUTOR", STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
+	w := WorkerConfig{DomainID: 1, STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
 	wireCfg := cfg.workerConfig(w)
 	if err := ipc.WriteMessage(sEnd, wireCfg); err != nil {
 		t.Fatalf("WriteMessage config: %v", err)

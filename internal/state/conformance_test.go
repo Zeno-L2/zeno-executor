@@ -110,12 +110,7 @@ func mustValue(t *testing.T, hexStr string) []byte {
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "state.wal"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
+	return OpenEmpty()
 }
 
 func TestSMTConformanceVectors(t *testing.T) {

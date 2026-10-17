@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/trie"
 )
 
@@ -99,7 +98,7 @@ func TestBundleDuplicateAndOutOfOrderWitnesses(t *testing.T) {
 	t.Run("duplicate witness", func(t *testing.T) {
 		rec := records[0]
 		rec.Witnesses = []WitnessEntry{rec.Witnesses[0], rec.Witnesses[0]}
-		if _, err := rec.Encode(); !errors.Is(err, ErrDuplicateKey) {
+		if _, err := EncodeBundle([]BundleInputRecord{rec}); !errors.Is(err, ErrDuplicateKey) {
 			t.Fatalf("got %v, want ErrDuplicateKey", err)
 		}
 	})
@@ -110,7 +109,7 @@ func TestBundleDuplicateAndOutOfOrderWitnesses(t *testing.T) {
 		if bytes.Compare(rec.Witnesses[0].DerivedKey[:], rec.Witnesses[1].DerivedKey[:]) < 0 {
 			t.Skip("witnesses already ascending after swap; construction assumption violated")
 		}
-		if _, err := rec.Encode(); !errors.Is(err, ErrNotSorted) {
+		if _, err := EncodeBundle([]BundleInputRecord{rec}); !errors.Is(err, ErrNotSorted) {
 			t.Fatalf("got %v, want ErrNotSorted", err)
 		}
 	})
@@ -147,9 +146,10 @@ func TestBundleEmptyRecordSetRoundTrips(t *testing.T) {
 	}
 }
 
-// TestBundleKind3DeployChunkData covers §20's kind-3-scoped DeployChunkData field: it
-// round-trips for a kind-3 record, is rejected on a non-kind-3 record, does not panic on an
-// empty InputData, and leaves a kind-4 record's encoding unchanged.
+// TestBundleKind3DeployChunkData covers the kind-3-scoped
+// DeployChunkData field: it round-trips for a kind-3 record, is
+// rejected on a non-kind-3 record, does not panic on an empty
+// InputData, and leaves a kind-4 record's encoding unchanged.
 func TestBundleKind3DeployChunkData(t *testing.T) {
 	t.Run("Kind3RoundTrips", func(t *testing.T) {
 		rec := BundleInputRecord{
@@ -188,7 +188,7 @@ func TestBundleKind3DeployChunkData(t *testing.T) {
 			ExecutionResult:  []byte("result-0"),
 			DeployChunkData:  []byte("chunk-bytes"),
 		}
-		if _, err := rec.Encode(); !errors.Is(err, ErrInvalidKind) {
+		if _, err := EncodeBundle([]BundleInputRecord{rec}); !errors.Is(err, ErrInvalidKind) {
 			t.Fatalf("got %v, want ErrInvalidKind", err)
 		}
 	})
@@ -199,9 +199,9 @@ func TestBundleKind3DeployChunkData(t *testing.T) {
 			InputData:        []byte{},
 			ExecutionResult:  []byte("result-0"),
 		}
-		b, err := rec.Encode()
+		b, err := EncodeBundle([]BundleInputRecord{rec})
 		if err != nil {
-			t.Fatalf("Encode: %v", err)
+			t.Fatalf("EncodeBundle: %v", err)
 		}
 		if _, err := DecodeBundle(b); err != nil {
 			t.Fatalf("DecodeBundle: %v", err)
@@ -214,9 +214,9 @@ func TestBundleKind3DeployChunkData(t *testing.T) {
 			InputData:        []byte{4, 0xAA, 0xBB},
 			ExecutionResult:  []byte("result-0"),
 		}
-		b, err := rec.Encode()
+		b, err := EncodeBundle([]BundleInputRecord{rec})
 		if err != nil {
-			t.Fatalf("Encode: %v", err)
+			t.Fatalf("EncodeBundle: %v", err)
 		}
 		got, err := DecodeBundle(b)
 		if err != nil {
@@ -247,9 +247,9 @@ func TestBundleWitnessValuePresentEmptyAndAbsent(t *testing.T) {
 		Witnesses:        []WitnessEntry{present},
 		ExecutionResult:  []byte("result-0"),
 	}
-	b, err := rec.Encode()
+	b, err := EncodeBundle([]BundleInputRecord{rec})
 	if err != nil {
-		t.Fatalf("Encode: %v", err)
+		t.Fatalf("EncodeBundle: %v", err)
 	}
 	got, err := DecodeBundle(b)
 	if err != nil {
@@ -266,9 +266,9 @@ func TestBundleWitnessValuePresentEmptyAndAbsent(t *testing.T) {
 		Witnesses:        []WitnessEntry{absent},
 		ExecutionResult:  []byte("result-0"),
 	}
-	b, err = rec.Encode()
+	b, err = EncodeBundle([]BundleInputRecord{rec})
 	if err != nil {
-		t.Fatalf("Encode: %v", err)
+		t.Fatalf("EncodeBundle: %v", err)
 	}
 	got, err = DecodeBundle(b)
 	if err != nil {
@@ -276,21 +276,5 @@ func TestBundleWitnessValuePresentEmptyAndAbsent(t *testing.T) {
 	}
 	if got[0].Witnesses[0].Value != nil {
 		t.Fatalf("absent: got %+v, want nil", got[0].Witnesses[0].Value)
-	}
-}
-
-func TestBundleHashStability(t *testing.T) {
-	records := sampleBundleRecords(t)
-	got, err := BundleHash(records)
-	if err != nil {
-		t.Fatalf("BundleHash: %v", err)
-	}
-	encoded, err := EncodeBundle(records)
-	if err != nil {
-		t.Fatalf("EncodeBundle: %v", err)
-	}
-	want := hashOf(crypto.Hash(encoded))
-	if got != want {
-		t.Errorf("got %x, want %x", got, want)
 	}
 }

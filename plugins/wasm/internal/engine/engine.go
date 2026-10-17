@@ -63,9 +63,9 @@ type Engine struct {
 	compilesPerRebuild int
 }
 
-// newRuntime builds a fresh wazero runtime with 04c's runtimeConfig (shared with deploy-time
-// validation) and instantiates the env host module on it. On any error it closes the runtime
-// and returns the error.
+// newRuntime builds a fresh wazero runtime with runtimeConfig (shared
+// with deploy-time validation) and instantiates the env host module on
+// it. On any error it closes the runtime and returns the error.
 func newRuntime(ctx context.Context) (wazero.Runtime, api.Module, error) {
 	rt := wazero.NewRuntimeWithConfig(ctx, runtimeConfig())
 
@@ -133,10 +133,12 @@ func (e *Engine) rebuild(ctx context.Context) error {
 // Run executes instrumented against frame, seeded with gasBudget gas, and returns a
 // deterministic Outcome.
 //
-// Precondition: codeHash must equal SHA3-256(instrumented). On a cache hit, instrumented is
-// ignored entirely and never re-verified against codeHash, so a caller passing a mismatched
-// pair silently executes the cached code; re-hashing per call would defeat the cache. 04f's
-// wiring is the trust boundary and should be reviewed against it.
+// Precondition: codeHash must equal SHA3-256(instrumented). On a cache
+// hit, instrumented is ignored entirely and never re-verified against
+// codeHash, so a caller passing a mismatched pair silently executes the
+// cached code; re-hashing per call would defeat the cache. The
+// plugins/wasm caller is the trust boundary and should be reviewed
+// against this precondition.
 //
 // gasBudget is the whole plasma_limit. Run applies the pre-execution initial-memory charge
 // itself, because it is the only code positioned to know the module's declared page count; a
@@ -157,7 +159,7 @@ func (e *Engine) Run(hc HostContext, codeHash types.Hash, instrumented, frame []
 
 	budget := gasBudget
 	if budget > math.MaxInt64 {
-		budget = math.MaxInt64 // §10.1
+		budget = math.MaxInt64
 	}
 
 	if e.compiles >= e.compilesPerRebuild {
@@ -171,19 +173,22 @@ func (e *Engine) Run(hc HostContext, codeHash types.Hash, instrumented, frame []
 		return Outcome{}, err
 	}
 
-	// The declared memory is read from the compiled module, before instantiation: validation
-	// (rule 9) guarantees the export, but Run never invokes the validator, so this is the guard
-	// for a caller that reaches Run by a path that skips it. Reading it here, rather than from
-	// the instantiated module below, also lets the initial-memory charge refuse an unaffordable
-	// budget before wazero pays the allocation and zeroing it prices, not after.
+	// The declared memory is read from the compiled module, before
+	// instantiation: validation (requireCoreExports) guarantees the
+	// export, but Run never invokes the validator, so this is the guard
+	// for a caller that reaches Run by a path that skips it. Reading it
+	// here, rather than from the instantiated module below, also lets
+	// the initial-memory charge refuse an unaffordable budget before
+	// wazero pays the allocation and zeroing it prices, not after.
 	memDef, ok := compiled.ExportedMemories()["memory"]
 	if !ok {
 		return Outcome{}, fmt.Errorf("engine: module has no memory export")
 	}
 
-	// Initial-memory charge (§10/§15): applied before anything else, including instantiation.
-	// Min() is exactly the page count wazero is about to allocate and zero -- nothing has run
-	// yet, so no memory.grow can have moved it.
+	// Initial-memory charge: applied before anything else, including
+	// instantiation. Min() is exactly the page count wazero is about to
+	// allocate and zero -- nothing has run yet, so no memory.grow can
+	// have moved it.
 	memCost := module.InitialMemoryCost(memDef.Min())
 	if budget < memCost {
 		return Outcome{Kind: OutOfGas, GasUsed: budget}, nil
@@ -210,8 +215,9 @@ func (e *Engine) Run(hc HostContext, codeHash types.Hash, instrumented, frame []
 	}
 
 	if !mem.Write(0, frame) {
-		// The frame does not fit declared memory (§27.1 => RUNTIME_FAULT). Nothing ran, so the
-		// only charge paid is the initial-memory one -- exactly §15's "metered".
+		// The frame does not fit declared memory, which is a
+		// RUNTIME_FAULT. Nothing ran, so the only charge paid is the
+		// initial-memory one -- exactly the metered gas.
 		return Outcome{Kind: Trapped, GasUsed: memCost}, nil
 	}
 

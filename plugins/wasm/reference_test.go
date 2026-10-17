@@ -15,10 +15,11 @@ import (
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
-// refStateDiffPreimage returns §15's stateDiffHash preimage: the §27.0 List<StateDiffEntry>
-// encoding of entries — count:u32 BE followed by each entry as key:bytes32 ‖ value, where a
-// nil value is §27.2's deletion sentinel (0xFFFFFFFF, no bytes) and any other value is
-// len:u32 BE ‖ bytes, including the zero-length present-empty case.
+// refStateDiffPreimage returns the stateDiffHash preimage: the
+// List<StateDiffEntry> encoding of entries, count:u32 BE followed by
+// each entry as key:bytes32 ‖ value, where a nil value is the deletion
+// sentinel (0xFFFFFFFF, no bytes) and any other value is len:u32 BE ‖
+// bytes, including the zero-length present-empty case.
 func refStateDiffPreimage(entries []codec.StateDiffEntry) []byte {
 	buf := make([]byte, 0, 4+len(entries)*40)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(entries)))
@@ -34,7 +35,8 @@ func refStateDiffPreimage(entries []codec.StateDiffEntry) []byte {
 	return buf
 }
 
-// refStateDiffHash is bytes32(0) for an empty list and SHA3-256(refStateDiffPreimage) otherwise (§15).
+// refStateDiffHash is bytes32(0) for an empty list and
+// SHA3-256(refStateDiffPreimage) otherwise.
 func refStateDiffHash(entries []codec.StateDiffEntry) types.Hash {
 	if len(entries) == 0 {
 		return types.Hash{}
@@ -42,7 +44,8 @@ func refStateDiffHash(entries []codec.StateDiffEntry) types.Hash {
 	return hashOf(crypto.Hash(refStateDiffPreimage(entries)))
 }
 
-// refReturnHash is bytes32(0) for empty return data and SHA3-256(returnData), unprefixed, otherwise (§15).
+// refReturnHash is bytes32(0) for empty return data and
+// SHA3-256(returnData), unprefixed, otherwise.
 func refReturnHash(returnData []byte) types.Hash {
 	if len(returnData) == 0 {
 		return types.Hash{}
@@ -50,7 +53,8 @@ func refReturnHash(returnData []byte) types.Hash {
 	return hashOf(crypto.Hash(returnData))
 }
 
-// refEventRoot is the §27.3 root over each event's canonical encoding, in list order.
+// refEventRoot is the root over each event's canonical encoding, in
+// list order.
 func refEventRoot(t *testing.T, events []codec.Event) types.Hash {
 	t.Helper()
 	elements := make([][]byte, len(events))
@@ -64,7 +68,8 @@ func refEventRoot(t *testing.T, events []codec.Event) types.Hash {
 	return codec.MerkleRoot(elements)
 }
 
-// refOutboxRoot is the §27.3 root over each message's canonical encoding, in list order.
+// refOutboxRoot is the root over each message's canonical encoding, in
+// list order.
 func refOutboxRoot(t *testing.T, messages []codec.OutboxMessage) types.Hash {
 	t.Helper()
 	elements := make([][]byte, len(messages))
@@ -78,8 +83,9 @@ func refOutboxRoot(t *testing.T, messages []codec.OutboxMessage) types.Hash {
 	return codec.MerkleRoot(elements)
 }
 
-// refWitnessKeys is §20's union: every path the accessor observed (Read or Len, present or
-// absent) unioned with every path the input wrote, ascending and deduplicated.
+// refWitnessKeys is the witness key union: every path the accessor
+// observed (Read or Len, present or absent) unioned with every path the
+// input wrote, ascending and deduplicated.
 func refWitnessKeys(witnesses []state.Witness, diff []domain.StateDiffEntry) []trie.Path {
 	set := make(map[trie.Path]struct{}, len(witnesses)+len(diff))
 	for _, w := range witnesses {
@@ -105,9 +111,10 @@ type refResult struct {
 	ReceiptBlob         []byte
 }
 
-// refDerive assembles the canonical ExecutionResult (inserting the pre/post state roots the
-// contract cannot compute), §15's two hashes, the two §27.3 roots, the witness union and the
-// §27.7 receipt, from what Apply returned for one vector.
+// refDerive assembles the canonical ExecutionResult (inserting the
+// pre/post state roots the contract cannot compute), the two receipt
+// hashes, the two roots, the witness union and the receipt, from what
+// Apply returned for one vector.
 func refDerive(t *testing.T, eff domain.Effects, acc *state.Accessor,
 	globalInputIndex, batchID uint64, preRoot, postRoot, inputHash types.Hash) refResult {
 	t.Helper()

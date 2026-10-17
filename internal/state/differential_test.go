@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand"
-	"path/filepath"
-	"reflect"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/trie"
@@ -89,17 +86,14 @@ func sortedKeys(ref map[trie.Path][]byte) []trie.Path {
 }
 
 // TestStoreMatchesFullRecompute drives random diffs through the Store and checks every root
-// and proof against a full recomputation over a mirrored leaf map, including across a reopen.
+// and proof against a full recomputation over a mirrored leaf map, including across a reopen
+// from a snapshot.
 func TestStoreMatchesFullRecompute(t *testing.T) {
 	for _, n := range []int{0, 1, 64, 512} {
 		n := n
 		t.Run(fmt.Sprintf("leaves=%d", n), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(int64(n) + 1))
-			walPath := filepath.Join(t.TempDir(), "state.wal")
-			s, err := Open(walPath)
-			if err != nil {
-				t.Fatalf("Open: %v", err)
-			}
+			s := OpenEmpty()
 			defer func() { _ = s.Close() }()
 
 			ref := map[trie.Path][]byte{}
@@ -236,15 +230,18 @@ func TestStoreMatchesFullRecompute(t *testing.T) {
 				lastTargets = check(lastDiff, root)
 			}
 
-			// Reopen: the rebuilt tree must reproduce the root and every proof byte for byte.
+			// Reopen from a snapshot: the rebuilt tree must reproduce
+			// the root and every proof byte for byte.
 			wantRoot, _ := s.Root()
 			wantProofs := assertProveMatchesRef(t, s, ref, lastTargets)
-			if err := s.Close(); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
-			s, err = Open(walPath)
+			dir := t.TempDir()
+			name, err := s.SaveSnapshot(dir, SnapshotHeader{})
 			if err != nil {
-				t.Fatalf("reopen: %v", err)
+				t.Fatalf("SaveSnapshot: %v", err)
+			}
+			s, err = OpenSnapshot(dir, name, types.Hash{})
+			if err != nil {
+				t.Fatalf("OpenSnapshot: %v", err)
 			}
 			if got, _ := s.Root(); got != wantRoot {
 				t.Fatalf("reopened root = %x, want %x", got, wantRoot)
@@ -265,59 +262,5 @@ func TestStoreMatchesFullRecompute(t *testing.T) {
 			diff := step(12)
 			check(diff, apply(diff, s))
 		})
-	}
-}
-
-// TestStoreApplyFailedAppendLeavesStateUnchanged pins that a failed log append leaves both the
-// leaf set and the tree untouched.
-func TestStoreApplyFailedAppendLeavesStateUnchanged(t *testing.T) {
-	walPath := filepath.Join(t.TempDir(), "state.wal")
-	s, err := Open(walPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	var a, b, c trie.Path
-	a[0], b[0], c[0] = 0x01, 0x02, 0x03
-	if _, err := s.Apply([]domain.StateDiffEntry{{Path: a, Value: []byte("a")}, {Path: b, Value: []byte("b")}}); err != nil {
-		t.Fatalf("seed Apply: %v", err)
-	}
-
-	targets := []trie.Path{a, b, c}
-	wantRoot, _ := s.Root()
-	want := map[trie.Path]proofResult{}
-	for _, p := range targets {
-		present, value, proof, err := s.Prove(p)
-		if err != nil {
-			t.Fatalf("Prove: %v", err)
-		}
-		want[p] = proofResult{present, value, proof}
-	}
-	before := maps.Clone(s.leaves)
-
-	if err := s.log.Close(); err != nil {
-		t.Fatalf("close log: %v", err)
-	}
-	_, err = s.Apply([]domain.StateDiffEntry{{Path: c, Value: []byte("c")}, {Path: a, Value: nil}})
-	if err == nil || !strings.Contains(err.Error(), "state: persist diff") {
-		t.Fatalf("Apply error = %v, want one containing %q", err, "state: persist diff")
-	}
-
-	if got, _ := s.Root(); got != wantRoot {
-		t.Fatalf("root changed after failed Apply: %x, want %x", got, wantRoot)
-	}
-	for _, p := range targets {
-		present, value, proof, err := s.Prove(p)
-		if err != nil {
-			t.Fatalf("Prove: %v", err)
-		}
-		w := want[p]
-		if present != w.present || !bytes.Equal(value, w.value) || !bytes.Equal(proof, w.proof) {
-			t.Fatalf("Prove(%x) changed after failed Apply", p)
-		}
-	}
-	if !reflect.DeepEqual(s.leaves, before) {
-		t.Fatalf("leaves changed after failed Apply")
 	}
 }

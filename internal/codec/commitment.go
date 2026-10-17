@@ -6,9 +6,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// Versions is the nine-field version block a batch commitment carries first (§24, §19). No
-// constructor: in Phase 1 every field is the corresponding package constant; tests set fields
-// directly to exercise mismatches.
+// Versions is the nine-field version block a batch commitment carries
+// first. No constructor: every field is the corresponding package
+// constant; tests set fields directly to exercise mismatches.
 type Versions struct {
 	ProtocolVersion        uint16
 	RuntimeProfileVersion  uint16
@@ -21,7 +21,7 @@ type Versions struct {
 	DAModeVersion          uint16
 }
 
-// BatchCommitment is the on-chain-committed summary of one batch (§19).
+// BatchCommitment is the on-chain-committed summary of one batch.
 type BatchCommitment struct {
 	Versions          Versions
 	DomainID          uint32
@@ -42,10 +42,12 @@ type BatchCommitment struct {
 	ProofData         []byte
 }
 
-// Encode returns the canonical encoding of c. Phase 1 requires ProofData to be the
-// zero-length encoding; a non-empty ProofData is rejected with ErrNonEmptyProofData. Each of
-// the nine Versions fields must equal its package constant, checked in declaration order,
-// first mismatch wins, so Encode never emits bytes DecodeBatchCommitment would reject.
+// Encode returns the canonical encoding of c. ProofData must be the
+// zero-length encoding; a non-empty ProofData is rejected with
+// ErrNonEmptyProofData. Each of the nine Versions fields must equal
+// its package constant, checked in declaration order, first mismatch
+// wins, so Encode never emits bytes DecodeBatchCommitment would
+// reject.
 func (c BatchCommitment) Encode() ([]byte, error) {
 	versionFields := []struct {
 		want uint16
@@ -102,11 +104,12 @@ func (c BatchCommitment) Encode() ([]byte, error) {
 	return w.buf, nil
 }
 
-// DecodeBatchCommitment decodes a canonical BatchCommitment. protocol_version is read and
-// checked first, before any other byte is interpreted (§19, §24); each remaining version
-// field is then checked in turn, rejecting a mismatch with ErrUnknownVersion before the body
-// is read. proofData must be the zero-length encoding (ErrNonEmptyProofData otherwise), and
-// trailing bytes after it are rejected.
+// DecodeBatchCommitment decodes a canonical BatchCommitment.
+// protocol_version is read and checked first, before any other byte is
+// interpreted; each remaining version field is then checked in turn,
+// rejecting a mismatch with ErrUnknownVersion before the body is read.
+// proofData must be the zero-length encoding (ErrNonEmptyProofData
+// otherwise), and trailing bytes after it are rejected.
 func DecodeBatchCommitment(b []byte) (BatchCommitment, error) {
 	r := newReader(b)
 	var c BatchCommitment

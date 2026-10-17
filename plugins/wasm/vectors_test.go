@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"flag"
 	"os"
-	"path/filepath"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -21,8 +21,8 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
-// --- the JSON schema, frozen here for later volume tickets to add rows to. It changes only
-// alongside a change to the committed bytes it describes: the regenerated artifact and its
+// --- the JSON schema, frozen here. It changes only alongside a change
+// to the committed bytes it describes: the artifact and its
 // vectorFileDigest.
 
 type vectorFile struct {
@@ -46,6 +46,7 @@ type vectorJSON struct {
 	GlobalInputIndex       uint64            `json:"global_input_index"`
 	MomentumHeight         uint64            `json:"momentum_height"`
 	MomentumTime           uint64            `json:"momentum_time"`
+	MomentumHash           string            `json:"momentum_hash"`
 	L1Sender               string            `json:"l1_sender"` // 20-byte hex
 	SourceAccountBlockHash string            `json:"source_account_block_hash"`
 	InputKind              uint8             `json:"input_kind"`
@@ -53,14 +54,14 @@ type vectorJSON struct {
 	CanonicalInputHex      string            `json:"canonical_input_hex"`
 	SourceDataHex          string            `json:"source_data_hex,omitempty"`        // kind 3 only (InputContext.SourceData)
 	ModuleWasmHex          string            `json:"module_wasm_hex,omitempty"`        // schema-optional
-	CodeHash               string            `json:"code_hash,omitempty"`              // SPEC's code_hash (pre-instrumentation)
-	InstrumentedCodeHash   string            `json:"instrumented_code_hash,omitempty"` // SPEC's CodeHash (§11.4)
+	CodeHash               string            `json:"code_hash,omitempty"`              // code_hash (pre-instrumentation)
+	InstrumentedCodeHash   string            `json:"instrumented_code_hash,omitempty"` // CodeHash (post-instrumentation)
 	InputFrameHex          string            `json:"input_frame_hex,omitempty"`        // call shape only
 	WithdrawalCaps         map[string]string `json:"withdrawal_caps"`                  // AssetID hex -> big-endian u256 hex; an absent asset has cap 0
 	PreState               map[string]string `json:"pre_state"`                        // derived path hex -> value hex ("" is present-empty)
 	PendingMetadataHex     *string           `json:"pending_metadata_hex,omitempty"`   // kinds 4,5 only
 	PreStateRoot           string            `json:"pre_state_root"`
-	WitnessKeys            []string          `json:"witness_keys"` // read ∪ written (§20), ascending
+	WitnessKeys            []string          `json:"witness_keys"` // read ∪ written, ascending
 	Status                 string            `json:"status"`
 	GasUsed                uint64            `json:"gas_used"`
 	ContractEffectsBlobHex string            `json:"contract_effects_blob_hex,omitempty"`
@@ -70,11 +71,13 @@ type vectorJSON struct {
 	ReceiptHex             string            `json:"receipt_hex"`
 }
 
-// vectorInput is the decoded, human-readable §27.5 kind-specific tail. canonical_input_hex is
-// authoritative; this view exists so a reader can see what those bytes encode. A field the
-// vector's kind carries is always present, including at its zero value; a field the kind does
-// not carry is always absent. Fields whose rendering can legitimately be empty or zero are
-// therefore pointers, since omitempty would erase them.
+// vectorInput is the decoded, human-readable kind-specific tail.
+// canonical_input_hex is authoritative; this view exists so a reader
+// can see what those bytes encode. A field the vector's kind carries is
+// always present, including at its zero value; a field the kind does
+// not carry is always absent. Fields whose rendering can legitimately
+// be empty or zero are therefore pointers, since omitempty would erase
+// them.
 type vectorInput struct {
 	TargetContract string  `json:"target_contract,omitempty"` // kinds 0,1
 	PlasmaLimit    *uint64 `json:"plasma_limit,omitempty"`    // kinds 0,1
@@ -94,8 +97,9 @@ type vectorInput struct {
 	Bytes          *uint64 `json:"bytes,omitempty"`           // kind 7; non-zero
 }
 
-// vectorReceipt is the decoded §27.7 receipt view. Its code_hash is §11.4's CodeHash, i.e.
-// the vector's instrumented_code_hash, not its top-level code_hash.
+// vectorReceipt is the decoded receipt view. Its code_hash is the
+// CodeHash, i.e. the vector's instrumented_code_hash, not its top-level
+// code_hash.
 type vectorReceipt struct {
 	Version       uint16 `json:"version"`
 	InputIndex    uint64 `json:"input_index"`
@@ -133,7 +137,7 @@ type vectorSpec struct {
 	ContractID             types.Hash
 	Module                 []byte                 // raw, pre-instrumentation
 	ExtraPreState          map[domain.Path][]byte // seeded beyond the two reserved leaves
-	WantStatus             codec.Status           // the §15 status this vector exists to freeze
+	WantStatus             codec.Status           // the status this vector exists to freeze
 	PendingMetadata        []byte                 // seeded into a kind-4/5 vector's pending record
 	WithdrawalCaps         capTable               // step 5a's cap table; nil is empty
 }
@@ -188,6 +192,14 @@ func sourceHash(id string) types.Hash {
 	return types.Hash(sha256.Sum256([]byte("conformance-vector:" + id)))
 }
 
+// momentumHashAt is the stand-in momentum hash of the momentum at
+// height: the SHA-256 of a fixed prefix and the decimal height, so
+// vectors at one height share one momentum hash, as they share one
+// momentum.
+func momentumHashAt(height uint64) types.Hash {
+	return types.Hash(sha256.Sum256([]byte("conformance-momentum:" + strconv.FormatUint(height, 10))))
+}
+
 // repeatedHash builds a 32-byte hash whose every byte is b.
 func repeatedHash(b byte) types.Hash {
 	var h types.Hash
@@ -234,6 +246,7 @@ func spineVectors(t *testing.T) []vectorSpec {
 			GlobalInputIndex: 5,
 			MomentumHeight:   1000,
 			MomentumTime:     1700000000,
+			MomentumHash:     momentumHashAt(1000),
 			L1Sender:         sender1,
 		},
 		Args: codec.CallL2Args{
@@ -276,6 +289,7 @@ func spineVectors(t *testing.T) []vectorSpec {
 			GlobalInputIndex: 6,
 			MomentumHeight:   1000,
 			MomentumTime:     1700000000,
+			MomentumHash:     momentumHashAt(1000),
 			L1Sender:         sender1,
 		},
 		Args: codec.CallL2Args{
@@ -314,6 +328,7 @@ func spineVectors(t *testing.T) []vectorSpec {
 			GlobalInputIndex: 9,
 			MomentumHeight:   1001,
 			MomentumTime:     1700000600,
+			MomentumHash:     momentumHashAt(1001),
 			L1Sender:         repeatedAddr(0x02),
 		},
 		Args: codec.DepositArgs{
@@ -338,8 +353,9 @@ var updateVectors = flag.Bool("update", false,
 
 const vectorFilePath = "testdata/execution-conformance-v1.json"
 
-// inputView renders a decoded §27.5 tail as the artifact's human-readable input view. It is a
-// view renderer, not a derivation, so both the generator and the runner use it.
+// inputView renders a decoded kind-specific tail as the artifact's
+// human-readable input view. It is a view renderer, not a derivation,
+// so both the generator and the runner use it.
 func inputView(args codec.InputArgs) *vectorInput {
 	switch a := args.(type) {
 	case codec.CallL2Args:
@@ -447,10 +463,7 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 	// Witness backend (hard requirement): the committed accessor MUST be a state.Store-backed
 	// state.Accessor. mapState records nothing on an absent-key Len observation, so a
 	// mapState-backed generator would silently drop exactly the entries N1 checks for.
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-	if err != nil {
-		t.Fatalf("%s: state.Open: %v", spec.ID, err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 
 	seedDiff := []domain.StateDiffEntry{
@@ -565,6 +578,7 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 		GlobalInputIndex:       spec.Ctx.GlobalInputIndex,
 		MomentumHeight:         spec.Ctx.MomentumHeight,
 		MomentumTime:           spec.Ctx.MomentumTime,
+		MomentumHash:           hex.EncodeToString(spec.Ctx.MomentumHash[:]),
 		L1Sender:               hex.EncodeToString(spec.Ctx.L1Sender[:]),
 		SourceAccountBlockHash: hex.EncodeToString(spec.SourceAccountBlockHash[:]),
 		InputKind:              uint8(spec.Args.Kind()),
@@ -592,10 +606,11 @@ func generateVector(t *testing.T, spec vectorSpec, chainID types.Hash) vectorJSO
 	return vj
 }
 
-// generateUnsupportedVector drives one unrecognized-kind input through the real
-// DecodeInput/Apply seam (§15). Its canonical input is assembled here rather than by
-// codec.Input.Encode, which refuses a kind outside {0..7} by design: §27.5 fixes the encoding as
-// input_kind:u8 ‖ source_account_block_hash:bytes32, with no tail.
+// generateUnsupportedVector drives one unrecognized-kind input through
+// the real DecodeInput/Apply seam. Its canonical input is assembled
+// here rather than by codec.Input.Encode, which refuses a kind outside
+// {0..7} by design: the encoding is input_kind:u8 ‖
+// source_account_block_hash:bytes32, with no tail.
 func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainID types.Hash) vectorJSON {
 	t.Helper()
 
@@ -605,10 +620,7 @@ func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainI
 	}
 	t.Cleanup(func() { _ = p.Close() })
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-	if err != nil {
-		t.Fatalf("%s: state.Open: %v", spec.ID, err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 
 	preStateRoot, err := store.Apply(nil)
@@ -675,6 +687,7 @@ func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainI
 		GlobalInputIndex:       spec.Ctx.GlobalInputIndex,
 		MomentumHeight:         spec.Ctx.MomentumHeight,
 		MomentumTime:           spec.Ctx.MomentumTime,
+		MomentumHash:           hex.EncodeToString(spec.Ctx.MomentumHash[:]),
 		L1Sender:               hex.EncodeToString(spec.Ctx.L1Sender[:]),
 		SourceAccountBlockHash: hex.EncodeToString(spec.SourceAccountBlockHash[:]),
 		InputKind:              kind,
@@ -761,10 +774,7 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		}
 	}
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-	if err != nil {
-		t.Fatalf("%s: state.Open: %v", spec.ID, err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 
 	var seedDiff []domain.StateDiffEntry
@@ -829,6 +839,7 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		GlobalInputIndex:       spec.Ctx.GlobalInputIndex,
 		MomentumHeight:         spec.Ctx.MomentumHeight,
 		MomentumTime:           spec.Ctx.MomentumTime,
+		MomentumHash:           hex.EncodeToString(spec.Ctx.MomentumHash[:]),
 		L1Sender:               hex.EncodeToString(spec.Ctx.L1Sender[:]),
 		SourceAccountBlockHash: hex.EncodeToString(spec.SourceAccountBlockHash[:]),
 		InputKind:              uint8(spec.Args.Kind()),
@@ -1006,7 +1017,7 @@ func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "c8a5ed07ad64336fd6e415bf14ef2939394d929d0a41dd544c55567c2bda49c6"
+const vectorFileDigest = "694cd4e01f34d6392e359979f4c21e61023aa9a2e266bea6538dfd41cc49e30a"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {

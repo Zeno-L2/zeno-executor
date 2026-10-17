@@ -284,7 +284,6 @@ func runWithProbe(t *testing.T, marker string, keySource map[string]any, inherit
 			map[string]any{
 				"domainId":    float64(1),
 				"binary":      probeBin,
-				"role":        "EXECUTOR",
 				"stfSpecHash": validHash,
 				"memoryLimit": float64(268435456),
 				"cpuLimit":    1.0,
@@ -424,7 +423,6 @@ func runWithProbe(t *testing.T, marker string, keySource map[string]any, inherit
 		ExecutorAddress:   executorAddress,
 		STFSpecHash:       types.HexToHashPanic(validHash),
 		ConfirmationDepth: 2,
-		Role:              "EXECUTOR",
 		NetworkName:       "test",
 		StoragePath:       storage,
 		MaxPendingBatches: 8,
@@ -664,7 +662,6 @@ func TestBootRejectsMismatchedKey(t *testing.T) {
 			map[string]any{
 				"domainId":    float64(1),
 				"binary":      probeBin,
-				"role":        "EXECUTOR",
 				"stfSpecHash": validHash,
 				"memoryLimit": float64(268435456),
 				"cpuLimit":    1.0,

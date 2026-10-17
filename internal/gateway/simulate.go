@@ -19,7 +19,7 @@ import (
 	"github.com/digitalSloth/go-executor/internal/workerproc"
 )
 
-// The simulator pools' bounds (EXECUTOR §17, §21.8).
+// The simulator pools' bounds.
 const (
 	simMemoryLimit  = simipc.DefaultMemoryLimit // the Config frame's soft limit
 	simMemoryMax    = simMemoryLimit + 1<<30    // memory.max as root on Linux

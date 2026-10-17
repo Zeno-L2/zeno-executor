@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
@@ -131,22 +130,6 @@ func argsTypeName(a InputArgs) string {
 	}
 }
 
-func TestInputHashMatchesIndependentSHA3(t *testing.T) {
-	in := sampleInputs()[0]
-	encoded, err := in.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	got, err := in.Hash()
-	if err != nil {
-		t.Fatalf("Hash: %v", err)
-	}
-	want := hashOf(crypto.Hash(encoded))
-	if got != want {
-		t.Errorf("got %x, want %x", got, want)
-	}
-}
-
 func TestInputUnknownKind(t *testing.T) {
 	b := []byte{0x08} // kind 8 is out of the 0..7 range
 	b = append(b, make([]byte, 32)...)
@@ -236,29 +219,9 @@ func TestInputNonCanonicalAssetID(t *testing.T) {
 	})
 }
 
-func TestInputRootMixedKinds(t *testing.T) {
-	inputs := sampleInputs()
-	got, err := InputRoot(inputs)
-	if err != nil {
-		t.Fatalf("InputRoot: %v", err)
-	}
-
-	elements := make([][]byte, len(inputs))
-	for i, in := range inputs {
-		b, err := in.Encode()
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
-		elements[i] = b
-	}
-	want := refMerkleRoot(elements)
-	if got != want {
-		t.Errorf("got %x, want %x", got, want)
-	}
-}
-
-// refMerkleRoot recomputes the §27.3 Merkle construction directly from sha3 calls, never via
-// codec.MerkleRoot, so the test does not check the library against itself.
+// refMerkleRoot recomputes the Merkle construction directly from sha3
+// calls, never via codec.MerkleRoot, so the test does not check the
+// library against itself.
 func refMerkleRoot(elements [][]byte) types.Hash {
 	if len(elements) == 0 {
 		return types.Hash{}

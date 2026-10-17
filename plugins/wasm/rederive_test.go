@@ -67,8 +67,9 @@ func leavesFromPreState(t *testing.T, m map[string]string) ([]trie.Path, [][]byt
 	return paths, values
 }
 
-// replayStateDiff applies diff onto the leaf set given by paths/values per §13.5.1 (nil
-// deletes, any other value sets), returning the resulting parallel slices.
+// replayStateDiff applies diff onto the leaf set given by paths/values
+// (nil deletes, any other value sets), returning the resulting parallel
+// slices.
 func replayStateDiff(paths []trie.Path, values [][]byte, diff []codec.StateDiffEntry) ([]trie.Path, [][]byte) {
 	leaves := make(map[trie.Path][]byte, len(paths)+len(diff))
 	for i, p := range paths {
@@ -90,9 +91,10 @@ func replayStateDiff(paths []trie.Path, values [][]byte, diff []codec.StateDiffE
 	return outPaths, outValues
 }
 
-// inlineMerkleRoot recomputes the §27.3 construction inline: leaf sha3(0x00 || element), node
-// sha3(0x01 || left || right), a lone trailing node promoted unchanged, bytes32(0) for the
-// empty set. It must not call codec.MerkleRoot.
+// inlineMerkleRoot recomputes the Merkle construction inline: leaf
+// sha3(0x00 || element), node sha3(0x01 || left || right), a lone
+// trailing node promoted unchanged, bytes32(0) for the empty set. It
+// must not call codec.MerkleRoot.
 func inlineMerkleRoot(elements [][]byte) types.Hash {
 	if len(elements) == 0 {
 		return types.Hash{}
@@ -116,8 +118,8 @@ func inlineMerkleRoot(elements [][]byte) types.Hash {
 	return level[0]
 }
 
-// statusOrdinal maps a §15 status name back to its ordinal byte, by scanning codec.Status's own
-// String() rendering.
+// statusOrdinal maps a status name back to its ordinal byte, by
+// scanning codec.Status's own String() rendering.
 func statusOrdinal(t *testing.T, name string) byte {
 	t.Helper()
 	for s := codec.StatusSuccess; s <= codec.StatusStorageQuotaExceeded; s++ {
@@ -137,8 +139,8 @@ var zeroAddrHex = hex.EncodeToString(make([]byte, 20))
 func checkFileLevel(t *testing.T, file vectorFile) {
 	t.Helper()
 
-	// A1: chain_id, computed inline from §9.1's formula, with no call to New, p.chainID or
-	// hashOf-via-plugin.
+	// A1: chain_id, computed inline from the chain_id formula, with no
+	// call to New, p.chainID or hashOf-via-plugin.
 	wantChainID := hashOf(crypto.Hash([]byte("ZENON_WASM_L2:"), []byte(file.NetworkName)))
 	if hex.EncodeToString(wantChainID[:]) != file.ChainID {
 		t.Fatalf("A1: chain_id = %s, want inline sha3(\"ZENON_WASM_L2:\" || network_name) %x", file.ChainID, wantChainID)
@@ -169,6 +171,11 @@ func checkFileLevel(t *testing.T, file vectorFile) {
 
 func checkPerVector(t *testing.T, vec vectorJSON) {
 	t.Helper()
+
+	// B0: the vector's momentum hash is non-zero.
+	if mustHash(t, vec.MomentumHash) == (types.Hash{}) {
+		t.Fatalf("B0: momentum_hash is all zero")
+	}
 
 	// B1: canonical input.
 	canonical := mustHex(t, vec.CanonicalInputHex)
@@ -214,7 +221,7 @@ func checkPerVector(t *testing.T, vec vectorJSON) {
 		checkExecutionResultBlob(t, vec, prePaths, preValues)
 	}
 
-	// B5: non-SUCCESS vectors (§14.3).
+	// B5: non-SUCCESS vectors.
 	if vec.Status != "SUCCESS" {
 		checkNonSuccess(t, vec)
 	}
@@ -370,9 +377,10 @@ func checkExecutionResultBlob(t *testing.T, vec vectorJSON, prePaths []trie.Path
 		t.Fatalf("B4: len(outbox) = %d, want receipt.outbox_count %d", len(er.Outbox), vec.Receipt.OutboxCount)
 	}
 
-	// state_diff_hash (§15): the region length is computed arithmetically from the decoded
-	// entries and sliced out of the encoded ExecutionResult at the fixed prefix offset 74
-	// (version:u16 + global_input_index:u64 + pre_state_root:32 + post_state_root:32).
+	// state_diff_hash: the region length is computed arithmetically
+	// from the decoded entries and sliced out of the encoded
+	// ExecutionResult at the fixed prefix offset 74 (version:u16 +
+	// global_input_index:u64 + pre_state_root:32 + post_state_root:32).
 	const stateDiffRegionOffset = 74
 	regionLen := 4
 	for _, e := range er.StateDiff {
@@ -397,7 +405,7 @@ func checkExecutionResultBlob(t *testing.T, vec vectorJSON, prePaths []trie.Path
 		}
 	}
 
-	// return_hash (§15/§14.3).
+	// return_hash.
 	if len(er.ReturnData) == 0 {
 		if vec.Receipt.ReturnHash != zeroHashHex {
 			t.Fatalf("B4: receipt.return_hash = %s, want zero for empty ReturnData", vec.Receipt.ReturnHash)
@@ -409,7 +417,7 @@ func checkExecutionResultBlob(t *testing.T, vec vectorJSON, prePaths []trie.Path
 		}
 	}
 
-	// witness keys (§20, generic half).
+	// witness keys (generic half).
 	for i := 1; i < len(vec.WitnessKeys); i++ {
 		if vec.WitnessKeys[i] <= vec.WitnessKeys[i-1] {
 			t.Fatalf("B4: witness_keys not strictly ascending at index %d: %s <= %s", i, vec.WitnessKeys[i], vec.WitnessKeys[i-1])
@@ -450,10 +458,10 @@ func checkNonSuccess(t *testing.T, vec vectorJSON) {
 	detail := blobDetail(t, vec.ContractEffectsBlobHex)
 
 	if vec.Receipt.StateDiffHash != zeroHashHex {
-		t.Fatalf("B5 (§14.3): status %s carries state_diff_hash %s, want zero; %s", vec.Status, vec.Receipt.StateDiffHash, detail)
+		t.Fatalf("B5: status %s carries state_diff_hash %s, want zero; %s", vec.Status, vec.Receipt.StateDiffHash, detail)
 	}
 	if vec.Status != "REVERT" && vec.Receipt.ReturnHash != zeroHashHex {
-		t.Fatalf("B5 (§14.3): status %s carries return_hash %s, want zero; %s", vec.Status, vec.Receipt.ReturnHash, detail)
+		t.Fatalf("B5: status %s carries return_hash %s, want zero; %s", vec.Status, vec.Receipt.ReturnHash, detail)
 	}
 
 	if vec.ExecutionResultBlobHex != "" {
@@ -463,20 +471,20 @@ func checkNonSuccess(t *testing.T, vec vectorJSON) {
 			t.Fatalf("B5: DecodeExecutionResult: %v", err)
 		}
 		if len(er.StateDiff) != 0 {
-			t.Fatalf("B5: ExecutionResult.StateDiff has %d entries, want 0 (§14.3)", len(er.StateDiff))
+			t.Fatalf("B5: ExecutionResult.StateDiff has %d entries, want 0", len(er.StateDiff))
 		}
 		if len(er.Events) != 0 {
-			t.Fatalf("B5: ExecutionResult.Events has %d entries, want 0 (§14.3)", len(er.Events))
+			t.Fatalf("B5: ExecutionResult.Events has %d entries, want 0", len(er.Events))
 		}
 		if vec.Status == "REVERT" {
 			if len(er.ReturnData) > codec.MaxReturnData {
-				t.Fatalf("B5: ExecutionResult.ReturnData has %d bytes, want <= %d (§14.3)", len(er.ReturnData), codec.MaxReturnData)
+				t.Fatalf("B5: ExecutionResult.ReturnData has %d bytes, want <= %d", len(er.ReturnData), codec.MaxReturnData)
 			}
 		} else if len(er.ReturnData) != 0 {
-			t.Fatalf("B5: ExecutionResult.ReturnData has %d bytes, want 0 (§14.3)", len(er.ReturnData))
+			t.Fatalf("B5: ExecutionResult.ReturnData has %d bytes, want 0", len(er.ReturnData))
 		}
 		if er.ClaimedDeposit != (codec.U256{}) {
-			t.Fatalf("B5: ExecutionResult.ClaimedDeposit = %x, want zero (§14.3)", er.ClaimedDeposit)
+			t.Fatalf("B5: ExecutionResult.ClaimedDeposit = %x, want zero", er.ClaimedDeposit)
 		}
 	}
 
@@ -588,6 +596,9 @@ func checkCallFrame(t *testing.T, file vectorFile, vec vectorJSON) {
 	if frame.MomentumTime != vec.MomentumTime {
 		t.Fatalf("C2: MomentumTime = %d, want %d", frame.MomentumTime, vec.MomentumTime)
 	}
+	if hex.EncodeToString(frame.MomentumHash[:]) != vec.MomentumHash {
+		t.Fatalf("C2: MomentumHash = %x, want %s", frame.MomentumHash, vec.MomentumHash)
+	}
 	if frame.InputIndex != vec.GlobalInputIndex {
 		t.Fatalf("C2: InputIndex = %d, want global_input_index %d", frame.InputIndex, vec.GlobalInputIndex)
 	}
@@ -609,7 +620,7 @@ func checkCallFrame(t *testing.T, file vectorFile, vec vectorJSON) {
 		}
 	case 1:
 		if len(frame.Payload) != 0 {
-			t.Fatalf("C2: Payload = %x, want empty for a Deposit (kind 1, §27.5)", frame.Payload)
+			t.Fatalf("C2: Payload = %x, want empty for a Deposit (kind 1)", frame.Payload)
 		}
 	}
 }
@@ -681,13 +692,16 @@ func checkCallEffects(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkCallEffectsTie ties the ExecutionResult's events and outbox to the contract effects
-// blob on SUCCESS (§27.1a, §27.3, §27.4): the events are the blob's events in order, the first n
-// outbox messages are the blob's n contract messages in order, and the only message after them
-// is the runtime-emitted refund at outbox_index n (§18.5), present exactly when the unclaimed
-// remainder deposit_amount - claimed_deposit is non-zero. Both sides come from the codec
-// decoders; the production result assembly is not consulted. The tie owns the events, the
-// contract messages in order and the message count; C5s owns the refund's fields.
+// checkCallEffectsTie ties the ExecutionResult's events and outbox to
+// the contract effects blob on SUCCESS: the events are the blob's
+// events in order, the first n outbox messages are the blob's n
+// contract messages in order, and the only message after them is the
+// runtime-emitted refund at outbox_index n, present exactly when the
+// unclaimed remainder deposit_amount - claimed_deposit is non-zero.
+// Both sides come from the codec decoders; the production result
+// assembly is not consulted. The tie owns the events, the contract
+// messages in order and the message count; C5s owns the refund's
+// fields.
 func checkCallEffectsTie(t *testing.T, vec vectorJSON, eff codec.ContractEffects, er codec.ExecutionResult) {
 	t.Helper()
 
@@ -890,12 +904,15 @@ func checkCallRefund(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkCallSuccessRefund re-derives the SUCCESS refund of a call row with a deposit from the
-// row's own inputs (§18.5, §27.4): the unclaimed remainder deposit_amount - claimed_deposit is
-// refunded as a zero-source L1Withdrawal at outbox_index = the number of contract messages,
-// and no refund message exists when the remainder is 0. The claim and the contract messages
-// come from the contract effects blob, the deposit from the input view; the production refund
-// code is not consulted.
+// checkCallSuccessRefund re-derives the SUCCESS refund of a call row
+// with a deposit from the row's own inputs: the unclaimed remainder
+// deposit_amount - claimed_deposit is refunded as a zero-source
+// L1Withdrawal at outbox_index = the number of contract messages, and
+// no refund message exists when the remainder is 0. The claim and the
+// contract messages come from the contract effects blob, the deposit
+// from the input view; the production refund code is not consulted. Its
+// failure messages carry the label C5s, the SUCCESS-row counterpart of
+// C5.
 func checkCallSuccessRefund(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	if vec.Status != "SUCCESS" || vec.Input == nil || vec.Input.DepositAmount == "" {
@@ -960,8 +977,8 @@ func checkCallSuccessRefund(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkUnsupportedKind is the unsupported_kind shape's whole check, from the JSON alone (§15,
-// §27.5).
+// checkUnsupportedKind is the unsupported_kind shape's whole check,
+// from the JSON alone.
 func checkUnsupportedKind(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
@@ -999,8 +1016,9 @@ func checkUnsupportedKind(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkDeploy is the deploy shape's whole check: the schema's shape rules, then the §15
-// receipt identity and the §11.3/§12 ReturnData shape for the vector's own kind and status.
+// checkDeploy is the deploy shape's whole check: the schema's shape
+// rules, then the receipt identity and the ReturnData shape for the
+// vector's own kind and status.
 func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 	t.Helper()
 
@@ -1039,7 +1057,7 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 		}
 		metadataHash := hex.EncodeToString(crypto.Hash(mustHex(t, *vec.Input.MetadataHex)))
 		if metadataHash != vec.Input.MetadataHash {
-			t.Fatalf("deploy: kind 2: sha3(metadata_hex) = %s, want metadata_hash %s (§11.1)", metadataHash, vec.Input.MetadataHash)
+			t.Fatalf("deploy: kind 2: sha3(metadata_hex) = %s, want metadata_hash %s", metadataHash, vec.Input.MetadataHash)
 		}
 		if _, err := codec.DecodeContractMetadata(mustHex(t, *vec.Input.MetadataHex)); err != nil {
 			t.Fatalf("deploy: kind 2: DecodeContractMetadata(metadata_hex): %v, want nil", err)
@@ -1294,7 +1312,8 @@ func checkDeployNoEffect(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkOwnership is the ownership shape's whole check, from the JSON alone (§12, §15).
+// checkOwnership is the ownership shape's whole check, from the JSON
+// alone.
 func checkOwnership(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
@@ -1409,7 +1428,8 @@ func checkOwnership(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkBuyStorage is the buy_storage shape's whole check, from the JSON alone (§13.8, §15).
+// checkBuyStorage is the buy_storage shape's whole check, from the JSON
+// alone.
 func checkBuyStorage(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
@@ -1492,9 +1512,11 @@ func checkBuyStorage(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkValidationRejection is the validation_rejection shape's whole check: a kind-4 finalize
-// rejected by a module the validator refuses, or by pending metadata §27.12 rejects, exactly
-// one of the two, with the rule it refuses it by named in rejectionReasons.
+// checkValidationRejection is the validation_rejection shape's whole
+// check: a kind-4 finalize rejected by a module the validator refuses,
+// or by pending metadata that DecodeContractMetadata rejects, exactly
+// one of the two, with the rule it refuses it by named in
+// rejectionReasons.
 func checkValidationRejection(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
@@ -1579,8 +1601,9 @@ func checkN1WitnessBackendTripwire(t *testing.T, vec vectorJSON) {
 	t.Fatalf("N1: witness_keys is missing sha3(contract_id || \"probe\") = %s; a mapState-backed generator would drop it", probeKey)
 }
 
-// checkN2DiscardNotVacuous is N2: proves §14.3's discard actually discarded something, by
-// asserting the returned blob carried a non-empty StateDiff and non-empty ReturnData.
+// checkN2DiscardNotVacuous is N2: proves the discard actually discarded
+// something, by asserting the returned blob carried a non-empty
+// StateDiff and non-empty ReturnData.
 func checkN2DiscardNotVacuous(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	if vec.ContractEffectsBlobHex == "" {
@@ -1592,14 +1615,15 @@ func checkN2DiscardNotVacuous(t *testing.T, vec vectorJSON) {
 		t.Fatalf("N2: DecodeContractEffects: %v", err)
 	}
 	if len(eff.StateDiff) == 0 {
-		t.Fatalf("N2: returned blob has an empty StateDiff; the §14.3 discard would be vacuous")
+		t.Fatalf("N2: returned blob has an empty StateDiff; the discard would be vacuous")
 	}
 	if len(eff.ReturnData) == 0 {
-		t.Fatalf("N2: returned blob has empty ReturnData; the §14.3 discard would be vacuous")
+		t.Fatalf("N2: returned blob has empty ReturnData; the discard would be vacuous")
 	}
 }
 
-// inlineEffectCharge sums the §10.4 effect cost of every entry in eff, from the gas table alone.
+// inlineEffectCharge sums the effect cost of every entry in eff, from
+// the gas table alone.
 func inlineEffectCharge(eff codec.ContractEffects) uint64 {
 	var total uint64
 	for _, e := range eff.StateDiff {
@@ -1615,10 +1639,12 @@ func inlineEffectCharge(eff codec.ContractEffects) uint64 {
 	return total
 }
 
-// checkPathGas recomputes gas_used from the gas table alone: module.InitialMemoryCost(pages),
-// plus module.OpcodeCost for each original opcode on the executed path, plus hostGas, plus the
-// §10.4 effect charge over the returned blob, computed inline from module.EffectCost. It must not
-// call plugins/wasm's effectCharge, which is the generator's own path.
+// checkPathGas recomputes gas_used from the gas table alone:
+// module.InitialMemoryCost(pages), plus module.OpcodeCost for each
+// original opcode on the executed path, plus hostGas, plus the effect
+// charge over the returned blob, computed inline from
+// module.EffectCost. It must not call plugins/wasm's effectCharge,
+// which is the generator's own path.
 func checkPathGas(t *testing.T, vec vectorJSON, pages uint32, hostGas uint64, path []byte) {
 	t.Helper()
 	if vec.Status != "SUCCESS" && vec.Status != "STORAGE_QUOTA_EXCEEDED" {
@@ -1821,9 +1847,9 @@ func checkCVDUPKEY1DuplicateLocalKeys(t *testing.T, vec vectorJSON) {
 	t.Fatalf("INV-8: no two StateDiff entries share a LocalKey")
 }
 
-// checkCVUNAUTH1ReservedKeyDiscardNotVacuous is INV-9: the decoded blob has a reserved-key entry
-// and a second, non-reserved entry, and a non-empty ReturnData, so the §14.3 discard is not
-// vacuous.
+// checkCVUNAUTH1ReservedKeyDiscardNotVacuous is INV-9: the decoded blob
+// has a reserved-key entry and a second, non-reserved entry, and a
+// non-empty ReturnData, so the discard is not vacuous.
 func checkCVUNAUTH1ReservedKeyDiscardNotVacuous(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
@@ -1882,9 +1908,10 @@ func checkCVRTLRESULT1ResultTooLargeFromRefund(t *testing.T, vec vectorJSON) {
 	if len(eff.ReturnData) > codec.MaxReturnData {
 		t.Fatalf("INV-11: len(ReturnData) = %d > codec.MaxReturnData %d, want <=", len(eff.ReturnData), codec.MaxReturnData)
 	}
-	// A contract-only ExecutionResult with N state entries, no events, no outbox, empty
-	// ReturnData encodes to 122 + Σ(36+len(v)) bytes (§27.1a's fixed prefix/suffix plus one
-	// 36-byte-overhead StateDiffEntry per entry). The runtime's quota entry adds 36 + 16.
+	// A contract-only ExecutionResult with N state entries, no events,
+	// no outbox, empty ReturnData encodes to 122 + Σ(36+len(v)) bytes
+	// (the fixed prefix/suffix plus one 36-byte-overhead StateDiffEntry
+	// per entry). The runtime's quota entry adds 36 + 16.
 	contractOnly := 122 + 36 + 16
 	for _, e := range eff.StateDiff {
 		contractOnly += 36 + len(e.Value)
@@ -1897,8 +1924,9 @@ func checkCVRTLRESULT1ResultTooLargeFromRefund(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// checkOutOfGasBase is the shared assertion every CV-OOG-* named invariant starts with (§10.6):
-// status OUT_OF_GAS and gas_used equal to the vector's own plasma_limit.
+// checkOutOfGasBase is the shared assertion every CV-OOG-* named
+// invariant starts with: status OUT_OF_GAS and gas_used equal to the
+// vector's own plasma_limit.
 func checkOutOfGasBase(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	if vec.Status != "OUT_OF_GAS" {
@@ -2140,8 +2168,8 @@ func withdrawalTotals(t *testing.T, vec vectorJSON) map[string]*big.Int {
 	return totals
 }
 
-// C7. Withdrawal caps (call, SUCCESS): each asset's withdrawals sum to at most its
-// withdrawal_caps value, 0 when absent (§27.9).
+// C7. Withdrawal caps (call, SUCCESS): each asset's withdrawals sum to
+// at most its withdrawal_caps value, 0 when absent.
 func checkCallWithdrawalCaps(t *testing.T, vec vectorJSON) {
 	t.Helper()
 	for asset, total := range withdrawalTotals(t, vec) {
@@ -3503,7 +3531,31 @@ func checkEXECDEP6(t *testing.T, vec vectorJSON) {
 	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
 }
 
-// abortCharge is abort's §10.3 charge for dataLen bytes: 1 + 10 * ceil(dataLen / 32).
+// checkCVFRAME1 checks that the contract returns the frame's momentum
+// hash and that its blob carries the frame's input index.
+func checkCVFRAME1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	if vec.Status != "SUCCESS" {
+		t.Fatalf("CV-FRAME-1: status %s, want SUCCESS", vec.Status)
+	}
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("CV-FRAME-1: DecodeExecutionResult: %v", err)
+	}
+	if want := mustHex(t, vec.MomentumHash); !bytes.Equal(er.ReturnData, want) {
+		t.Fatalf("CV-FRAME-1: ReturnData %x, want the momentum hash %x", er.ReturnData, want)
+	}
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("CV-FRAME-1: DecodeContractEffects: %v", err)
+	}
+	if eff.GlobalInputIndex != vec.GlobalInputIndex {
+		t.Fatalf("CV-FRAME-1: blob global_input_index %d, want %d", eff.GlobalInputIndex, vec.GlobalInputIndex)
+	}
+}
+
+// abortCharge is abort's charge for dataLen bytes: 1 + 10 *
+// ceil(dataLen / 32).
 func abortCharge(n uint64) uint64 { return 1 + 10*((n+31)/32) }
 
 // abortGas is the gas_used of a vector whose body is abortCallBody and whose abort carries
@@ -3601,8 +3653,8 @@ func checkEXECDEP10(t *testing.T, vec vectorJSON) {
 	}
 }
 
-// blobConditions is which §10.6 content condition a decoded ContractEffects trips,
-// evaluated from the vector's JSON fields alone.
+// blobConditions is which content condition a decoded ContractEffects
+// trips, evaluated from the vector's JSON fields alone.
 type blobConditions struct {
 	IndexMismatch      bool // step 2: blob globalInputIndex != global_input_index
 	ForeignAttribution bool // step 2: an event contract_id or outbox source_contract != receipt.contract_id
@@ -3724,6 +3776,7 @@ func checkConditions(t *testing.T, vec vectorJSON, status string, want blobCondi
 
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-002":           checkN1WitnessBackendTripwire,
+	"CV-FRAME-1":         checkCVFRAME1,
 	"EXEC-FAIL-OUTBOX-1": checkN2DiscardNotVacuous,
 	"EXEC-006":           checkEXEC006DescendingLocalKeys,
 	"EXEC-012":           checkEXEC012AbsentRead,
@@ -3865,11 +3918,11 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	},
 }
 
-// TestConformanceVectors re-derives every committed value in the artifact from the JSON
-// fields alone, by a second path. It must not call refDerive or any ref* helper, must not use
-// codec.MerkleRoot, codec.Receipt.Encode, codec.Input.Hash, codec.InputRoot or
-// plugins/wasm's derive/CodeHash/callerHash for a value it is re-deriving, and must not use
-// mapState.
+// TestConformanceVectors re-derives every committed value in the
+// artifact from the JSON fields alone, by a second path. It must not
+// call refDerive or any ref* helper, must not use codec.MerkleRoot,
+// codec.Receipt.Encode or plugins/wasm's derive/CodeHash/callerHash for
+// a value it is re-deriving, and must not use mapState.
 func TestConformanceVectors(t *testing.T) {
 	data, err := os.ReadFile(vectorFilePath)
 	if err != nil {

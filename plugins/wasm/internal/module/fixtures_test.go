@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// The module builder used by every fixture in validate_test.go (and, per the ticket, meant to
-// be extended by later tickets rather than replaced). Three mechanisms:
+// The module builder used by every fixture in validate_test.go. Three
+// mechanisms:
 //
 //   - (S) Structural fields: newBuilder()'s minimal conforming module, mutated one field at a
 //     time. Every count and length in the output is computed by bytes(); every byte with

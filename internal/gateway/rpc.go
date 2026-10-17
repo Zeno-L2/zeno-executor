@@ -21,7 +21,7 @@ import (
 	"github.com/digitalSloth/go-executor/domain"
 )
 
-// The JSON-RPC server's bounds (EXECUTOR §21.7).
+// The JSON-RPC server's bounds.
 const (
 	// maxRequestBytes caps one HTTP request body.
 	maxRequestBytes = 1 << 20
@@ -118,7 +118,7 @@ const (
 	httpShutdownTimeout = 10 * time.Second
 )
 
-// JSON-RPC error codes: JSON-RPC 2.0's and EXECUTOR §21.3's.
+// JSON-RPC error codes: JSON-RPC 2.0's and the gateway's own.
 const (
 	codeParseError     = -32700
 	codeInvalidRequest = -32600
@@ -168,8 +168,8 @@ type budget struct {
 	sub *subscription
 }
 
-// Server serves JSON-RPC 2.0 over HTTP (EXECUTOR §21.3) for the
-// configured domains. It is safe for concurrent use.
+// Server serves JSON-RPC 2.0 over HTTP for the configured domains. It
+// is safe for concurrent use.
 type Server struct {
 	networkName string
 	// endpoint is the znnd endpoint, redacted from logged errors.

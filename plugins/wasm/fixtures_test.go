@@ -14,9 +14,10 @@ type wasmFuncType struct {
 	Results []byte
 }
 
-// wasmImport is one declared import. Module and Name are arbitrary: fixtures for §7.2
-// import-rejection classes need pairs the validator refuses, which the env-only builders
-// elsewhere in the tree cannot express.
+// wasmImport is one declared import. Module and Name are arbitrary:
+// fixtures for import-rejection classes need pairs the validator
+// refuses, which the env-only builders elsewhere in the tree cannot
+// express.
 type wasmImport struct {
 	Module  string
 	Name    string

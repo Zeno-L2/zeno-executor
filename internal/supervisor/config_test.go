@@ -53,7 +53,6 @@ func baseConfig(storage, binary string) map[string]any {
 			map[string]any{
 				"domainId":    float64(1),
 				"binary":      binary,
-				"role":        "EXECUTOR",
 				"stfSpecHash": validHash,
 				"memoryLimit": float64(1 << 30),
 				"cpuLimit":    1.0,
@@ -125,9 +124,6 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 	if w.Binary != binary {
 		t.Errorf("Binary = %q, want %q", w.Binary, binary)
-	}
-	if w.Role != "EXECUTOR" {
-		t.Errorf("Role = %q, want EXECUTOR", w.Role)
 	}
 	if w.STFSpecHash != wantHash {
 		t.Errorf("STFSpecHash = %v, want %v", w.STFSpecHash, wantHash)
@@ -241,7 +237,6 @@ func TestConfigWorkerConfig(t *testing.T) {
 	w := WorkerConfig{
 		DomainID:    7,
 		Binary:      "/usr/local/bin/worker",
-		Role:        "EXECUTOR",
 		STFSpecHash: types.Hash{0xAA},
 		MemoryLimit: 1 << 30,
 		CPULimit:    1.0,
@@ -252,7 +247,6 @@ func TestConfigWorkerConfig(t *testing.T) {
 		ExecutorAddress:   types.Address{0x01},
 		STFSpecHash:       types.Hash{0xAA},
 		ConfirmationDepth: 10,
-		Role:              "EXECUTOR",
 		NetworkName:       "devnet",
 		StoragePath:       "/var/lib/executor",
 		MaxPendingBatches: 5,
@@ -324,7 +318,7 @@ func TestLoadConfigInvalid(t *testing.T) {
 		}},
 		{name: "binary a directory", mutate: func(m map[string]any) { worker0(m)["binary"] = storage }},
 		{name: "binary mode 0644", mutate: func(m map[string]any) { worker0(m)["binary"] = nonExecBinary }},
-		{name: "role WATCHER", mutate: func(m map[string]any) { worker0(m)["role"] = "WATCHER" }},
+		{name: "unknown field worker role", mutate: func(m map[string]any) { worker0(m)["role"] = "executor" }},
 		{name: "stfSpecHash missing", mutate: func(m map[string]any) { delete(worker0(m), "stfSpecHash") }},
 		{name: "stfSpecHash 63 hex", mutate: func(m map[string]any) {
 			worker0(m)["stfSpecHash"] = strings.Repeat("0", 63)

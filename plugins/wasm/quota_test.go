@@ -3,7 +3,6 @@ package wasm
 import (
 	"bytes"
 	"math"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -38,10 +37,7 @@ func quotaMapState(leaves map[domain.Path][]byte, quotaLeaf []byte) *mapState {
 // quotaStore opens a state.Store seeded with values.
 func quotaStore(t *testing.T, values map[domain.Path][]byte) *state.Store {
 	t.Helper()
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { store.Close() })
 	var diff []domain.StateDiffEntry
 	for p, v := range values {

@@ -1,8 +1,7 @@
-// Package gateway is the gateway's core (EXECUTOR §21): it rebuilds a
-// served domain's state from the bundles and receipt sidecars an
-// executor publishes, checks every batch against Settlement before
-// serving it at latest, and keeps the state versions EXECUTOR §21.6
-// requires.
+// Package gateway is the gateway's core: it rebuilds a served domain's
+// state from the bundles and receipt sidecars an executor publishes,
+// checks every batch against Settlement before serving it at latest,
+// and keeps the state versions that VersionAt serves.
 package gateway
 
 import (
@@ -31,7 +30,7 @@ import (
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
-// Status is a served domain's status in zeno_getHead (EXECUTOR §21.3).
+// Status is a served domain's status in zeno_getHead.
 type Status string
 
 const (
@@ -75,9 +74,9 @@ type SettlementView interface {
 	BatchEntry(domainID uint32, batchID uint64) (*definition.BatchEntry, bool, error)
 	DomainRecord(domainID uint32) (*definition.DomainRecord, bool, error)
 	OutboxProcessed(outboxID types.Hash) (bool, error)
-	// Momentum returns the height and unix time of the momentum the
-	// view reads at.
-	Momentum() (height, unixTime uint64)
+	// Momentum returns the height, unix time and hash of the momentum
+	// the view reads at.
+	Momentum() (height, unixTime uint64, hash types.Hash)
 	AssetConfig(domainID uint32, assetID types.Hash) (*definition.AssetConfig, bool, error)
 }
 
@@ -181,7 +180,9 @@ func (t timedView) OutboxProcessed(outboxID types.Hash) (bool, error) {
 	})
 }
 
-func (t timedView) Momentum() (height, unixTime uint64) { return t.view.Momentum() }
+func (t timedView) Momentum() (height, unixTime uint64, hash types.Hash) {
+	return t.view.Momentum()
+}
 
 func (t timedView) AssetConfig(domainID uint32, assetID types.Hash) (*definition.AssetConfig, bool, error) {
 	type r struct {
@@ -214,10 +215,9 @@ type ChainConfig struct {
 	Logf func(format string, args ...any)
 }
 
-// Chain follows one domain (EXECUTOR §21.2) and holds its state
-// versions (§21.6). Poll is its only writer and is not safe for
-// concurrent use; Head and VersionAt are safe from any goroutine,
-// including while Poll runs.
+// Chain follows one domain and holds its state versions. Poll is its
+// only writer and is not safe for concurrent use; Head and VersionAt
+// are safe from any goroutine, including while Poll runs.
 type Chain struct {
 	cfg ChainConfig
 
@@ -815,9 +815,6 @@ func (c *Chain) finalize(p *poll) error {
 		if _, err := c.cfg.Final.Apply(b.diff); err != nil {
 			return fmt.Errorf("gateway: domain %d: finalize batch %d: %w", c.cfg.DomainID, id, err)
 		}
-		if err := c.cfg.Final.TruncateLog(); err != nil {
-			return fmt.Errorf("gateway: domain %d: finalize batch %d: %w", c.cfg.DomainID, id, err)
-		}
 		head := b.want.head()
 		c.mu.Lock()
 		c.finalized = &head
@@ -1312,11 +1309,11 @@ type batchInput struct {
 	chunk     []byte   // a DeployContractChunk record's chunk bytes
 }
 
-// maxInputData returns the longest canonical input encoding of kind
-// (SPEC §27.5): input_kind(1) and source_account_block_hash(32), then
-// the kind's tail, with a CallL2 payload at MaxCallPayload and
-// DeployContractStart metadata at MaxContractMetadataSize, the limit
-// Settlement enforces at receive. Any other kind has no tail.
+// maxInputData returns the longest canonical input encoding of kind:
+// input_kind(1) and source_account_block_hash(32), then the kind's
+// tail, with a CallL2 payload at MaxCallPayload and DeployContractStart
+// metadata at MaxContractMetadataSize, the limit Settlement enforces at
+// receive. Any other kind has no tail.
 func maxInputData(kind byte) int {
 	const prefix = 1 + 32
 	switch codec.InputKind(kind) {
@@ -1351,15 +1348,14 @@ func maxInputData(kind byte) int {
 	return prefix
 }
 
-// checkBatch runs EXECUTOR §21.2's four checks, the receipt-to-record
-// match and the commitment binding over one batch's bundle and
-// sidecar, applying its StateDiffs to base. It bounds each record's
-// input data by maxInputData, its deploy chunk data by
-// MaxDeployChunkData and its execution result by MaxExecutionResult.
-// Every error it returns is a failed check, except errOverBudget. It
-// returns errOverBudget, after every check but check 3, when the batch
-// costs more than limit. It also returns each record's data for the
-// index.
+// checkBatch runs the four batch checks, the receipt-to-record match
+// and the commitment binding over one batch's bundle and sidecar,
+// applying its StateDiffs to base. It bounds each record's input data
+// by maxInputData, its deploy chunk data by MaxDeployChunkData and its
+// execution result by MaxExecutionResult. Every error it returns is a
+// failed check, except errOverBudget. It returns errOverBudget, after
+// every check but check 3, when the batch costs more than limit. It
+// also returns each record's data for the index.
 func checkBatch(base state.Version, want expect, bundle, sidecar []byte, limit int64) (checked, error) {
 	if !bytes.Equal(crypto.Hash(bundle), want.daHash[:]) {
 		return checked{}, fmt.Errorf("check 1: bundle does not hash to daHash %s", want.daHash)

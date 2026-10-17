@@ -22,9 +22,6 @@ import (
 // malformed or out-of-range field, rejected before any worker starts.
 var ErrConfig = errors.New("supervisor: invalid configuration")
 
-// roleExecutor is the only worker role this package implements (EXECUTOR §17).
-const roleExecutor = "EXECUTOR"
-
 // defaultMaxPendingBatches is the maxPendingBatches an absent field takes.
 const defaultMaxPendingBatches = 8
 
@@ -39,9 +36,10 @@ const cpuLimitMin = 0.01
 // conversion in workerproc_linux.go's cpu.max write, and well above any host's real core count.
 const cpuLimitMax = 1024.0
 
-// Config is the supervisor's boot configuration, decoded from one JSON file with
-// DisallowUnknownFields: a binary requires every field it consumes and rejects any field it does
-// not (EXECUTOR §17), so no setting is silently ignored.
+// Config is the supervisor's boot configuration, decoded from one JSON
+// file with DisallowUnknownFields: a binary requires every field it
+// consumes and rejects any field it does not, so no setting is silently
+// ignored.
 type Config struct {
 	ExecutorAddress     types.Address  `json:"executorAddress"`
 	NetworkName         string         `json:"networkName"`
@@ -65,7 +63,6 @@ type KeySource struct {
 type WorkerConfig struct {
 	DomainID    uint32     `json:"domainId"`
 	Binary      string     `json:"binary"`
-	Role        string     `json:"role"`
 	STFSpecHash types.Hash `json:"stfSpecHash"`
 	MemoryLimit int64      `json:"memoryLimit"` // bytes
 	CPULimit    float64    `json:"cpuLimit"`    // CPUs
@@ -153,9 +150,6 @@ func LoadConfig(path string) (Config, error) {
 		if fi.Mode().Perm()&0o111 == 0 {
 			return Config{}, fmt.Errorf("%w: workers[%d].binary %q is not executable", ErrConfig, i, w.Binary)
 		}
-		if w.Role != roleExecutor {
-			return Config{}, fmt.Errorf("%w: workers[%d].role %q is not %s", ErrConfig, i, w.Role, roleExecutor)
-		}
 		if w.STFSpecHash.IsZero() {
 			return Config{}, fmt.Errorf("%w: workers[%d].stfSpecHash is required", ErrConfig, i)
 		}
@@ -178,16 +172,16 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// workerConfig is the channel Config frame for w: w's DomainID, STFSpecHash and Role, plus c's
-// ExecutorAddress, NetworkName, ConfirmationDepth, StoragePath and MaxPendingBatches. The
-// supervisor sends this to the worker over its channel before serving any request.
+// workerConfig is the channel Config frame for w: w's DomainID and
+// STFSpecHash, plus c's ExecutorAddress, NetworkName,
+// ConfirmationDepth, StoragePath and MaxPendingBatches. The supervisor
+// sends this to the worker over its channel before serving any request.
 func (c Config) workerConfig(w WorkerConfig) ipc.WorkerConfig {
 	return ipc.WorkerConfig{
 		DomainID:          w.DomainID,
 		ExecutorAddress:   c.ExecutorAddress,
 		STFSpecHash:       w.STFSpecHash,
 		ConfirmationDepth: c.ConfirmationDepth,
-		Role:              w.Role,
 		NetworkName:       c.NetworkName,
 		StoragePath:       c.StoragePath,
 		MaxPendingBatches: c.MaxPendingBatches,

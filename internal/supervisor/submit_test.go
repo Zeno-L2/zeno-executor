@@ -1655,9 +1655,9 @@ func TestSubmitGates(t *testing.T) {
 			m.ExecutorAddress = types.Address{0x77}
 			g.Member = &m
 		}, `executor-set member names`},
-		{"member lapsed", func(g *settlement.Gates) {
+		{"member not active", func(g *settlement.Gates) {
 			m := *g.Member
-			m.Status = definition.ExecutorStatusLapsed
+			m.Status = 1
 			g.Member = &m
 		}, `has status 1, not active`},
 	}

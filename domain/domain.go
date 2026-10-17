@@ -44,26 +44,27 @@ type StateDiffEntry struct {
 // AssetFlowSummary. Every deterministic execution outcome, including every failure status, is
 // returned as Effects with a nil error — see Apply's doc comment for the halt/status split.
 type Effects struct {
-	// Status is the §15 receipt status ordinal.
+	// Status is the receipt status ordinal.
 	Status codec.Status
-	// GasUsed is committed in the receiptRoot; its value per status is a domain invariant, not
-	// a free choice (§27.7).
+	// GasUsed is committed in the receiptRoot; its value per status is
+	// a domain invariant, not a free choice.
 	GasUsed uint64
 	// ContractID is the receipt's contractId; zero when no contract target was involved.
 	ContractID types.Hash
 	// CodeHash is the receipt's codeHash; zero when nothing executed.
 	CodeHash types.Hash
-	// AbortCode is the §7.5 abort code of a REVERT: the code passed to env.abort, or for a run
-	// returning r < 0 the value (-r) truncated to i32. It is 0 for every other status. It is
-	// in-process only — no wire format carries it today.
+	// AbortCode is the abort code of a REVERT: the code passed to
+	// env.abort, or for a run returning r < 0 the value (-r) truncated
+	// to i32. It is 0 for every other status. It is in-process only: no
+	// wire format carries it today.
 	AbortCode int32
-	// ClaimedDeposit is zero on any failure status (§14.3).
+	// ClaimedDeposit is zero on any failure status.
 	ClaimedDeposit codec.U256
 	StateDiff      []StateDiffEntry
 	Events         []codec.Event
 	OutboxMessages []codec.OutboxMessage
-	// ReturnData is empty on every non-SUCCESS status except REVERT, where it is the revert
-	// data (§14.3).
+	// ReturnData is empty on every non-SUCCESS status except REVERT,
+	// where it is the revert data.
 	ReturnData []byte
 }
 
@@ -86,6 +87,10 @@ type InputContext struct {
 	GlobalInputIndex uint64
 	MomentumHeight   uint64
 	MomentumTime     uint64
+	// MomentumHash is the hash of the momentum at MomentumHeight.
+	// The pillar that produced that momentum chose its content, so
+	// the hash is not a source of unbiased randomness.
+	MomentumHash types.Hash
 	// L1Sender is the raw L1 sender address of the source account-block.
 	L1Sender types.Address
 	// SourceData is domain-defined bytes from the source account-block that the domain's
@@ -95,15 +100,18 @@ type InputContext struct {
 	Caps CapLookup
 }
 
-// CapLookup answers the per-asset withdrawal caps step 5a applies to one input (SPEC §27.9):
-// for each asset, the MaxBatchWithdrawal in Settlement state at the end of the momentum
-// confirming the input's receive, for the input's domain. An asset with no AssetConfig has cap
-// 0. The answers are L1 state proven at that fixed momentum, so Apply stays a function of state
-// and its input. An error means the caps could not be read; Apply returns it wrapped with %w and
-// never turns it into a status.
+// CapLookup answers the per-asset withdrawal caps plugins/wasm's
+// step 5a applies to one input: for each asset, the MaxBatchWithdrawal
+// in Settlement state at the end of the momentum confirming the input's
+// receive, for the input's domain. An asset with no AssetConfig has a
+// cap of zero. The answers are L1 state proven at that fixed momentum,
+// so Apply stays a function of state and its input. An error means the
+// caps could not be read; Apply returns it wrapped with %w and never
+// turns it into a status.
 type CapLookup interface {
-	// MaxBatchWithdrawals returns one cap per asset, in assets order. Step 5a asks once per
-	// input, with every asset the input withdraws.
+	// MaxBatchWithdrawals returns one cap per asset, in assets order.
+	// plugins/wasm's step 5a asks once per input, with every asset the
+	// input withdraws.
 	MaxBatchWithdrawals(assets []codec.AssetID) ([]codec.U256, error)
 }
 
@@ -154,9 +162,10 @@ type RelayPayload struct {
 	Data []byte
 }
 
-// Source is implemented only by domains whose inputSource is L1_RELAYED (§6.1) — the relay
-// role watches an external chain and posts what the domain's STF will need onto L1. An
-// L1_NATIVE domain implements only Domain.
+// Source is implemented only by domains whose inputSource is
+// L1_RELAYED: the relay role watches an external chain and posts what
+// the domain's STF will need onto L1. An L1_NATIVE domain implements
+// only Domain.
 type Source interface {
 	Watch(ctx context.Context) (<-chan RelayPayload, error)
 }

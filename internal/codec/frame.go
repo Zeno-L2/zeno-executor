@@ -6,8 +6,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// ExecutionInputFrame is the contiguous input frame the runtime writes at memory offset 0
-// before invoking a contract's run entry point (§27.1).
+// ExecutionInputFrame is the contiguous input frame the runtime writes
+// at memory offset 0 before invoking a contract's run entry point.
 type ExecutionInputFrame struct {
 	ContextVersion uint16
 	ChainID        types.Hash
@@ -16,6 +16,7 @@ type ExecutionInputFrame struct {
 	CodeHash       types.Hash
 	MomentumHeight uint64
 	MomentumTime   uint64
+	MomentumHash   types.Hash
 	InputIndex     uint64
 	DepositAsset   AssetID
 	DepositAmount  U256
@@ -35,6 +36,7 @@ func (f ExecutionInputFrame) Encode() ([]byte, error) {
 	w.hash(f.CodeHash)
 	w.u64(f.MomentumHeight)
 	w.u64(f.MomentumTime)
+	w.hash(f.MomentumHash)
 	w.u64(f.InputIndex)
 	w.raw(f.DepositAsset[:])
 	w.u256(f.DepositAmount)
@@ -42,9 +44,9 @@ func (f ExecutionInputFrame) Encode() ([]byte, error) {
 	return w.buf, nil
 }
 
-// DecodeExecutionInputFrame decodes a canonical ExecutionInputFrame. It rejects
-// context_version != RuntimeProfileVersion with ErrUnknownVersion before reading any other
-// field (§24).
+// DecodeExecutionInputFrame decodes a canonical ExecutionInputFrame. It
+// rejects context_version != RuntimeProfileVersion with
+// ErrUnknownVersion before reading any other field.
 func DecodeExecutionInputFrame(b []byte) (ExecutionInputFrame, error) {
 	r := newReader(b)
 	var f ExecutionInputFrame
@@ -74,6 +76,9 @@ func DecodeExecutionInputFrame(b []byte) (ExecutionInputFrame, error) {
 		return f, fmt.Errorf("codec: decode frame: %w", err)
 	}
 	if f.MomentumTime, err = r.u64(); err != nil {
+		return f, fmt.Errorf("codec: decode frame: %w", err)
+	}
+	if f.MomentumHash, err = r.hash(); err != nil {
 		return f, fmt.Errorf("codec: decode frame: %w", err)
 	}
 	if f.InputIndex, err = r.u64(); err != nil {

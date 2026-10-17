@@ -17,10 +17,10 @@ import (
 	"github.com/digitalSloth/go-executor/internal/state"
 )
 
-// MaxBatchInputs is the §25.1 per-batch input count cap.
+// MaxBatchInputs is the per-batch input count cap.
 const MaxBatchInputs = codec.MaxBatchInputs
 
-// DAMode is the §20 DA mode ordinal; 0 is the only Phase-1 value.
+// DAMode is the DA mode ordinal; the driver always uses 0.
 const DAMode uint8 = 0
 
 // InputSource is the ordered per-domain input stream. *ledger.Follower satisfies it; ok ==
@@ -29,15 +29,15 @@ type InputSource interface {
 	Next() (ledger.Input, bool, error)
 }
 
-// BundleStore is the persistence seam the DAHash round-trip reads back through. Ticket 07
-// owns the on-disk implementation.
+// BundleStore is the persistence seam the DAHash round-trip reads back
+// through. recovery.BundleStore is the on-disk implementation.
 type BundleStore interface {
 	Put(daHash types.Hash, bundle []byte) error
 	Get(daHash types.Hash) ([]byte, error)
 }
 
-// ReceiptStore persists a batch's receipt sidecar (EXECUTOR §21.2) by DAHash. Put rejects a
-// sidecar whose leaves do not hash to receiptRoot.
+// ReceiptStore persists a batch's receipt sidecar by DAHash. Put
+// rejects a sidecar whose leaves do not hash to receiptRoot.
 type ReceiptStore interface {
 	Put(daHash, receiptRoot types.Hash, sidecar []byte) error
 }
@@ -73,12 +73,13 @@ var (
 	// (go-zenon vm/constants/settlement.go:64), so its withdrawalDebit stays representable. This
 	// is unreachable in practice. Kept as a structural, fail-closed guard.
 	ErrUnbatchable = errors.New("batch: first input of a batch alone exceeds a per-batch cap")
-	// ErrEffectsInvariant reports that an input's Effects carried content that violates a
-	// committed invariant: on a non-SUCCESS status, §14.3/§15 forbid a non-empty StateDiff or
-	// Events, a non-empty ReturnData outside REVERT, a non-zero ClaimedDeposit, a non-zero
-	// AbortCode outside REVERT, or an OutboxMessages set other than empty or exactly one
-	// runtime-emitted deposit refund; on SUCCESS, ClaimedDeposit must not exceed the input's own
-	// deposit_amount (§18.3).
+	// ErrEffectsInvariant reports that an input's Effects carried
+	// content that violates a committed invariant: a non-SUCCESS status
+	// forbids a non-empty StateDiff or Events, a non-empty ReturnData
+	// outside REVERT, a non-zero ClaimedDeposit, a non-zero AbortCode
+	// outside REVERT, or an OutboxMessages set other than empty or
+	// exactly one runtime-emitted deposit refund; on SUCCESS,
+	// ClaimedDeposit must not exceed the input's own deposit_amount.
 	ErrEffectsInvariant = errors.New("batch: non-success effects carry committed content")
 	// ErrDriverReorged reports that NextBatch was called again on a Driver that already returned
 	// a *ledger.ReorgError. The caller must discard this Driver and construct a fresh one over
@@ -89,9 +90,10 @@ var (
 	ErrMisaligned = errors.New("batch: input stream does not end a batch at the accepted lastInputSeq")
 )
 
-// Driver runs the per-input execution pipeline against Config.Domain and Config.Store, slices
-// Config.Inputs' stream into batches under the §25.1/§27.9 caps, and assembles and
-// self-verifies each batch through NextBatch.
+// Driver runs the per-input execution pipeline against Config.Domain
+// and Config.Store, slices Config.Inputs' stream into batches under the
+// per-batch caps, and assembles and self-verifies each batch through
+// NextBatch.
 //
 // Config.Store's exclusive ownership by the Driver, for its entire lifetime, is a precondition:
 // the Driver caches the store's current root and refreshes it only from its own Store.Apply
@@ -104,8 +106,9 @@ type Driver struct {
 
 	batchID uint64
 
-	// carried is the first input of the next batch when a cap closed the previous one: computed
-	// through step 7, unapplied, resumed at step 8 by the next NextBatch call.
+	// carried is the first input of the next batch when a cap closed
+	// the previous one: computed by computeRecord, unapplied, resumed
+	// at cap evaluation by the next NextBatch call.
 	carried *applied
 
 	// open holds the records of a batch NextBatchTo has not closed yet, applied to the store and
@@ -138,9 +141,10 @@ func New(cfg Config) (*Driver, error) {
 	return &Driver{cfg: cfg, batchID: cfg.FirstBatchID}, nil
 }
 
-// applied is one input's per-input pipeline output, computed through step 7 (witness proofs).
-// postStateRoot and encodedResult are set only once steps 9-10 have run; a carried record is the
-// same value short of those two steps.
+// applied is one input's per-input pipeline output, computed by
+// computeRecord (through the witness proofs). postStateRoot and
+// encodedResult are set only once finishApply has run; a carried record
+// is the same value short of those two fields.
 type applied struct {
 	input         ledger.Input
 	inputData     []byte
@@ -164,32 +168,36 @@ type applied struct {
 //
 //   - ok == false with a nil error: the source yielded nothing and nothing was accumulated.
 //
-//   - A source error with nothing accumulated: returned wrapped with %w, never reclassified, so
-//     errors.As(err, **ledger.ReorgError) and errors.Is(err, ledger.ErrSourceRead) both
-//     survive to the caller. ledger.Follower.Next documents three distinct classes — an
-//     unlatched MomentumSource read error the caller may retry, a one-shot *ReorgError, and a
-//     latched permanent error — and EXECUTOR.md §15 gives each a different behaviour ("retry
-//     with backoff" vs "roll back cursor+state" vs HALTED). Classification and backoff are the
+//   - A source error with nothing accumulated: returned wrapped with
+//     %w, never reclassified, so errors.As(err, **ledger.ReorgError)
+//     and errors.Is(err, ledger.ErrSourceRead) both survive to the
+//     caller. ledger.Follower.Next documents three distinct classes: an
+//     unlatched MomentumSource read error the caller may retry, a
+//     one-shot *ReorgError, and a latched permanent error. Each class
+//     calls for a different behaviour ("retry with backoff" vs "roll
+//     back cursor+state" vs HALTED). Classification and backoff are the
 //     caller's; NextBatch must not collapse them into a halt.
 //
-//   - A *ledger.ReorgError, whatever is accumulated: discard the accumulated records and return
-//     the error wrapped. NextBatch never closes and returns a batch on this class. A reorg means
-//     the ledger no longer extends the last momentum the follower consumed, so inputs already
-//     popped and applied may come from a retracted momentum; returning them with a nil error
-//     would let the caller submit them before its next call tells it about the reorg. Nothing is
-//     lost by discarding: the store already carries their writes, and the recovery layer's rollback
-//     must restore the durable side effects a discarded record produced that it owns — the cursor,
-//     the state trie and the WAL: Store.Apply appends each diff to the durable WAL before this
-//     method returns (internal/state/store.go:117), so a rollback that only rewrites in-memory leaves lands back
-//     on the discarded root after a restart replays that log; and Domain.DecodeInput (step 4,
-//     called before any admission or cap decision) can mutate a domain plugin's own local,
-//     non-consensus store outside the state trie. Replay rewrites every chunk a canonical
-//     finalize assembles, because Settlement accepts a finalize only once every chunk is present
-//     (§11.3). The unrepaired path (EXECUTOR §15): the retracted branch saw a pending record
-//     expire (§11.5) and accepted a second DeployContractStart from the same deployer for the
-//     same code_hash; that second record survives the rollback, and a canonical finalize for
-//     the first record assembles against it. Another deployer's start cannot reach the
-//     record. Operator remedy: EXECUTOR §15.
+//   - A *ledger.ReorgError, whatever is accumulated: discard the
+//     accumulated records and return the error wrapped. NextBatch never
+//     closes and returns a batch on this class. A reorg means the
+//     ledger no longer extends the last momentum the follower consumed,
+//     so inputs already popped and applied may come from a retracted
+//     momentum; returning them with a nil error would let the caller
+//     submit them before its next call tells it about the reorg.
+//     Nothing is lost by discarding: the store already carries their
+//     writes, and the recovery layer's rollback must restore the side
+//     effects a discarded record produced that it owns: the cursor and
+//     the state trie; and Domain.DecodeInput (called before any
+//     admission or cap decision) can mutate a domain plugin's own
+//     local, non-consensus store outside the state trie. Replay
+//     rewrites every chunk a canonical finalize assembles, because
+//     Settlement accepts a finalize only once every chunk is present.
+//     The unrepaired path: the retracted branch saw a pending record
+//     expire and accepted a second DeployContractStart from the same
+//     deployer for the same code_hash; that second record survives the
+//     rollback, and a canonical finalize for the first record assembles
+//     against it. Another deployer's start cannot reach the record.
 //
 //   - After a *ledger.ReorgError, the caller MUST NOT reuse this Driver instance: it caches the
 //     store's current root (currentRoot) and only ever refreshes it from its own Store.Apply
@@ -205,24 +213,30 @@ type applied struct {
 //     re-present on the next call. This is what keeps already-executed, already-applied inputs
 //     from being dropped between batches.
 //
-//   - An error wrapping ledger.ErrCapRead, from Domain.Apply (step 5a) or from the driver's own
-//     cap lookup after Apply: the withdrawal-cap source is unavailable. It is not a halt and not
-//     a retry. The caller ends the run on it and the supervisor restarts the worker. NextBatch
-//     discards the accumulated records, whose writes the store already carries, so the caller
-//     MUST NOT call NextBatch on this Driver again. A restart replays safely: boot reopens the
-//     snapshot at the last commit and discards the WAL, so the dropped records are re-derived
-//     and never applied twice.
+//   - An error wrapping ledger.ErrCapRead, from Domain.Apply
+//     (plugins/wasm's step 5a) or from the driver's own cap lookup
+//     after Apply: the withdrawal-cap source is unavailable. It is not
+//     a halt and not a retry. The caller ends the run on it and the
+//     supervisor restarts the worker. NextBatch discards the
+//     accumulated records, whose writes the store already carries, so
+//     the caller MUST NOT call NextBatch on this Driver again. A
+//     restart replays safely: boot reopens the snapshot at the last
+//     commit, so the dropped records are re-derived and never applied
+//     twice.
 //
 //   - Every other non-source error is a halt: a Domain.DecodeInput/Domain.Apply error, an encode
 //     error, ErrDAHashMismatch, ErrEffectsInvariant, ErrUnbatchable.
 //
-// Outside a reorg discard or a cap-read error, the store always equals the last returned batch's
-// PostStateRoot: cap evaluation (step 8) precedes Store.Apply, so the store never runs ahead of a
-// batch NextBatch has not yet returned. Those two cases break the invariant: the store is then
-// ahead of it by the dropped records' writes. Restoring it is the rollback's job after a reorg
-// and the restart's job after a cap-read error, never the Driver's. While d.open holds records
-// the store is likewise ahead of the last returned batch's PostStateRoot, by their writes, and
-// the caller must not commit.
+// Outside a reorg discard or a cap-read error, the store always equals
+// the last returned batch's PostStateRoot: cap evaluation
+// (admitCandidate) precedes Store.Apply, so the store never runs ahead
+// of a batch NextBatch has not yet returned. Those two cases break the
+// invariant: the store is then ahead of it by the dropped records'
+// writes. Restoring it is the rollback's job after a reorg and the
+// restart's job after a cap-read error, never the Driver's. While
+// d.open holds records the store is likewise ahead of the last returned
+// batch's PostStateRoot, by their writes, and the caller must not
+// commit.
 func (d *Driver) NextBatch() (Batch, bool, error) {
 	return d.nextBatch(0, false)
 }
@@ -263,8 +277,9 @@ func (d *Driver) nextBatch(to uint64, aligned bool) (Batch, bool, error) {
 				return Batch{}, false, misalignedAt(rec.input.Ctx.GlobalInputIndex, nil, to)
 			}
 		} else if _, err := admitCandidate(&totals, &rec, true); err != nil {
-			// isFirst=true: a breach here is ErrUnbatchable (edge case 5), never a close-and-carry,
-			// since this batch has nothing accumulated yet to close.
+			// isFirst=true: a breach here is ErrUnbatchable, never a
+			// close-and-carry, since this batch has nothing accumulated
+			// yet to close.
 			return Batch{}, false, err
 		}
 
@@ -380,9 +395,10 @@ func (d *Driver) currentRoot() (types.Hash, error) {
 	return root, nil
 }
 
-// computeRecord runs steps 1-7 of the per-input pipeline against in: the cached pre-state root,
-// the canonical input encoding and its deposit, decode, apply, the non-SUCCESS effects
-// invariant, and the witness proofs. Steps 8-10 are driven by NextBatch.
+// computeRecord runs the per-input pipeline against in: the cached
+// pre-state root, the canonical input encoding and its deposit, decode,
+// apply, the non-SUCCESS effects invariant, and the witness proofs. Cap
+// evaluation (admitCandidate) and finishApply are driven by NextBatch.
 func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	var rec applied
 	rec.input = in
@@ -405,7 +421,7 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	case err == nil:
 		rec.depositAsset, rec.depositAmount = depositOf(ci.Args)
 	case errors.Is(err, codec.ErrInvalidKind):
-		// An unsupported-kind input carries no deposit; not a halt (edge case per §27.5).
+		// An unsupported-kind input carries no deposit; not a halt.
 	default:
 		return applied{}, fmt.Errorf("batch: decode canonical input: %w", err)
 	}
@@ -453,9 +469,11 @@ func (d *Driver) computeRecord(in ledger.Input) (applied, error) {
 	return rec, nil
 }
 
-// withdrawalCaps returns the cap in.Ctx.Caps answers for each asset eff holds a contract
-// L1Withdrawal in (a non-zero SourceContract, any amount), in one lookup: the cap step 5a checked
-// the input against. A refund needs no cap. It returns nil when eff holds no contract withdrawal.
+// withdrawalCaps returns the cap in.Ctx.Caps answers for each asset eff
+// holds a contract L1Withdrawal in (a non-zero SourceContract, any
+// amount), in one lookup: the cap plugins/wasm's step 5a checked the
+// input against. A refund needs no cap. It returns nil when eff holds
+// no contract withdrawal.
 func withdrawalCaps(in ledger.Input, eff domain.Effects) (map[codec.AssetID]codec.U256, error) {
 	var assets []codec.AssetID
 	seen := map[codec.AssetID]bool{}
@@ -484,9 +502,10 @@ func withdrawalCaps(in ledger.Input, eff domain.Effects) (map[codec.AssetID]code
 	return caps, nil
 }
 
-// finishApply runs steps 9-10: on SUCCESS, Store.Apply and refresh the cached root; otherwise
-// postStateRoot equals preStateRoot and the store is untouched. Either way it assembles and
-// encodes the ExecutionResult.
+// finishApply applies the record: on SUCCESS, Store.Apply and refresh
+// the cached root; otherwise postStateRoot equals preStateRoot and the
+// store is untouched. Either way it assembles and encodes the
+// ExecutionResult.
 func (d *Driver) finishApply(rec applied) (applied, error) {
 	if rec.eff.Status == codec.StatusSuccess {
 		post, err := d.cfg.Store.Apply(rec.eff.StateDiff)
@@ -534,12 +553,14 @@ func CheckEffects(eff domain.Effects, depositAmount codec.U256) error {
 	return checkClaimedDeposit(eff.ClaimedDeposit, depositAmount)
 }
 
-// checkNonSuccessInvariant enforces edge case 7 / §14.3 / §15: a non-SUCCESS input's Effects
-// carry no StateDiff or Events, no ReturnData unless the status is REVERT (where it is the
-// revert data), a zero ClaimedDeposit, AbortCode zero unless the status is REVERT, and an
-// OutboxMessages set that is either empty or exactly one message that is a codec.L1Withdrawal
-// at OutboxIndex 0 with a zero SourceContract. That message is the runtime-emitted deposit
-// refund, the only outbox content a failed input may carry.
+// checkNonSuccessInvariant enforces that a non-SUCCESS input's Effects
+// carry no StateDiff or Events, no ReturnData unless the status is
+// REVERT (where it is the revert data), a zero ClaimedDeposit,
+// AbortCode zero unless the status is REVERT, and an OutboxMessages set
+// that is either empty or exactly one message that is a
+// codec.L1Withdrawal at OutboxIndex 0 with a zero SourceContract. That
+// message is the runtime-emitted deposit refund, the only outbox
+// content a failed input may carry.
 func checkNonSuccessInvariant(eff domain.Effects) error {
 	if len(eff.StateDiff) != 0 || len(eff.Events) != 0 {
 		return fmt.Errorf("%w: non-empty StateDiff/Events", ErrEffectsInvariant)
@@ -572,12 +593,13 @@ func checkNonSuccessInvariant(eff domain.Effects) error {
 	return nil
 }
 
-// checkClaimedDeposit enforces, on a SUCCESS effects, that the plugin's own ClaimedDeposit does
-// not exceed the input's deposit_amount — the bound plugins/wasm's step 4 already enforces
-// (effects.go:107), re-checked here at the plugin seam because ClaimedDeposit is content a
-// plugin returns and the driver commits on trust otherwise (§18.3 conservation). Violation is
-// ErrEffectsInvariant, the same sentinel checkNonSuccessInvariant uses for a plugin's untrusted
-// effects.
+// checkClaimedDeposit enforces, on a SUCCESS effects, that the plugin's
+// own ClaimedDeposit does not exceed the input's deposit_amount, the
+// bound plugins/wasm's step 4 already enforces (effects.go:107),
+// re-checked here at the plugin seam because ClaimedDeposit is content
+// a plugin returns and the driver commits on trust otherwise (deposit
+// conservation). Violation is ErrEffectsInvariant, the same sentinel
+// checkNonSuccessInvariant uses for a plugin's untrusted effects.
 func checkClaimedDeposit(claimed, depositAmount codec.U256) error {
 	if new(big.Int).SetBytes(claimed[:]).Cmp(new(big.Int).SetBytes(depositAmount[:])) > 0 {
 		return fmt.Errorf("%w: ClaimedDeposit exceeds the input's deposit_amount", ErrEffectsInvariant)
@@ -585,9 +607,10 @@ func checkClaimedDeposit(claimed, depositAmount codec.U256) error {
 	return nil
 }
 
-// witnessKeys returns the union of observed paths and diff paths, deduplicated and ascending.
-// On a non-SUCCESS input diff is empty (checkNonSuccessInvariant enforces it), so the union
-// reduces to the observed paths alone (edge case 9) with no special-casing needed here.
+// witnessKeys returns the union of observed paths and diff paths,
+// deduplicated and ascending. On a non-SUCCESS input diff is empty
+// (checkNonSuccessInvariant enforces it), so the union reduces to the
+// observed paths alone with no special-casing needed here.
 func witnessKeys(observed []state.Witness, diff []domain.StateDiffEntry) []trie.Path {
 	set := make(map[trie.Path]bool, len(observed)+len(diff))
 	for _, w := range observed {

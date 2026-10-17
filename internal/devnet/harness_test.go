@@ -331,7 +331,6 @@ func domainParams(status uint8) []any {
 		[]byte{},
 		uint8(1),
 		definition.ProposerPolicySingle,
-		[]byte{},
 		definition.FinalityModelDelay,
 		status,
 		constants.WithdrawalDelayMin,
@@ -579,7 +578,6 @@ func writeConfig(t *testing.T, dir, workerBin string) (configPath, storagePath s
 			map[string]any{
 				"domainId":    domainID,
 				"binary":      workerBin,
-				"role":        "EXECUTOR",
 				"stfSpecHash": stfSpecHash.String(),
 				"memoryLimit": 1073741824,
 				"cpuLimit":    1.0,

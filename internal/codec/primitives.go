@@ -9,9 +9,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// U256 is a fixed 32-byte big-endian unsigned integer (§27.0). It is a fixed-size array,
-// never a *big.Int, precisely so the codec cannot range-check or normalize it — a u256 is
-// never range-checked at this layer (§27.0).
+// U256 is a fixed 32-byte big-endian unsigned integer. It is a
+// fixed-size array, never a *big.Int, precisely so the codec cannot
+// range-check or normalize it: a u256 is never range-checked at this
+// layer.
 type U256 [32]byte
 
 // U256FromBig converts v into its 32-byte big-endian encoding, erroring on a negative value
@@ -29,7 +30,8 @@ func U256FromBig(v *big.Int) (U256, error) {
 	return out, nil
 }
 
-// writer is an append-only canonical-encoding buffer over the §27.0 primitives.
+// writer is an append-only canonical-encoding buffer over the codec
+// primitives.
 type writer struct {
 	buf []byte
 }
@@ -39,8 +41,9 @@ func (w *writer) u16(v uint16) { w.buf = binary.BigEndian.AppendUint16(w.buf, v)
 func (w *writer) u32(v uint32) { w.buf = binary.BigEndian.AppendUint32(w.buf, v) }
 func (w *writer) u64(v uint64) { w.buf = binary.BigEndian.AppendUint64(w.buf, v) }
 
-// i32 writes v as its two's-complement big-endian four-byte encoding (§27.7), the same width
-// as u32. Every int32 is a valid abort_code, so there is no range check.
+// i32 writes v as its two's-complement big-endian four-byte encoding,
+// the same width as u32. Every int32 is a valid abort_code, so there
+// is no range check.
 func (w *writer) i32(v int32) { w.u32(uint32(v)) }
 
 func (w *writer) u256(v U256)             { w.buf = append(w.buf, v[:]...) }
@@ -110,7 +113,7 @@ func (r *reader) u64() (uint64, error) {
 	return binary.BigEndian.Uint64(b), nil
 }
 
-// i32 reads a two's-complement big-endian four-byte abort_code (§27.7).
+// i32 reads a two's-complement big-endian four-byte abort_code.
 func (r *reader) i32() (int32, error) {
 	v, err := r.u32()
 	return int32(v), err

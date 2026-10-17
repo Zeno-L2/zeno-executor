@@ -25,9 +25,10 @@ const (
 // metadata bytes: metadata_hash(32) + total_size(8) + chunk_count(4).
 const pendingRecordPrefixSize = 44
 
-// pendingRecord is the decoded kind-2 record DecodeInput wrote to the local store.
-// MetadataHash is decoded for round-trip fidelity with encodePendingRecord. The deployer is
-// not stored: the record's key carries it. Metadata feeds finalize's §27.12 validation.
+// pendingRecord is the decoded kind-2 record DecodeInput wrote to the
+// local store. MetadataHash is decoded for round-trip fidelity with
+// encodePendingRecord. The deployer is not stored: the record's key
+// carries it. Metadata feeds finalize's metadata validation.
 type pendingRecord struct {
 	MetadataHash types.Hash
 	TotalSize    uint64
@@ -35,9 +36,9 @@ type pendingRecord struct {
 	Metadata     []byte
 }
 
-// decodePendingRecord is encodePendingRecord's inverse. ok is false only when b is shorter
-// than pendingRecordPrefixSize; the caller turns that into a halt (EXECUTOR §15 code-store
-// row). Metadata is a copy of b[pendingRecordPrefixSize:].
+// decodePendingRecord is encodePendingRecord's inverse. ok is false
+// only when b is shorter than pendingRecordPrefixSize; the caller turns
+// that into a halt. Metadata is a copy of b[pendingRecordPrefixSize:].
 func decodePendingRecord(b []byte) (pendingRecord, bool) {
 	if len(b) < pendingRecordPrefixSize {
 		return pendingRecord{}, false
@@ -50,11 +51,12 @@ func decodePendingRecord(b []byte) (pendingRecord, bool) {
 	return rec, true
 }
 
-// prepareModule runs §11.3's finalize steps 1-6 plus step 7's CodeHash derivation against a
-// pre-instrumentation code_hash, and memoizes both derived module tiers on success. It reads
-// the pending record and chunks keyed by (deployer, preCodeHash), so it only ever sees the
-// given deployer's own staged deployment. It returns the derived CodeHash and the pending
-// record's metadata for the caller's §27.12 validation.
+// prepareModule runs the finalize steps numbered in its body against a
+// pre-instrumentation code_hash, and memoizes both derived module tiers
+// on success. It reads the pending record and chunks keyed by
+// (deployer, preCodeHash), so it only ever sees the given deployer's
+// own staged deployment. It returns the derived CodeHash and the
+// pending record's metadata for the caller's metadata validation.
 //
 // Call-site contract, mandatory and in this order:
 //
@@ -131,11 +133,13 @@ func (p *Plugin) prepareModule(deployer types.Address, preCodeHash types.Hash) (
 	return derivedHash, record.Metadata, true, nil
 }
 
-// deriveModule runs finalize steps 5-7 over assembled bytes: validation, the engine compile of
-// the original, instrumentation, the engine compile of the instrumented output, and the CodeHash
-// derivation. It has no error return because none of these steps can ever be a halt (§11.3):
-// every one of them is a pure, deterministic function of the assembled bytes under the pinned
-// engine, so a rejection here is a rejection on every node. ok == false is VALIDATION_FAILED.
+// deriveModule is prepareModule's step 5 (Derive): validation, the
+// engine compile of the original, instrumentation, the engine compile
+// of the instrumented output, and the CodeHash derivation. It has no
+// error return because none of these steps can ever be a halt: every
+// one of them is a pure, deterministic function of the assembled bytes
+// under the pinned engine, so a rejection here is a rejection on every
+// node. ok == false is VALIDATION_FAILED.
 func (p *Plugin) deriveModule(assembled []byte) (instrumented []byte, codeHash types.Hash, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -161,8 +165,8 @@ func (p *Plugin) deriveModule(assembled []byte) (instrumented []byte, codeHash t
 	return inst, CodeHash(inst), true
 }
 
-// applyDeployFinalize serves input_kind 4 (§11.3). It takes no StateAccess: a finalize reads no
-// state, so its witness set is empty on every path.
+// applyDeployFinalize serves input_kind 4. It takes no StateAccess: a
+// finalize reads no state, so its witness set is empty on every path.
 func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployFinalizeArgs) (domain.Effects, error) {
 	codeHash, metadata, ok, err := p.prepareModule(ctx.L1Sender, args.CodeHash)
 	if err != nil {
@@ -206,7 +210,7 @@ func (p *Plugin) applyDeployFinalize(ctx domain.InputContext, args codec.DeployF
 	}, nil
 }
 
-// applyUpgrade serves input_kind 5 (§12).
+// applyUpgrade serves input_kind 5.
 func (p *Plugin) applyUpgrade(state domain.StateAccess, ctx domain.InputContext, args codec.UpgradeArgs) (domain.Effects, error) {
 	// Unconditional, in this fixed order, before any branch — the witness set is committed in
 	// DAHash and must not depend on which authorization branch is taken.
@@ -277,7 +281,7 @@ func ownerAuthorized(policyLeaf []byte, policyPresent bool, ownerLeaf []byte, ow
 		ownerPresent && bytes.Equal(ownerLeaf, caller[:])
 }
 
-// applyTransferOwnership serves input_kind 6 (§12, §15).
+// applyTransferOwnership serves input_kind 6.
 func (p *Plugin) applyTransferOwnership(state domain.StateAccess, ctx domain.InputContext, args codec.TransferOwnershipArgs) (domain.Effects, error) {
 	// Unconditional, in this order, before any branch: the runtime writes these reserved keys
 	// itself, so the step-3 reserved-key scan is not involved and this read order alone fixes
@@ -329,9 +333,9 @@ func (p *Plugin) applyTransferOwnership(state domain.StateAccess, ctx domain.Inp
 	}, nil
 }
 
-// contractID is §12's derivation (SPEC.md:640):
-// SHA3-256(deployer_l1_address(20) ‖ globalInputIndex(8B BE) ‖ chain_id(32)), over the raw
-// 20-byte L1 address.
+// contractID derives a contract's id: SHA3-256(deployer_l1_address(20)
+// ‖ globalInputIndex(8B BE) ‖ chain_id(32)), over the raw 20-byte L1
+// address.
 func contractID(deployer types.Address, globalInputIndex uint64, chainID types.Hash) types.Hash {
 	var idxBuf [8]byte
 	binary.BigEndian.PutUint64(idxBuf[:], globalInputIndex)

@@ -201,7 +201,6 @@ func validConfig(t *testing.T, src testSource) Config {
 		DomainID:          1,
 		ExecutorID:        types.Address{0x42}.String(),
 		StoragePath:       t.TempDir(),
-		Role:              "EXECUTOR",
 		STFSpecHash:       types.Hash{0xAA},
 		ConfirmationDepth: 2,
 		Momenta:           src,
@@ -264,7 +263,6 @@ func TestConfigValidation(t *testing.T) {
 		"empty executor id":        func(c *Config) { c.ExecutorID = "" },
 		"executor id not address":  func(c *Config) { c.ExecutorID = "not-an-address" },
 		"empty storage path":       func(c *Config) { c.StoragePath = "" },
-		"role other than executor": func(c *Config) { c.Role = "WATCHER" },
 		"zero stf spec hash":       func(c *Config) { c.STFSpecHash = types.Hash{} },
 		"zero confirmation depth":  func(c *Config) { c.ConfirmationDepth = 0 },
 		"depth above the maximum":  func(c *Config) { c.ConfirmationDepth = recovery.MaxConfirmationDepth + 1 },
@@ -350,7 +348,7 @@ func TestRunCommitsAndRecovers(t *testing.T) {
 
 	// A fresh boot lands on the cursor's root.
 	rdy, err := recovery.Boot(recovery.Config{
-		Layout: layout, DomainID: cfg.DomainID, ExecutorID: cfg.ExecutorID, Role: cfg.Role,
+		Layout: layout, DomainID: cfg.DomainID, ExecutorID: cfg.ExecutorID,
 		STFSpecHash: cfg.STFSpecHash, ConfirmationDepth: cfg.ConfirmationDepth, Domain: scriptDomain{},
 		Momenta: src, Anchors: noAnchor{}, Bundles: bundles, Retry: cfg.Retry,
 	})

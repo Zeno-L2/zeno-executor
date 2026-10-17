@@ -31,9 +31,6 @@ var (
 	ErrLocked = errors.New("runtime: domain lock held by another process")
 )
 
-// roleExecutor is the only EXECUTOR §17 role this runtime implements.
-const roleExecutor = "EXECUTOR"
-
 // Config is the executor's boot configuration. Every field is validated before the run loop
 // starts. Run rejects any missing or malformed value with an error wrapping ErrConfig rather
 // than defaulting silently.
@@ -45,16 +42,14 @@ type Config struct {
 	ExecutorID string
 	// StoragePath is the root directory for this process's on-disk state.
 	StoragePath string
-	// Role is EXECUTOR | WATCHER | RELAY (EXECUTOR §17). Only EXECUTOR is implemented; the
-	// runtime refuses to start under any other, rather than running an executor's loop under
-	// another role's name.
-	Role string
-	// STFSpecHash identifies the state-transition function this build implements. It tags every
-	// snapshot, and a snapshot tagged with another value is never loaded (§16).
+	// STFSpecHash identifies the state-transition function this build
+	// implements. It tags every snapshot, and a snapshot tagged with
+	// another value is never loaded.
 	STFSpecHash types.Hash
-	// ConfirmationDepth is how many momenta behind the frontier are treated as confirmed
-	// (SPEC §4.3). It has no default: §17 makes every field required and validated, and the
-	// depth is the parameter that bounds how deep a reorg may be before it is an L1 fault.
+	// ConfirmationDepth is how many momenta behind the frontier are
+	// treated as confirmed. It has no default: every configuration
+	// field is required and validated, and the depth is the parameter
+	// that bounds how deep a reorg may be before it is an L1 fault.
 	ConfirmationDepth uint64
 	// MaxPendingBatches is how many batches the run lets sit above Settlement's nextBatchId,
 	// committed or pending, before it stops sealing and waits for the cursor to advance. It
@@ -119,9 +114,6 @@ func (c Config) validate() error {
 	}
 	if c.StoragePath == "" {
 		return fmt.Errorf("%w: storagePath is required", ErrConfig)
-	}
-	if c.Role != roleExecutor {
-		return fmt.Errorf("%w: role %q is not implemented; only %s is", ErrConfig, c.Role, roleExecutor)
 	}
 	if c.STFSpecHash.IsZero() {
 		return fmt.Errorf("%w: stfSpecHash is required", ErrConfig)
@@ -224,7 +216,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 		Layout:            layout,
 		DomainID:          r.cfg.DomainID,
 		ExecutorID:        r.cfg.ExecutorID,
-		Role:              r.cfg.Role,
 		STFSpecHash:       r.cfg.STFSpecHash,
 		ConfirmationDepth: r.cfg.ConfirmationDepth,
 		Domain:            d,

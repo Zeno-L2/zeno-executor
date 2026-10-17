@@ -63,8 +63,8 @@ var ErrFloatType = errors.New("module: float type")
 // ErrSIMD is returned for a v128 valtype, instruction or sub-opcode.
 var ErrSIMD = errors.New("module: SIMD")
 
-// ErrReferenceType is returned for a reference type (funcref/externref) or instruction where
-// Phase 1 does not accept one.
+// ErrReferenceType is returned for a reference type (funcref/externref)
+// or instruction which the validator rejects.
 var ErrReferenceType = errors.New("module: reference type")
 
 // ErrInvalidValType is returned for a byte that is none of the recognized valtype encodings.
@@ -219,8 +219,8 @@ var ErrLabelOutOfBounds = errors.New("module: label out of bounds")
 // function's params plus declared locals.
 var ErrLocalIndexOutOfBounds = errors.New("module: local index out of bounds")
 
-// ErrBlockTypeIndex is returned for a block type immediate encoding a multi-value type
-// index, which Phase 1 does not accept.
+// ErrBlockTypeIndex is returned for a block type immediate encoding a
+// multi-value type index, which the validator rejects.
 var ErrBlockTypeIndex = errors.New("module: block type index")
 
 // ErrNonCanonicalLEB128 is returned for a LEB128 encoding longer than the shortest one that

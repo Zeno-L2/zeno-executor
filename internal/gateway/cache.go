@@ -21,7 +21,7 @@ const snapshotExt = ".snap"
 
 // cachePaths are one domain's gateway cache paths under storagePath.
 type cachePaths struct {
-	stateDir, wal, snapshots, index string
+	snapshots, index string
 }
 
 // cachePathsFor returns the cache paths for domainID under
@@ -29,8 +29,6 @@ type cachePaths struct {
 func cachePathsFor(storagePath string, domainID uint32) cachePaths {
 	root := filepath.Join(storagePath, strconv.FormatUint(uint64(domainID), 10))
 	return cachePaths{
-		stateDir:  filepath.Join(root, "state"),
-		wal:       filepath.Join(root, "state", "wal"),
 		snapshots: filepath.Join(root, "snapshots"),
 		index:     filepath.Join(root, "index"),
 	}
@@ -157,12 +155,12 @@ func openFinal(ctx context.Context, storagePath string, domainID uint32, s Settl
 		if err := guardCache(cacheRoot); err != nil {
 			return fmt.Errorf("gateway: domain %d: %w", domainID, err)
 		}
-		for _, dir := range []string{p.stateDir, p.snapshots} {
+		for _, dir := range []string{p.snapshots} {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return fmt.Errorf("gateway: domain %d: %w", domainID, err)
 			}
 		}
-		for _, dir := range []string{cacheRoot, p.stateDir, p.snapshots} {
+		for _, dir := range []string{cacheRoot, p.snapshots} {
 			if err := secureLeaf(dir, euid()); err != nil {
 				return fmt.Errorf("gateway: domain %d: %w", domainID, err)
 			}
@@ -180,11 +178,7 @@ func openFinal(ctx context.Context, storagePath string, domainID uint32, s Settl
 		if err := mkdirs(); err != nil {
 			return nil, nil, err
 		}
-		store, err := state.OpenEmpty(p.wal)
-		if err != nil {
-			return nil, nil, fmt.Errorf("gateway: domain %d: %w", domainID, err)
-		}
-		return store, nil, nil
+		return state.OpenEmpty(), nil, nil
 	}
 
 	if err := mkdirs(); err != nil {
@@ -195,11 +189,7 @@ func openFinal(ctx context.Context, storagePath string, domainID uint32, s Settl
 		return discard(fmt.Sprintf("the snapshot directory cannot be read: %v", err))
 	}
 	if len(infos) == 0 {
-		store, err := state.OpenEmpty(p.wal)
-		if err != nil {
-			return nil, nil, fmt.Errorf("gateway: domain %d: %w", domainID, err)
-		}
-		return store, nil, nil
+		return state.OpenEmpty(), nil, nil
 	}
 	info := infos[len(infos)-1]
 	if len(info.Header.Meta) != 8 {
@@ -234,7 +224,7 @@ func openFinal(ctx context.Context, storagePath string, domainID uint32, s Settl
 	if err := guardCache(cacheRoot); err != nil {
 		return nil, nil, fmt.Errorf("gateway: domain %d: %w", domainID, err)
 	}
-	store, err := state.OpenSnapshot(p.wal, p.snapshots, info.Name, rec.StfSpecHash)
+	store, err := state.OpenSnapshot(p.snapshots, info.Name, rec.StfSpecHash)
 	if err != nil {
 		return discard(err.Error())
 	}
@@ -250,13 +240,12 @@ func openFinal(ctx context.Context, storagePath string, domainID uint32, s Settl
 	return store, &BatchHead{BatchID: id, LastInputSeq: e.LastInputSeq, PostStateRoot: e.PostStateRoot}, nil
 }
 
-// discardCache removes the domain's snapshots/, state/ and index/
-// under storagePath, and nothing else: never storagePath, never the
-// domain directory, and never a REMOTE gateway's bundles/ and
-// receipts/.
+// discardCache removes the domain's snapshots/ and index/ under
+// storagePath, and nothing else: never storagePath, never the domain
+// directory, and never a REMOTE gateway's bundles/ and receipts/.
 func discardCache(storagePath string, domainID uint32) error {
 	p := cachePathsFor(storagePath, domainID)
-	for _, dir := range []string{p.snapshots, p.stateDir, p.index} {
+	for _, dir := range []string{p.snapshots, p.index} {
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("gateway: discard %s: %w", dir, err)
 		}

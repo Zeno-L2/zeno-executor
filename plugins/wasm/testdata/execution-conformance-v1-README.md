@@ -272,6 +272,7 @@ Vector IDs are stable names; gaps in numbering are intentional.
 | `CV-QUOTA-7` | `BuyStorage` naming a `contract_id` with no code-hash leaf is `VALIDATION_FAILED` |
 | `CV-QUOTA-8` | `BuyStorage` whose `purchased + bytes` is `2^64` is `VALIDATION_FAILED`, and its receipt carries the unchanged `CodeHash` |
 | `EXEC-FAIL-OUTBOX-1` | a failed input carrying a deposit, proving §14.3's discard |
+| `CV-FRAME-1` | the contract returns the frame's `momentum_hash` as its `ReturnData` and takes its `input_index` from the frame: `SUCCESS`, and `return_hash` commits the momentum hash |
 
 `CV-DEPLOY-1` and `CV-DEPLOY-2` together are the single-chunk sizing case: the kind-2 record
 declaring `chunk_count == 1` and the kind-3 chunk that carries the whole module.

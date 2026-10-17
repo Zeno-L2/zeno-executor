@@ -12,9 +12,11 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
-// This file holds the deploy/upgrade and §7.2 rejection vectorSpecs, the fixture bodies they
-// need and the fixture-to-validator-rule map. All fixtures go through buildWasmModule/
-// runModuleSpec (fixtures_test.go); no ad-hoc WASM bytes, no new builder.
+// This file holds the deploy/upgrade and validator rejection
+// vectorSpecs, the fixture bodies they need and the
+// fixture-to-validator-rule map. All fixtures go through
+// buildWasmModule/runModuleSpec (fixtures_test.go); no ad-hoc WASM
+// bytes, no new builder.
 
 // deployModule is the module CV-DEPLOY-1, CV-DEPLOY-2 and EXEC-DEPLOY-1 share: three
 // independent code stores, not one sequenced deployment.
@@ -38,8 +40,9 @@ var (
 	quotaCodeHash = repeatedHash(0x9C) // the keyCodeHash leaf the BuyStorage vectors seed for quotaCid
 )
 
-// rejectionReasons binds each §7.2 rejection vector to the validator rule its module
-// exercises. A validation_rejection vector missing from this map fails the suite.
+// rejectionReasons binds each validator rejection vector to the
+// validator rule its module exercises. A validation_rejection vector
+// missing from this map fails the suite.
 var rejectionReasons = map[string]error{
 	"CV-REJECT-WASI-1":    module.ErrDisallowedImport,
 	"CV-REJECT-FLOAT-1":   module.ErrFloatInstruction,
@@ -186,7 +189,7 @@ func deployVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
-	// --- §7.2 rejections.
+	// --- validator rejections.
 
 	{
 		idx := nextIndex()
@@ -293,10 +296,12 @@ func deployVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
-	// --- Contract metadata, upgrade policy and ownership: a chained sequence of vectors sharing
-	// ownedCid's reserved leaves (§11.3, §12, §15, §27.12). Each vector's spec.ExtraPreState is
-	// the reserved leaves the vector before it in the chain leaves, computed inline (generateDeployVector
-	// gives every vectorSpec its own fresh store; nothing here shares a store across vectors).
+	// --- Contract metadata, upgrade policy and ownership: a chained
+	// sequence of vectors sharing ownedCid's reserved leaves. Each
+	// vector's spec.ExtraPreState is the reserved leaves the vector
+	// before it in the chain leaves, computed inline
+	// (generateDeployVector gives every vectorSpec its own fresh store;
+	// nothing here shares a store across vectors).
 
 	testnetChainID := hashOf(crypto.Hash([]byte("ZENON_WASM_L2:"), []byte("testnet")))
 	deployInstrumented, err := module.Instrument(deployModule, moduleLimits())

@@ -58,7 +58,6 @@ const (
 	MaxAcceptedEntries = 64   // entries in one Accepted reply; Settlement caps a batch at 64 inputs
 	MaxMomentaCount    = 1024 // internal/ledger/follower.go:18 (rpcMaxCountSize, unexported there)
 	MaxSourceErrorLen  = 4096 // the supervisor truncates a source error's text to this
-	maxRoleLen         = 64
 	maxNetworkNameLen  = 256
 	maxStoragePathLen  = 4096
 
@@ -83,7 +82,6 @@ type WorkerConfig struct {
 	ExecutorAddress   types.Address
 	STFSpecHash       types.Hash
 	ConfirmationDepth uint64
-	Role              string
 	NetworkName       string
 	StoragePath       string
 	MaxPendingBatches uint64
@@ -189,8 +187,8 @@ func (Recovered) Type() Type       { return TypeRecovered }
 // Withdrawal carries one L1 withdrawal of batch BatchID. Message is a
 // canonical kind 1 OutboxMessage; its inputIndex and outboxIndex are
 // its position in the batch, and a batch's Withdrawal frames are
-// strictly ascending in that pair. Proof is its §27.3 MerkleProof under
-// the batch's OutboxRoot.
+// strictly ascending in that pair. Proof is its MerkleProof under the
+// batch's OutboxRoot.
 type Withdrawal struct {
 	BatchID uint64
 	Message []byte
@@ -472,9 +470,6 @@ func decodePayload(t Type, payload []byte) (Message, error) {
 // --- Config ---
 
 func encodeConfig(c WorkerConfig) ([]byte, error) {
-	if len(c.Role) > maxRoleLen {
-		return nil, fmt.Errorf("role exceeds %d bytes", maxRoleLen)
-	}
 	if len(c.NetworkName) > maxNetworkNameLen {
 		return nil, fmt.Errorf("networkName exceeds %d bytes", maxNetworkNameLen)
 	}
@@ -486,7 +481,6 @@ func encodeConfig(c WorkerConfig) ([]byte, error) {
 	w.raw(c.ExecutorAddress[:])
 	w.raw(c.STFSpecHash[:])
 	w.u64(c.ConfirmationDepth)
-	w.str16(c.Role)
 	w.str16(c.NetworkName)
 	w.str16(c.StoragePath)
 	w.u64(c.MaxPendingBatches)
@@ -512,10 +506,6 @@ func decodeConfig(p []byte) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	role, err := r.str16(maxRoleLen)
-	if err != nil {
-		return nil, err
-	}
 	network, err := r.str16(maxNetworkNameLen)
 	if err != nil {
 		return nil, err
@@ -535,7 +525,6 @@ func decodeConfig(p []byte) (Message, error) {
 	copy(c.ExecutorAddress[:], addr)
 	copy(c.STFSpecHash[:], hash)
 	c.ConfirmationDepth = depth
-	c.Role = role
 	c.NetworkName = network
 	c.StoragePath = storage
 	c.MaxPendingBatches = maxPending

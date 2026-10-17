@@ -377,11 +377,12 @@ func checkImportsAllFunctions(payload []byte) error {
 	return nil
 }
 
-// parseTypesLoose decodes a type section payload into per-type param/result valtypes,
-// tolerating any form byte: Instrument does not re-run rule 3's form == 0x60 check (a
-// validated input is the caller's contract), it only needs each type's shape to look up a
-// function's block-wrapper result type and to check the one precondition (more than one
-// result) that is cheap to catch here.
+// parseTypesLoose decodes a type section payload into per-type
+// param/result valtypes, tolerating any form byte: Instrument does not
+// re-run the type section's form == 0x60 check (a validated input is
+// the caller's contract), it only needs each type's shape to look up a
+// function's block-wrapper result type and to check the one
+// precondition (more than one result) that is cheap to catch here.
 func parseTypesLoose(payload []byte) ([]funcSig, error) {
 	r := newReader(payload)
 	count, err := r.readVecCount()

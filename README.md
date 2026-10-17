@@ -20,7 +20,7 @@ conflict.
 | `runtime` | The generic runtime: plugin registration, the per-domain lock (`worker.lock`), the boot-time recovery, and the execution loop that commits batches, handles reorgs and halts on a consistency fault. |
 | `plugins/wasm` | The WASM execution domain: the deterministic Core 1.0 interpreter — binary reader and validator, gas metering and instrumentation, the three-import host ABI, and `Apply` for all six input kinds. In simulate mode its code store lives in memory: a miss fetches the as-deployed module over the channel, checks it against state, and keeps at most 32 MiB of instrumented modules. |
 | `internal/lease` | The exclusive file lock behind the single-instance lease. |
-| `internal/state` | The L2 leaf cache: a WAL-backed `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API), the witnessing `Accessor` a domain's `Apply` reads through, and the immutable `Version` the gateway keeps one of per served batch, sharing structure with the versions derived from it. |
+| `internal/state` | The L2 leaf cache: an in-memory `Store` (`Root`/`Prove`/`Apply`, wrapping only the path-native trie API) that opens empty or from a snapshot, the witnessing `Accessor` a domain's `Apply` reads through, and the immutable `Version` the gateway keeps one of per served batch, sharing structure with the versions derived from it. |
 | `internal/codec` | The canonical binary encoding for every consensus-visible structure. |
 | `internal/ledger` | The input pipeline: a `Follower` that reads confirmed momenta from a `MomentumSource`, reconstructs the canonical per-block order, and takes each settlement momentum's inputs for the configured domain from an `AssignmentSource`, which supplies the global input index. |
 | `internal/batch` | The `Driver`: the per-input execution pipeline against a `domain.Domain` and `internal/state.Store`, batch slicing under the §25.1/§27.9 caps, the self-verified batch commitment and DA bundle, and the batch's receipt sidecar. |
@@ -68,7 +68,6 @@ listed below. `docker/executor.json` is a complete example.
 | `workers` | array | Required, non-empty; one entry per domain. |
 | `workers[].domainId` | integer | Unique within the file; also sets the worker's uid (`10000 + domainId`) when uids are separated. |
 | `workers[].binary` | absolute path | Required; must be an executable regular file. |
-| `workers[].role` | string | Must be `"EXECUTOR"`. |
 | `workers[].stfSpecHash` | 32-byte hex hash | Required. |
 | `workers[].memoryLimit` | integer, bytes | Required, positive; sets the worker's `GOMEMLIMIT` (90% of this value) and, where enforced, its cgroup `memory.max`. |
 | `workers[].cpuLimit` | number, CPUs | Required, 0.01 to 1024; sets the worker's cgroup `cpu.max` where enforced. |
@@ -95,7 +94,7 @@ status 78.
 
 No worker ever receives the key, its source kind, or its path or variable name: a worker's
 channel `Config` frame carries only its `domainId`, the executor address, its `stfSpecHash`,
-`confirmationDepth`, `role`, `networkName`, `storagePath` and `maxPendingBatches`.
+`confirmationDepth`, `networkName`, `storagePath` and `maxPendingBatches`.
 
 ### Isolation
 
@@ -136,10 +135,11 @@ Settlement already accepted.
 
 It confirms each send by reading Settlement once the receive is `confirmationDepth` momenta deep.
 A rejected batch, or a send the node no longer knows, is retried without limit under the restart
-backoff and never halts the domain. After 5 consecutive rejections of the same batch, the
-supervisor logs an error and raises an error status for that domain, and keeps retrying. The count
-and the status clear when Settlement accepts the batch, when Settlement's `nextBatchId` moves
-past it, or when the executor restarts. A `nextBatchId` read lower than an earlier one comes from
+backoff and never halts the domain.
+Each rejection logs `supervisor: domain <d> batch <b> rejected by Settlement (send <hash>); retrying in <delay>`.
+The 5th consecutive rejection of the same batch also logs `supervisor: domain <d> ERROR: Settlement rejected batch <b> 5 consecutive times (latest send <hash>); retrying without limit, and each attempt costs plasma`, and each later rejection logs the same line with `WARN` in place of `ERROR` and the current count in place of 5.
+The count resets when Settlement accepts the batch, when Settlement's `nextBatchId` moves past it, or when the executor restarts.
+A `nextBatchId` read lower than an earlier one comes from
 a lagging node or a reorg deeper than `confirmationDepth`: it clears nothing and is logged as a warning, and each read of `nextBatchId` that
 is higher than the highest seen raises the observed value. A send the node no longer knows neither counts as a
 rejection nor clears the count.
@@ -153,12 +153,13 @@ its batches submitted. These reads trail the chain by `confirmationDepth` moment
 behind a load-balanced endpoint they can trail by more than the batch read does, so a pause set
 at the frontier can still let a send through; Settlement rejects it, and the send costs plasma.
 
-A send not received after `confirmationDepth` x 10 momenta raises an error status and is never
-replaced automatically. Insufficient plasma raises an error status and retries.
+A send not received after `confirmationDepth` x 10 momenta is never replaced automatically, and the supervisor logs `supervisor: WARN: send <hash> for domain <d> <send> has not been received by Settlement after <age> momenta (confirmationDepth x 10 is <n>); it is not replaced automatically` once for that send, where `<send>` is `batch <b>`, `batch <b> withdrawal <outboxId>` or `release`.
+Insufficient plasma logs `supervisor: WARN: submitter: domain <d> <send>: supervisor: insufficient plasma: executor address <address> has <available> plasma available, the send needs <needed>; retrying`, at most once a minute, and the send is retried.
 
 When a lagging node or a reorg deeper than `confirmationDepth` keeps Settlement's `nextBatchId`
-below the supervisor's observed value, that domain stops submitting and raises an error status after
-`confirmationDepth` x 10 momenta. The remedy is to check the node, then restart the executor. After a
+below the supervisor's observed value, that domain stops submitting.
+After `confirmationDepth` x 10 momenta, the supervisor logs `supervisor: domain <d> ERROR: Settlement's nextBatchId <n> stayed below the observed <mark> for <k> momenta: ...`, at most once a minute; the rest of the line gives the remedy below.
+The remedy is to check the node, then restart the executor. After a
 reorg like that, move the submission log files aside before restarting, because a restart reads the
 observed value back from them.
 
@@ -171,7 +172,7 @@ Each line starts with a log-format version (`"version":2` for this release) and 
 - Fields a release does not know are ignored, so a newer release can add fields without changing the log-format version.
 - This release reads version 1 lines. An older release reads every version 2 line as unreadable, so a downgrade is not supported.
 
-A crash in the middle of a write leaves an incomplete last line, which the supervisor drops at boot with a warning. A line that is not a JSON object with a log-format version and a block hash stops the supervisor at boot with an error naming the file and the line. Moving the file and its `.1` file aside starts a new log, and the supervisor then forgets a send that had no outcome: it may send that batch a second time, Settlement accepts at most one of the two, and the other costs plasma. If the supervisor cannot write or sync the log, it logs an error, raises an error status and sends nothing more until the executor restarts.
+A crash in the middle of a write leaves an incomplete last line, which the supervisor drops at boot with a warning. A line that is not a JSON object with a log-format version and a block hash stops the supervisor at boot with an error naming the file and the line. Moving the file and its `.1` file aside starts a new log, and the supervisor then forgets a send that had no outcome: it may send that batch a second time, Settlement accepts at most one of the two, and the other costs plasma. If the supervisor cannot write or sync the log, it logs `supervisor: ERROR: submitter: <error>; nothing is sent until the executor restarts` once and sends nothing more until the executor restarts.
 
 Each send adds about 500 bytes. Once the log reaches 16 MiB, the supervisor renames it to `<file>.1` before the next send, replacing any older one, and starts a new file. It reads both files at boot.
 
@@ -193,7 +194,10 @@ Settlement's relay pause, global or for the domain, stops that domain's relays a
 
 Relays and releases share the one unresolved send across all domains, alternating with batch sends. Each send takes about `confirmationDepth` + 2 momenta. With `confirmationDepth` 10 and 10-second momenta, a full batch of 2,112 withdrawals needs about 2,250 sends (2,112 relays and 132 releases) at about 2 minutes each: about 3 days, or about 6 days while the domain also sends batches. Each withdrawal costs about 57,000 plasma plus its call data: one relay at 52,500 and a sixteenth of a release at 73,500. Both methods are permissionless: a recipient can relay its own withdrawal with the gateway's outbox proof, and anyone can release.
 
-A rejected relay is retried without limit under the restart backoff. After 5 consecutive rejections of the same withdrawal, the supervisor logs an error and raises the domain's relay error status. The domain's later withdrawals wait behind that one. The count and the status clear when the withdrawal is registered, by anyone, or when the executor restarts. A relay the node no longer knows, and a relay or release that cannot be built (for example for lack of plasma), waits out the same backoff without counting.
+A rejected relay is retried without limit under the restart backoff. Each rejection logs `supervisor: domain <d> batch <b> withdrawal <outboxId> rejected by Settlement (send <hash>); retrying in <delay>`.
+The 5th consecutive rejection of the same withdrawal also logs `supervisor: domain <d> ERROR: Settlement rejected the relay of batch <b> withdrawal <outboxId> 5 consecutive times (latest send <hash>); retrying without limit, and each attempt costs plasma`, and each later rejection logs the same line with `WARN` in place of `ERROR` and the current count in place of 5.
+The domain's later withdrawals wait behind that one.
+The count resets when the withdrawal is registered, by anyone, or when the executor restarts. A relay the node no longer knows, and a relay or release that cannot be built (for example for lack of plasma), waits out the same backoff without counting.
 
 After a restart, a relay or release left with no outcome in the submission log is followed to its outcome instead of being sent a second time. The supervisor then re-reads which withdrawals are registered, up to 64 per pass.
 
@@ -243,9 +247,8 @@ it was first built.
 
 Accepted batches that never end at the domain's last input in a momentum, such as batches built by a
 different executor, stay uncommitted in memory until one does or the rebuild passes `nextBatchId`.
-Each costs about 2 KB, about 190 MB per 100,000 batches. The domain's state log in its directory
-also grows on disk through that stretch, because only a commit truncates it. A crash during that
-stretch repeats the rebuild from the last commit.
+Each costs about 2 KB, about 190 MB per 100,000 batches. A crash during that stretch repeats the
+rebuild from the last commit.
 
 A rebuilt batch that differs from its accepted entry, or an input stream that cannot end a batch
 where the entry does, halts the domain: the worker exits HALTED, naming the batchId and the domain
@@ -302,13 +305,13 @@ missing `workerBinary` while simulation is enabled. 1 also covers simulation ref
 cgroup v2 memory and cpu limits are off, simulation refused as root on a host that does not separate uids (a `sudo`
 gateway on macOS), and a failure to seal inherited descriptors or turn non-dumpable; each logs a line naming the cause.
 
-The cache lives in `<storagePath>/<domainId>/state/wal`, `<storagePath>/<domainId>/snapshots/` and
-`<storagePath>/<domainId>/index/` (directories it creates 0700, files 0600). The index holds every batch the gateway has checked. At boot it keeps the batches above its finalized batch that still match Settlement or, while pending, the executor's batch record; it removes the first one that does not and every batch above it, and marks the domain `INCONSISTENT` when an accepted batch's entry changed. An index that cannot be opened, or that disagrees with the snapshot or with Settlement's entry for its finalized batch, deletes the cache and rebuilds the domain from batch 0. A cache written by a gateway without the index has no `index/`, so the first boot after upgrading rebuilds every domain from batch 0. Each input's L1 sender is read once from `znnd` (`ledger.getAccountBlockByHash`, checked against the send hash, and accepted only from a user send to the Settlement contract that names the domain) and kept for good, and a batch is served only once every sender is stored. An accepted batch whose input names a send that is not an input of the domain marks the domain `INCONSISTENT`; a pending batch that does so stays unpublished. The kept senders are bounded by the L1 sends to Settlement that name the domain. A rebuild re-reads every sender, one `znnd` round trip per input, so every trigger that deletes the cache costs one round trip per input in the domain's history: an index that cannot be opened, an index that disagrees with the snapshot or with Settlement, and a snapshot whose batch entry is not visible (a lagging node or a raised `confirmationDepth`), which discards the whole cache and the index with it. A gateway log line that says "the index is damaged" while running means the index changed under it; stop the gateway and remove `<storagePath>/<domainId>`, and it rebuilds on the next start. At boot the gateway requires `storagePath` to be a real directory owned by its own uid and sets it to 0700, uses its resolved path from then on, refuses a symlink in the path owned by a user other than root or itself, and refuses to start when any parent of its resolved path is owned by a user other than root or itself, or can be written by another user without the sticky bit, and before it creates, truncates or deletes anything in a domain's cache it refuses a symlink or a directory owned by another uid. The gateway creates `storagePath` with `MkdirAll` and resolves it with `EvalSymlinks` before its ownership walk, and the walk of the resolved path refuses a link planted between those steps when it leads to a directory another user owns. Run the gateway as its own non-root uid. When the gateway first catches up after boot, it saves a snapshot
+The cache lives in `<storagePath>/<domainId>/snapshots/` and
+`<storagePath>/<domainId>/index/` (directories it creates 0700, files 0600). The index holds every batch the gateway has checked. At boot it keeps the batches above its finalized batch that still match Settlement or, while pending, the executor's batch record; it removes the first one that does not and every batch above it, and marks the domain `INCONSISTENT` when an accepted batch's entry changed. An index that cannot be opened, or that disagrees with the snapshot or with Settlement's entry for its finalized batch, deletes the cache and rebuilds the domain from batch 0. A cache written by a gateway without the index has no `index/`, so the first boot after upgrading rebuilds every domain from batch 0. Each input's L1 sender is read once from `znnd` (`ledger.getAccountBlockByHash`, checked against the send hash, and accepted only from a user send to the Settlement contract that names the domain) and kept for good, and a batch is served only once every sender is stored. An accepted batch whose input names a send that is not an input of the domain marks the domain `INCONSISTENT`; a pending batch that does so stays unpublished. The kept senders are bounded by the L1 sends to Settlement that name the domain. A rebuild re-reads every sender, one `znnd` round trip per input, so every trigger that deletes the cache costs one round trip per input in the domain's history: an index that cannot be opened, an index that disagrees with the snapshot or with Settlement, and a snapshot whose batch entry is not visible (a lagging node or a raised `confirmationDepth`), which discards the whole cache and the index with it. A gateway log line that says "the index is damaged" while running means the index changed under it; stop the gateway and remove `<storagePath>/<domainId>`, and it rebuilds on the next start. At boot the gateway requires `storagePath` to be a real directory owned by its own uid and sets it to 0700, uses its resolved path from then on, refuses a symlink in the path owned by a user other than root or itself, and refuses to start when any parent of its resolved path is owned by a user other than root or itself, or can be written by another user without the sticky bit, and before it creates or deletes anything in a domain's cache it refuses a symlink or a directory owned by another uid. The gateway creates `storagePath` with `MkdirAll` and resolves it with `EvalSymlinks` before its ownership walk, and the walk of the resolved path refuses a link planted between those steps when it leads to a directory another user owns. Run the gateway as its own non-root uid. When the gateway first catches up after boot, it saves a snapshot
 of the finalized state; after that it saves at most one every 10 minutes while batches finalize,
 and each save deletes the older ones. A restart rebuilds from the executor's bundles the batches
 finalized since the last snapshot, about 10 minutes' worth while saves succeed. A clean shutdown saves no snapshot, so a restart after one also rebuilds those batches. At boot it checks
 the newest snapshot's root against that batch's `postStateRoot` in Settlement at the confirmed
-height; a mismatch, an invisible entry, or a snapshot or WAL it cannot open deletes the cache and
+height; a mismatch, an invisible entry, or a snapshot it cannot open deletes the cache and
 rebuilds the domain from batch 0. A node that has not synced past the snapshot's batch, or a
 raised `confirmationDepth` that hides its entry, discards the cache. A `znnd` error or timeout at
 boot never deletes the cache. Deleting a domain's cache while the gateway is stopped is always
@@ -347,7 +350,7 @@ Hashes and paths are 64 lowercase hex characters without a prefix (parameters ac
 
 `zeno_read(domainId, view[, params[, tag]])` runs one named view of the domain's reader at a batch, with `params` an object of the view's parameters (an unknown member answers `-32602`, and a `null` optional parameter is left out). The WASM domain serves the `contracts/1` views `contract(contractId)`, `storage(contractId, key)` (`key` is at most 32 bytes of hex), `contractsByDeployer(address[, cursor])` and `module(sourceCodeHash)`; `zeno_chainInfo` lists each view's parameters and result fields. `module` takes the `contract` view's `sourceCodeHash` (the as-deployed `code_hash`), not its `codeHash` (the instrumented module's hash). The result names `postStateRoot`, `view`, `result` and `proofs`. A state view proves every path it reads against `postStateRoot`, `owner` is checked against `ownerCaller`, and `contractsByDeployer` pages by `cursor` (pass `nextCursor` back unchanged). A domain with no reader, or a view it lacks, answers `-32005`, and `module` answers `-32004` when no successful deploy of that code hash exists at the batch. A gateway cache whose index lacks the current schema version is discarded and rebuilt from batch 0 at boot, so a cache built before this release rebuilds itself; the rebuild re-reads every input's L1 sender from `znnd` (one node call per input on a long history).
 
-`zeno_simulate(domainId, input[, tag])` runs one input against the state at a batch and returns what the batch driver would record for it, without submitting anything. The `input` is an object with `kind` (`"CallL2"` or `"Deposit"` only), `sender` (an L1 address), `targetContract`, `payload` (hex, `CallL2` only), `deposit` (`asset` and `amount`, a decimal string) and `plasmaLimit` (at most `simulation.maxGas`). The input's index is one past the `pending` batch's last input, and the momentum height and time come from the newest poll's Settlement view; a withdrawal's caps are read from Settlement at that height. The state rule is the one of `zeno_read`: kept from `finalized` through `pending`, and `-32002` for an older batch. The result names `domainId`, `batchId`, `postStateRoot`, `inputIndex`, `momentumHeight`, `momentumTime`, `status`, `gasUsed`, `abortCode`, `contractId`, `codeHash`, `returnData`, `events`, `outbox` and `stateDiff`, with `verified` always `false`, `simulated` always `true` and every outbox message's `outboxId` `null`, because no batch holds it. The errors, by code:
+`zeno_simulate(domainId, input[, tag])` runs one input against the state at a batch and returns what the batch driver would record for it, without submitting anything. The `input` is an object with `kind` (`"CallL2"` or `"Deposit"` only), `sender` (an L1 address), `targetContract`, `payload` (hex, `CallL2` only), `deposit` (`asset` and `amount`, a decimal string) and `plasmaLimit` (at most `simulation.maxGas`). The input's index is one past the `pending` batch's last input, and the momentum height, time and hash come from the newest poll's Settlement view; a withdrawal's caps are read from Settlement at that height. The state rule is the one of `zeno_read`: kept from `finalized` through `pending`, and `-32002` for an older batch. The result names `domainId`, `batchId`, `postStateRoot`, `inputIndex`, `momentumHeight`, `momentumTime`, `momentumHash`, `status`, `gasUsed`, `abortCode`, `contractId`, `codeHash`, `returnData`, `events`, `outbox` and `stateDiff`, with `verified` always `false`, `simulated` always `true` and every outbox message's `outboxId` `null`, because no batch holds it. The errors, by code:
 
 - `-32602`: a wrong parameter count, a bad `domainId`, a bad input member (each message names the member and its rule) or a bad tag.
 - `-32001`: an unknown domain.

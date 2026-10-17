@@ -46,7 +46,7 @@ func TestClientReadConfig(t *testing.T) {
 
 	want := WorkerConfig{
 		DomainID: 1, ExecutorAddress: types.Address{0x42}, STFSpecHash: types.Hash{0xAA},
-		ConfirmationDepth: 2, Role: "EXECUTOR", NetworkName: "test", StoragePath: "/x",
+		ConfirmationDepth: 2, NetworkName: "test", StoragePath: "/x",
 	}
 	go sendFrom(t, b, want)
 

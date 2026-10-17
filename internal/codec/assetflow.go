@@ -5,14 +5,15 @@ import (
 	"fmt"
 )
 
-// AssetFlowEntry is one per-asset flow record in a batch commitment (§27.6, §18.4).
+// AssetFlowEntry is one per-asset flow record in a batch commitment.
 type AssetFlowEntry struct {
 	Asset           AssetID
 	DepositCredit   U256
 	WithdrawalDebit U256
 }
 
-// AssetFlowSummary is a bounded, ascending-by-asset list of AssetFlowEntry (§27.6).
+// AssetFlowSummary is a bounded, ascending-by-asset list of
+// AssetFlowEntry.
 type AssetFlowSummary []AssetFlowEntry
 
 // Encode returns the canonical encoding of s.
