@@ -25,26 +25,10 @@ func survives(t *testing.T, path, want string) {
 	}
 }
 
-func TestOpenFinalRefusesSymlinkedWAL(t *testing.T) {
-	storage := t.TempDir()
-	target := filepath.Join(t.TempDir(), "victim")
-	mkfile(t, target)
-	if err := os.MkdirAll(filepath.Join(storage, "1", "state"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, filepath.Join(storage, "1", "state", "wal")); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("openFinal = %v, want a symlink refusal", err)
-	}
-	survives(t, target, "x")
-}
-
 func TestOpenFinalRefusesSymlinkedDomainDir(t *testing.T) {
 	storage := t.TempDir()
 	other := t.TempDir()
-	for _, f := range []string{"state/wal", "snapshots/a", "index/b"} {
+	for _, f := range []string{"snapshots/a", "index/b"} {
 		mkfile(t, filepath.Join(other, f))
 	}
 	if err := os.Symlink(other, filepath.Join(storage, "1")); err != nil {
@@ -53,7 +37,7 @@ func TestOpenFinalRefusesSymlinkedDomainDir(t *testing.T) {
 	if _, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("openFinal = %v, want a symlink refusal", err)
 	}
-	for _, f := range []string{"state/wal", "snapshots/a", "index/b"} {
+	for _, f := range []string{"snapshots/a", "index/b"} {
 		survives(t, filepath.Join(other, f), "x")
 	}
 }
@@ -85,10 +69,7 @@ func TestWriteSnapshotRefusesSymlinkedSnapshots(t *testing.T) {
 	if err := os.Symlink(other, dir); err != nil {
 		t.Fatal(err)
 	}
-	store, err := state.OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := state.OpenEmpty()
 	defer store.Close()
 	if err := writeSnapshot(store, dir, BatchHead{}, types.Hash{}); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("writeSnapshot = %v, want a symlink refusal", err)
@@ -101,10 +82,10 @@ func TestOpenFinalRefusesForeignOwner(t *testing.T) {
 		t.Skip("changing a directory's owner needs root")
 	}
 	storage := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(storage, "1", "state"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(storage, "1", "index"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chown(filepath.Join(storage, "1", "state"), 12345, 12345); err != nil {
+	if err := os.Chown(filepath.Join(storage, "1", "index"), 12345, 12345); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog); err == nil || !strings.Contains(err.Error(), "owned by uid") {
@@ -112,25 +93,9 @@ func TestOpenFinalRefusesForeignOwner(t *testing.T) {
 	}
 }
 
-func TestOpenFinalRefusesSymlinkedStateDir(t *testing.T) {
-	storage := t.TempDir()
-	other := t.TempDir()
-	mkfile(t, filepath.Join(other, "wal"))
-	if err := os.MkdirAll(filepath.Join(storage, "1"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(other, filepath.Join(storage, "1", "state")); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("openFinal = %v, want a symlink refusal", err)
-	}
-	survives(t, filepath.Join(other, "wal"), "x")
-}
-
 func TestOpenFinalRefusesSymlinkedStoragePath(t *testing.T) {
 	real := t.TempDir()
-	mkfile(t, filepath.Join(real, "1", "state", "wal"))
+	mkfile(t, filepath.Join(real, "1", "snapshots", "a"))
 	link := filepath.Join(t.TempDir(), "gw")
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
@@ -138,7 +103,7 @@ func TestOpenFinalRefusesSymlinkedStoragePath(t *testing.T) {
 	if _, _, err := openFinal(context.Background(), link, 1, nil, readTimeout, noLog); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("openFinal = %v, want a symlink refusal", err)
 	}
-	survives(t, filepath.Join(real, "1", "state", "wal"), "x")
+	survives(t, filepath.Join(real, "1", "snapshots", "a"), "x")
 }
 
 // The root directory is owned by root, so a non-root process sees a
@@ -192,13 +157,13 @@ func TestOpenFinalRefusesExecutorMarkers(t *testing.T) {
 	for _, m := range []string{"batches", "cursor", "meta.json", "momentum_hashes"} {
 		t.Run(m, func(t *testing.T) {
 			storage := t.TempDir()
-			wal := filepath.Join(storage, "1", "state", "wal")
-			mkfile(t, wal)
+			snap := filepath.Join(storage, "1", "snapshots", "a")
+			mkfile(t, snap)
 			mkfile(t, filepath.Join(storage, "1", m, "x"))
 			if _, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog); err == nil || !strings.Contains(err.Error(), m) {
 				t.Fatalf("openFinal = %v, want a refusal naming %s", err, m)
 			}
-			survives(t, wal, "x")
+			survives(t, snap, "x")
 		})
 	}
 }
@@ -206,7 +171,7 @@ func TestOpenFinalRefusesExecutorMarkers(t *testing.T) {
 func TestGuardCacheBundlesAndReceipts(t *testing.T) {
 	cache := func(t *testing.T) string {
 		root := filepath.Join(t.TempDir(), "1")
-		for _, d := range []string{"bundles", "receipts", "state", "snapshots", "index"} {
+		for _, d := range []string{"bundles", "receipts", "snapshots", "index"} {
 			if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -261,7 +226,7 @@ func TestGuardCacheBundlesAndReceipts(t *testing.T) {
 
 func TestOpenChainRefusesSwappedPath(t *testing.T) {
 	exec := t.TempDir()
-	mkfile(t, filepath.Join(exec, "1", "state", "wal"))
+	mkfile(t, filepath.Join(exec, "1", "snapshots", "a"))
 	link := filepath.Join(t.TempDir(), "gw")
 	if err := os.Symlink(exec, link); err != nil {
 		t.Fatal(err)
@@ -270,7 +235,7 @@ func TestOpenChainRefusesSwappedPath(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "overlap") {
 		t.Fatalf("OpenChain = %v, want an overlap refusal", err)
 	}
-	survives(t, filepath.Join(exec, "1", "state", "wal"), "x")
+	survives(t, filepath.Join(exec, "1", "snapshots", "a"), "x")
 }
 
 func TestSameTreeCaseInsensitive(t *testing.T) {
@@ -860,7 +825,7 @@ func TestPrepareStorageRefusesForeignLeaf(t *testing.T) {
 }
 
 func TestOpenFinalRefusesSwappedLeaf(t *testing.T) {
-	for _, leaf := range []string{"", "state", "snapshots"} {
+	for _, leaf := range []string{"", "snapshots"} {
 		t.Run("leaf "+leaf, func(t *testing.T) {
 			storage := resolvedTemp(t)
 			victim := filepath.Join(resolvedTemp(t), "victim")
@@ -894,7 +859,7 @@ func TestOpenFinalRefusesForeignLeaf(t *testing.T) {
 			t.Skip("a root-owned leaf is the gateway's own")
 		}
 		storage := resolvedTemp(t)
-		if err := os.MkdirAll(filepath.Join(storage, "1", "state"), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(storage, "1"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		// guardCache still sees the real uid, so the refusal comes from
@@ -905,7 +870,7 @@ func TestOpenFinalRefusesForeignLeaf(t *testing.T) {
 			t.Fatalf("openFinal = %v, want an ownership refusal naming the domain directory", err)
 		}
 	})
-	for _, leaf := range []string{"", "state", "snapshots"} {
+	for _, leaf := range []string{"", "snapshots"} {
 		t.Run("chown "+leaf, func(t *testing.T) {
 			if os.Geteuid() != 0 {
 				t.Skip("changing a directory's owner needs root")
@@ -999,4 +964,37 @@ func TestOpenIndexRefusesExecutorTree(t *testing.T) {
 		t.Fatalf("index/ was created in an executor tree: %v", err)
 	}
 	survives(t, filepath.Join(root, "meta.json"), "x")
+}
+
+// A fresh gateway cache holds only snapshots/ and index/, and a
+// leftover state/ is neither checked, followed nor removed.
+func TestOpenFinalIgnoresStateDirectory(t *testing.T) {
+	t.Run("a fresh cache has no state directory", func(t *testing.T) {
+		storage := t.TempDir()
+		store, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog)
+		if err != nil {
+			t.Fatalf("openFinal: %v", err)
+		}
+		defer store.Close()
+		if _, err := os.Lstat(filepath.Join(storage, "1", "state")); !os.IsNotExist(err) {
+			t.Fatalf("state/ was created in the cache: %v", err)
+		}
+	})
+	t.Run("a leftover symlinked state directory is left alone", func(t *testing.T) {
+		storage := t.TempDir()
+		other := t.TempDir()
+		mkfile(t, filepath.Join(other, "wal"))
+		if err := os.MkdirAll(filepath.Join(storage, "1"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, filepath.Join(storage, "1", "state")); err != nil {
+			t.Fatal(err)
+		}
+		store, _, err := openFinal(context.Background(), storage, 1, nil, readTimeout, noLog)
+		if err != nil {
+			t.Fatalf("openFinal: %v", err)
+		}
+		defer store.Close()
+		survives(t, filepath.Join(other, "wal"), "x")
+	})
 }

@@ -8,10 +8,10 @@ import (
 	"github.com/digitalSloth/go-executor/internal/codec"
 )
 
-// Reader is a domain's gateway read adapter (EXECUTOR §7, §21.4).
-// It decodes and reads gateway state; it never executes.
+// Reader is a domain's gateway read adapter. It decodes and reads
+// gateway state; it never executes.
 type Reader interface {
-	ChainID() any // JSON-encodable chain_id (SPEC §9.1)
+	ChainID() any // JSON-encodable chain_id
 	DescribeInput(inputData []byte) (any, error)
 	Profiles() []Profile
 	Views() []View

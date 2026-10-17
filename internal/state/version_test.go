@@ -2,7 +2,6 @@ package state
 
 import (
 	"bytes"
-	"path/filepath"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/trie"
@@ -11,10 +10,7 @@ import (
 )
 
 func TestVersionMatchesStore(t *testing.T) {
-	store, err := OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
+	store := OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 
 	pA, pB, pC, pD := trie.Path{0x10}, trie.Path{0x20}, trie.Path{0x30}, trie.Path{0x40}
@@ -52,10 +48,7 @@ func TestVersionMatchesStore(t *testing.T) {
 }
 
 func TestStoreVersion(t *testing.T) {
-	store, err := OpenEmpty(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
+	store := OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 
 	pA, pB, pC, pD := trie.Path{0x10}, trie.Path{0x20}, trie.Path{0x30}, trie.Path{0x40}

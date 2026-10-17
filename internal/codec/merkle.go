@@ -8,10 +8,11 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// MerkleRoot is the §27.3 construction, distinct from the SMT (§13): leaf
-// SHA3-256(0x00 || element), node SHA3-256(0x01 || left || right), a lone trailing node at a
-// level promoted unchanged, and bytes32(0) for the empty set. One element hashes to its leaf
-// hash (promoted at every level). Element order is the caller's responsibility.
+// MerkleRoot is a Merkle construction distinct from the SMT: leaf
+// SHA3-256(0x00 || element), node SHA3-256(0x01 || left || right), a
+// lone trailing node at a level promoted unchanged, and bytes32(0) for
+// the empty set. One element hashes to its leaf hash (promoted at
+// every level). Element order is the caller's responsibility.
 func MerkleRoot(elements [][]byte) types.Hash {
 	if len(elements) == 0 {
 		return types.Hash{}
@@ -36,9 +37,9 @@ func MerkleRoot(elements [][]byte) types.Hash {
 	return level[0]
 }
 
-// MerkleProofs returns the §27.3 MerkleProof of every element, in
-// element order, over the same tree as MerkleRoot. It builds the tree
-// once. A proof is count:u32 BE followed by count steps of side:u8 ||
+// MerkleProofs returns the MerkleProof of every element, in element
+// order, over the same tree as MerkleRoot. It builds the tree once. A
+// proof is count:u32 BE followed by count steps of side:u8 ||
 // sibling:bytes32; side 0 puts the sibling on the left, side 1 on the
 // right. A node promoted at a level contributes no step at that level.
 func MerkleProofs(elements [][]byte) [][]byte {

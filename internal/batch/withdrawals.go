@@ -13,8 +13,7 @@ import (
 type Withdrawal struct {
 	// Message is the canonical OutboxMessage encoding: the outbox leaf.
 	Message []byte
-	// Proof is the §27.3 MerkleProof of Message under the batch's
-	// OutboxRoot.
+	// Proof is the MerkleProof of Message under the batch's OutboxRoot.
 	Proof []byte
 }
 

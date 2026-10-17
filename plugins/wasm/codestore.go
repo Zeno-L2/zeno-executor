@@ -11,8 +11,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// entryKind partitions the code store's flat key space into the four entry shapes §4
-// describes. Kind and key together identify a stored value.
+// entryKind partitions the code store's flat key space into its four
+// entry shapes. Kind and key together identify a stored value.
 type entryKind uint8
 
 const (
@@ -63,12 +63,13 @@ var (
 
 var allEntryKinds = []entryKind{entryDeployChunk, entryPendingRecord, entryAssembledModule, entryInstrumentedModule}
 
-// codeStore is the local, non-consensus, checksummed disk tier the EXECUTOR §2 carve-out permits
-// Apply and DecodeInput to read and memoize into. There is no in-memory byte tier: the OS page
-// cache is sufficient at this scale (§4). Every entry carries a SHA3-256 checksum of its own
-// bytes, and a checksum mismatch — corruption, or a write that never completed — is treated
-// exactly as absence; the caller's obligation to turn "absent" into a halt lives above this
-// type, not in it.
+// codeStore is the local, non-consensus, checksummed disk tier that
+// Apply and DecodeInput read and memoize into. There is no in-memory
+// byte tier: the OS page cache is sufficient at this scale. Every entry
+// carries a SHA3-256 checksum of its own bytes, and a checksum mismatch
+// (corruption, or a write that never completed) is treated exactly as
+// absence; the caller's obligation to turn "absent" into a halt lives
+// above this type, not in it.
 type codeStore struct {
 	root string
 }

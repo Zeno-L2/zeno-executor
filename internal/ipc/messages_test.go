@@ -99,7 +99,6 @@ func validTable() []msgCase {
 			ExecutorAddress:   types.Address{0x42},
 			STFSpecHash:       types.Hash{0xAA},
 			ConfirmationDepth: 2,
-			Role:              "EXECUTOR",
 			NetworkName:       "test",
 			StoragePath:       "/data",
 			MaxPendingBatches: 8,
@@ -196,7 +195,6 @@ func TestStr16Overrun(t *testing.T) {
 		ExecutorAddress:   types.Address{0x01},
 		STFSpecHash:       types.Hash{0x02},
 		ConfirmationDepth: 1,
-		Role:              "R",
 		NetworkName:       "N",
 		StoragePath:       "S",
 		MaxPendingBatches: 1,
@@ -206,11 +204,10 @@ func TestStr16Overrun(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 	payload := enc[5:]
-	// Layout: u32 domainId(4) + 20B addr + 32B hash + u64 depth(8) = 64 bytes fixed prefix,
-	// then str16 role, str16 networkName, str16 storagePath.
+	// Layout: u32 domainId(4) + 20B addr + 32B hash + u64 depth(8) =
+	// 64 bytes fixed prefix, then str16 networkName, str16 storagePath.
 	const fixed = 4 + 20 + 32 + 8
-	roleLenOff := fixed
-	networkLenOff := fixed + 2 + len(cfg.Role)
+	networkLenOff := fixed
 	storageLenOff := networkLenOff + 2 + len(cfg.NetworkName)
 
 	overrun := func(name string, lenOff int) {
@@ -228,7 +225,6 @@ func TestStr16Overrun(t *testing.T) {
 			}
 		})
 	}
-	overrun("role", roleLenOff)
 	overrun("networkName", networkLenOff)
 	overrun("storagePath", storageLenOff)
 
@@ -259,19 +255,16 @@ func TestOverLimitStrings(t *testing.T) {
 		ExecutorAddress:   types.Address{0x01},
 		STFSpecHash:       types.Hash{0x02},
 		ConfirmationDepth: 1,
-		Role:              "EXECUTOR",
 		NetworkName:       "test",
 		StoragePath:       "/data",
 	}
 
-	longRole := base
-	longRole.Role = strings.Repeat("r", maxRoleLen+1)
 	longNetwork := base
 	longNetwork.NetworkName = strings.Repeat("n", maxNetworkNameLen+1)
 	longStorage := base
 	longStorage.StoragePath = strings.Repeat("s", maxStoragePathLen+1)
 
-	for name, cfg := range map[string]WorkerConfig{"role": longRole, "networkName": longNetwork, "storagePath": longStorage} {
+	for name, cfg := range map[string]WorkerConfig{"networkName": longNetwork, "storagePath": longStorage} {
 		t.Run("config/"+name, func(t *testing.T) {
 			if _, err := Encode(cfg); err == nil {
 				t.Fatalf("Encode: want error")
@@ -304,7 +297,6 @@ func handEncodeConfig(t *testing.T, c WorkerConfig) []byte {
 	w.raw(c.ExecutorAddress[:])
 	w.raw(c.STFSpecHash[:])
 	w.u64(c.ConfirmationDepth)
-	w.str16(c.Role)
 	w.str16(c.NetworkName)
 	w.str16(c.StoragePath)
 	w.u64(c.MaxPendingBatches)
@@ -325,6 +317,29 @@ func handEncodeSourceError(t *testing.T, s SourceError) []byte {
 		t.Fatalf("assembleFrame: %v", err)
 	}
 	return frame
+}
+
+func TestConfigStringsAtLimitRoundTrip(t *testing.T) {
+	cfg := WorkerConfig{
+		DomainID:          1,
+		ExecutorAddress:   types.Address{0x01},
+		STFSpecHash:       types.Hash{0x02},
+		ConfirmationDepth: 1,
+		NetworkName:       strings.Repeat("n", maxNetworkNameLen),
+		StoragePath:       strings.Repeat("s", maxStoragePathLen),
+		MaxPendingBatches: 7,
+	}
+	enc, err := Encode(cfg)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	m, err := ReadMessage(bytes.NewReader(enc), Supervisor)
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if got := m.(WorkerConfig); got != cfg {
+		t.Fatalf("decoded config differs from the encoded one: got %+v", got)
+	}
 }
 
 func TestUnknownTypes(t *testing.T) {
@@ -620,7 +635,7 @@ func TestCursorRequestRejectsPayload(t *testing.T) {
 }
 
 func TestConfigCarriesMaxPendingBatches(t *testing.T) {
-	enc, err := Encode(WorkerConfig{DomainID: 1, Role: "R", NetworkName: "N", StoragePath: "S", MaxPendingBatches: 64})
+	enc, err := Encode(WorkerConfig{DomainID: 1, NetworkName: "N", StoragePath: "S", MaxPendingBatches: 64})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}

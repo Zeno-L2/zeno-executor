@@ -4,41 +4,31 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/trie"
-	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// WitnessEntry is one SMT witness in a DA bundle record (§20): an inclusion proof for a read
-// or written present key, or a non-inclusion proof for an absent observation.
+// WitnessEntry is one SMT witness in a DA bundle record: an inclusion
+// proof for a read or written present key, or a non-inclusion proof
+// for an absent observation.
 type WitnessEntry struct {
 	DerivedKey trie.Path
-	// Value is the observed leaf value in the §27.2 value form: nil means absent (the EMPTY
-	// sentinel), a non-nil zero-length slice means present-empty.
+	// Value is the observed leaf value in the state value form: nil
+	// means absent (the EMPTY sentinel), a non-nil zero-length slice
+	// means present-empty.
 	Value []byte
 	Proof []byte
 }
 
-// BundleInputRecord is one input's entry in the canonical DA bundle (§20).
+// BundleInputRecord is one input's entry in the canonical DA bundle.
 type BundleInputRecord struct {
 	GlobalInputIndex uint64
 	InputData        []byte
 	Witnesses        []WitnessEntry
 	ExecutionResult  []byte
-	// DeployChunkData is the kind-3 chunk's raw bytes (§20). It is encoded, as a trailing
-	// Bytes field, only for a record whose InputData names input_kind 3; it MUST be nil for
-	// every other kind.
+	// DeployChunkData is the kind-3 chunk's raw bytes. It is encoded,
+	// as a trailing Bytes field, only for a record whose InputData
+	// names input_kind 3; it MUST be nil for every other kind.
 	DeployChunkData []byte
-}
-
-// Encode returns the canonical encoding of r. Witnesses MUST be strictly ascending by
-// DerivedKey with no duplicates.
-func (r BundleInputRecord) Encode() ([]byte, error) {
-	w := &writer{}
-	if err := encodeBundleInputRecordBody(w, r); err != nil {
-		return nil, fmt.Errorf("codec: encode bundle input record: %w", err)
-	}
-	return w.buf, nil
 }
 
 func encodeBundleInputRecordBody(w *writer, rec BundleInputRecord) error {
@@ -130,9 +120,10 @@ func decodeBundleInputRecordBody(r *reader) (BundleInputRecord, error) {
 	return rec, nil
 }
 
-// EncodeBundle returns the canonical DA bundle encoding: the concatenation, with no
-// separators and no outer framing, of each record's encoding in the given slice order.
-// Records MUST be strictly ascending by GlobalInputIndex with no duplicates (§20).
+// EncodeBundle returns the canonical DA bundle encoding: the
+// concatenation, with no separators and no outer framing, of each
+// record's encoding in the given slice order. Records MUST be strictly
+// ascending by GlobalInputIndex with no duplicates.
 func EncodeBundle(records []BundleInputRecord) ([]byte, error) {
 	for i := 1; i < len(records); i++ {
 		if records[i].GlobalInputIndex == records[i-1].GlobalInputIndex {
@@ -175,13 +166,4 @@ func DecodeBundle(b []byte) ([]BundleInputRecord, error) {
 		records = append(records, rec)
 	}
 	return records, nil
-}
-
-// BundleHash returns DAHash = SHA3-256(EncodeBundle(records)).
-func BundleHash(records []BundleInputRecord) (types.Hash, error) {
-	b, err := EncodeBundle(records)
-	if err != nil {
-		return types.Hash{}, fmt.Errorf("codec: bundle hash: %w", err)
-	}
-	return hashOf(crypto.Hash(b)), nil
 }

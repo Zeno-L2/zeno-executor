@@ -7,7 +7,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// Status is the §15 receipt status ordinal (exhaustive; ordinals fixed).
+// Status is the receipt status ordinal (exhaustive; ordinals fixed).
 type Status uint8
 
 const (
@@ -22,7 +22,8 @@ const (
 	StatusStorageQuotaExceeded Status = 8
 )
 
-// String returns the §15 status name, or "UNKNOWN" for an out-of-range ordinal.
+// String returns the status name, or "UNKNOWN" for an out-of-range
+// ordinal.
 func (s Status) String() string {
 	switch s {
 	case StatusSuccess:
@@ -48,7 +49,7 @@ func (s Status) String() string {
 	}
 }
 
-// Receipt is the per-input receipt (§27.7, §15).
+// Receipt is the per-input receipt.
 type Receipt struct {
 	Version       uint16
 	InputIndex    uint64
@@ -166,8 +167,9 @@ func DecodeReceipt(b []byte) (Receipt, error) {
 	return rec, nil
 }
 
-// StateDiffHash is the §15 receipt preimage rule: SHA3-256 over the canonical
-// List<StateDiffEntry> encoding (§27.1a, §27.2), and bytes32(0) when the list is empty.
+// StateDiffHash is the receipt preimage rule: SHA3-256 over the
+// canonical List<StateDiffEntry> encoding, and bytes32(0) when the
+// list is empty.
 func StateDiffHash(entries []StateDiffEntry) (types.Hash, error) {
 	if len(entries) == 0 {
 		return types.Hash{}, nil
@@ -179,8 +181,9 @@ func StateDiffHash(entries []StateDiffEntry) (types.Hash, error) {
 	return hashOf(crypto.Hash(w.buf)), nil
 }
 
-// ReturnHash is the §15 receipt preimage rule: SHA3-256(ReturnData) over the raw bytes with
-// no length prefix and no framing, and bytes32(0) when ReturnData is empty.
+// ReturnHash is the receipt preimage rule: SHA3-256(ReturnData) over
+// the raw bytes with no length prefix and no framing, and bytes32(0)
+// when ReturnData is empty.
 func ReturnHash(data []byte) types.Hash {
 	if len(data) == 0 {
 		return types.Hash{}
@@ -188,9 +191,10 @@ func ReturnHash(data []byte) types.Hash {
 	return hashOf(crypto.Hash(data))
 }
 
-// EncodeReceiptSidecar returns a batch's receipt sidecar (EXECUTOR §21.2): the List<Bytes>
-// (§27.0) of each receipt's canonical encoding, in order. receipts MUST be strictly
-// ascending by InputIndex. The elements are exactly the batch's receiptRoot leaves.
+// EncodeReceiptSidecar returns a batch's receipt sidecar: the
+// List<Bytes> of each receipt's canonical encoding, in order. receipts
+// MUST be strictly ascending by InputIndex. The elements are exactly
+// the batch's receiptRoot leaves.
 func EncodeReceiptSidecar(receipts []Receipt) ([]byte, error) {
 	for i := 1; i < len(receipts); i++ {
 		if receipts[i].InputIndex == receipts[i-1].InputIndex {

@@ -34,8 +34,9 @@ func sigEqual(a, b funcSig) bool {
 	return bytes.Equal(a.params, b.params) && bytes.Equal(a.results, b.results)
 }
 
-// tableInfo and memInfo are the one declared table's and one declared memory's limits
-// (rules 6 and 7 cap each index space at a single entry).
+// tableInfo and memInfo are the one declared table's and one declared
+// memory's limits (parseTables and parseMemories cap each index space
+// at a single entry).
 type tableInfo struct {
 	min, max uint32
 	hasMax   bool
@@ -67,9 +68,10 @@ type moduleInfo struct {
 	sawRunExport    bool
 }
 
-// Validate reports whether wasm is in the Phase-1 accepted set, returning a wrapped named
-// reason for the first rule it breaks. It performs no type checking: operand-stack typing,
-// block signatures and call_indirect type agreement are the engine's, via engine.Compile.
+// Validate reports whether wasm is in the accepted set, returning a
+// wrapped named reason for the first rule it breaks. It performs no
+// type checking: operand-stack typing, block signatures and
+// call_indirect type agreement are the engine's, via engine.Compile.
 //
 // Two rules here are stricter than Core 1.0, deliberately: canonical LEB128 only (any padded
 // encoding is rejected, for every count, length, index and immediate), and a deny-by-default
@@ -139,8 +141,9 @@ func Validate(wasm []byte, lim Limits) error {
 	return nil
 }
 
-// requireCoreExports enforces rule 9's two required exports, called once at the point in
-// section order rule 9 occupies, whether or not an export section is present.
+// requireCoreExports enforces the two required exports, run and memory,
+// called once at the export section's point in section order, whether
+// or not an export section is present.
 func requireCoreExports(m *moduleInfo) error {
 	if !m.sawMemoryExport {
 		return fmt.Errorf("export section: no memory export named \"memory\": %w", ErrMissingExport)
@@ -151,13 +154,16 @@ func requireCoreExports(m *moduleInfo) error {
 	return nil
 }
 
-// parseTypes implements rule 3. It also caps a declared type's parameter count against
-// lim.MaxLocalsPerFunction and accumulates the running total across the whole type section
-// against lim.MaxTotalParams, in the same early-exit shape as parseCode's MaxTotalLocals
-// accumulator: wazero's decode-time cache key for a function type is built with O(n^2) string
-// concatenation over its params, for every declared type whether or not any function
-// references it, so a type's params must be bounded here rather than relying on the
-// per-function locals check a function using it would otherwise hit.
+// parseTypes validates the type section. It also caps a declared type's
+// parameter count against lim.MaxLocalsPerFunction and accumulates the
+// running total across the whole type section against
+// lim.MaxTotalParams, in the same early-exit shape as parseCode's
+// MaxTotalLocals accumulator: wazero's decode-time cache key for a
+// function type is built with O(n^2) string concatenation over its
+// params, for every declared type whether or not any function
+// references it, so a type's params must be bounded here rather than
+// relying on the per-function locals check a function using it would
+// otherwise hit.
 func parseTypes(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -209,7 +215,7 @@ var (
 	runSig         = funcSig{params: []byte{0x7F, 0x7F}, results: []byte{0x7E}}
 )
 
-// parseImports implements rule 4.
+// parseImports validates the import section.
 func parseImports(payload []byte, m *moduleInfo) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -270,7 +276,7 @@ func parseImports(payload []byte, m *moduleInfo) error {
 	return nil
 }
 
-// parseFunctions implements rule 5.
+// parseFunctions validates the function section.
 func parseFunctions(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -296,7 +302,7 @@ func parseFunctions(payload []byte, m *moduleInfo, lim Limits) error {
 	return nil
 }
 
-// parseTables implements rule 6.
+// parseTables validates the table section.
 func parseTables(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -336,7 +342,7 @@ func parseTables(payload []byte, m *moduleInfo, lim Limits) error {
 	return nil
 }
 
-// parseMemories implements rule 7.
+// parseMemories validates the memory section.
 func parseMemories(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -372,7 +378,7 @@ func parseMemories(payload []byte, m *moduleInfo, lim Limits) error {
 	return nil
 }
 
-// parseGlobals implements rule 8.
+// parseGlobals validates the global section.
 func parseGlobals(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -417,7 +423,8 @@ func parseGlobals(payload []byte, m *moduleInfo, lim Limits) error {
 	return nil
 }
 
-// parseExports implements rule 9.
+// parseExports validates the export section; requireCoreExports checks
+// the required run and memory exports.
 func parseExports(payload []byte, m *moduleInfo) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -486,7 +493,8 @@ func parseExports(payload []byte, m *moduleInfo) error {
 	return nil
 }
 
-// parseElements implements rules 10 and, for the active-segment bounds check, 12.
+// parseElements validates the element section, including the
+// active-segment bounds check.
 func parseElements(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -532,9 +540,10 @@ func parseElements(payload []byte, m *moduleInfo, lim Limits) error {
 			}
 			numFuncs++
 		}
-		// A segment with no table declared has no table 0 to reference. Rule 9 only requires
-		// a memory and a run export, not a table export, so this is the primary check that
-		// rejects a table-less module with an element segment.
+		// A segment with no table declared has no table 0 to reference.
+		// requireCoreExports only requires a memory and a run export,
+		// not a table export, so this is the primary check that rejects
+		// a table-less module with an element segment.
 		if !m.hasTable {
 			return fmt.Errorf("element %d: no table declared: %w", i, ErrTableIndexOutOfBounds)
 		}
@@ -548,7 +557,8 @@ func parseElements(payload []byte, m *moduleInfo, lim Limits) error {
 	return nil
 }
 
-// parseData implements rules 11 and, for the active-segment bounds check, 12.
+// parseData validates the data section, including the active-segment
+// bounds check.
 func parseData(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()
@@ -587,9 +597,10 @@ func parseData(payload []byte, m *moduleInfo, lim Limits) error {
 		if err != nil {
 			return fmt.Errorf("data %d: bytes: %w", i, err)
 		}
-		// A segment with no memory declared has no memory 0 to reference. Unreachable once
-		// rule 9's memory-export requirement has fired first, kept as defence in depth (see
-		// the equivalent comment in parseElements).
+		// A segment with no memory declared has no memory 0 to
+		// reference. Unreachable once requireCoreExports's
+		// memory-export requirement has fired first, kept as defence in
+		// depth (see the equivalent comment in parseElements).
 		if !m.hasMem {
 			return fmt.Errorf("data %d: no memory declared: %w", i, ErrMemoryIndexOutOfBounds)
 		}
@@ -603,7 +614,7 @@ func parseData(payload []byte, m *moduleInfo, lim Limits) error {
 	return nil
 }
 
-// parseCode implements rule 13.
+// parseCode validates the code section.
 func parseCode(payload []byte, m *moduleInfo, lim Limits) error {
 	r := newReader(payload)
 	count, err := r.readVecCount()

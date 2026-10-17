@@ -12,13 +12,14 @@ import (
 	"github.com/digitalSloth/go-executor/internal/codec"
 )
 
-// assetTotals is one asset's running batch contribution: depositCredit and withdrawalDebit
-// mirror the committed AssetFlowSummary fields (§27.6, edge cases 11-12); capTotal is the
-// MaxBatchWithdrawal aggregate (§27.9, edge case 13), which excludes runtime-emitted refunds,
-// and capLimit is the highest cap among the batch's records holding a contract withdrawal in
-// the asset (§27.9), which bounds capTotal. All four are unbounded math/big values;
-// conversion to codec.U256 happens only once a candidate has been admitted (breach) or the
-// batch is assembled (assetFlowSummary).
+// assetTotals is one asset's running batch contribution: depositCredit
+// and withdrawalDebit mirror the committed AssetFlowSummary fields;
+// capTotal is the MaxBatchWithdrawal aggregate, which excludes
+// runtime-emitted refunds, and capLimit is the highest cap among the
+// batch's records holding a contract withdrawal in the asset, which
+// bounds capTotal. All four are unbounded math/big values; conversion
+// to codec.U256 happens only once a candidate has been admitted
+// (breach) or the batch is assembled (assetFlowSummary).
 type assetTotals struct {
 	depositCredit   *big.Int
 	withdrawalDebit *big.Int
@@ -26,8 +27,8 @@ type assetTotals struct {
 	capLimit        *big.Int
 }
 
-// batchTotals is the in-progress batch's per-asset running totals, keyed by AssetID. An asset
-// with no contribution has no entry (edge case 14).
+// batchTotals is the in-progress batch's per-asset running totals,
+// keyed by AssetID. An asset with no contribution has no entry.
 type batchTotals map[codec.AssetID]*assetTotals
 
 func (bt batchTotals) entry(asset codec.AssetID) *assetTotals {
@@ -54,12 +55,13 @@ func (bt batchTotals) clone() batchTotals {
 	return out
 }
 
-// apply folds rec's contribution into bt: its own deposit (edge case 11, regardless of status)
-// into depositCredit only — MaxBatchWithdrawal bounds withdrawals, not inbound deposits — and
-// every codec.L1Withdrawal in its committed ExecutionResult into withdrawalDebit (edge case 12,
-// including refunds) and, when its SourceContract is non-zero, into capTotal too (edge case 13,
-// refunds excluded). It also raises capLimit to the cap rec's Ctx.Caps answered for that
-// asset when that is higher.
+// apply folds rec's contribution into bt: its own deposit (regardless
+// of status) into depositCredit only (MaxBatchWithdrawal bounds
+// withdrawals, not inbound deposits) and every codec.L1Withdrawal in
+// its committed ExecutionResult into withdrawalDebit (including
+// refunds) and, when its SourceContract is non-zero, into capTotal too
+// (refunds excluded). It also raises capLimit to the cap rec's Ctx.Caps
+// answered for that asset when that is higher.
 func (bt batchTotals) apply(rec *applied) {
 	if rec.depositAmount != (codec.U256{}) {
 		t := bt.entry(rec.depositAsset)
@@ -84,10 +86,10 @@ func (bt batchTotals) apply(rec *applied) {
 	}
 }
 
-// breach reports whether bt exceeds MaxAssetsPerBatch's distinct-asset footprint, any asset's
-// capTotal exceeds its capLimit, or any asset's depositCredit or withdrawalDebit no
-// longer fits a codec.U256 (edge case 15: a 256-bit overflow is treated exactly as a cap
-// breach).
+// breach reports whether bt exceeds MaxAssetsPerBatch's distinct-asset
+// footprint, any asset's capTotal exceeds its capLimit, or any asset's
+// depositCredit or withdrawalDebit no longer fits a codec.U256. A
+// 256-bit overflow is treated exactly as a cap breach.
 func (bt batchTotals) breach() bool {
 	if len(bt) > codec.MaxAssetsPerBatch {
 		return true
@@ -126,10 +128,12 @@ func (bt batchTotals) assetFlowSummary() (codec.AssetFlowSummary, error) {
 			return nil, fmt.Errorf("batch: asset flow summary: %w", err)
 		}
 		if credit == (codec.U256{}) && debit == (codec.U256{}) {
-			// edge case 14: apply creates an entry unconditionally for a zero-amount
-			// withdrawal (bt.entry(w.Asset) above), so this skip is load-bearing, not
-			// defensive — it is what keeps §27.6's both-amounts-zero rejection satisfied.
-			// Such an asset still counts toward breach()'s MaxAssetsPerBatch footprint.
+			// apply creates an entry unconditionally for a zero-amount
+			// withdrawal (bt.entry(w.Asset) above), so this skip is
+			// load-bearing, not defensive: it is what keeps the codec's
+			// both-amounts-zero rejection (ErrEmptyAssetFlowEntry)
+			// satisfied. Such an asset still counts toward breach()'s
+			// MaxAssetsPerBatch footprint.
 			continue
 		}
 		out = append(out, codec.AssetFlowEntry{Asset: asset, DepositCredit: credit, WithdrawalDebit: debit})
@@ -137,11 +141,12 @@ func (bt batchTotals) assetFlowSummary() (codec.AssetFlowSummary, error) {
 	return out, nil
 }
 
-// admitCandidate evaluates rec against a scratch clone of totals, including rec's own
-// contribution (step 8, edge case 16). On a breach with isFirst — this batch has nothing
-// accumulated yet — it is ErrUnbatchable (edge case 5), a halt. On a breach otherwise it
-// reports (false, nil): the caller closes the batch and carries rec. Otherwise it commits the
-// scratch totals into *totals and reports (true, nil).
+// admitCandidate evaluates rec against a scratch clone of totals,
+// including rec's own contribution. On a breach with isFirst (this
+// batch has nothing accumulated yet) it is ErrUnbatchable, a halt. On a
+// breach otherwise it reports (false, nil): the caller closes the batch
+// and carries rec. Otherwise it commits the scratch totals into *totals
+// and reports (true, nil).
 func admitCandidate(totals *batchTotals, rec *applied, isFirst bool) (bool, error) {
 	scratch := totals.clone()
 	scratch.apply(rec)
@@ -155,7 +160,7 @@ func admitCandidate(totals *batchTotals, rec *applied, isFirst bool) (bool, erro
 	return true, nil
 }
 
-// assembleReceipt builds one input's §27.7 receipt from its applied record.
+// assembleReceipt builds one input's receipt from its applied record.
 func assembleReceipt(rec applied, batchID uint64) (codec.Receipt, error) {
 	sdHash, err := codec.StateDiffHash(toDerivedStateDiff(rec.eff.StateDiff))
 	if err != nil {
@@ -204,10 +209,11 @@ func encodeAll[T any](items []T, encode func(T) ([]byte, error)) ([][]byte, erro
 	return out, nil
 }
 
-// assemble builds and self-verifies the batch over records, which MUST be non-empty. batchID is
-// d.batchID; it advances only once assemble succeeds (NextBatch's responsibility). It stores the
-// batch's receipt sidecar after its bundle, so both exist before the caller commits a record
-// naming them (EXECUTOR §16).
+// assemble builds and self-verifies the batch over records, which MUST
+// be non-empty. batchID is d.batchID; it advances only once assemble
+// succeeds (NextBatch's responsibility). It stores the batch's receipt
+// sidecar after its bundle, so both exist before the caller commits a
+// record naming them.
 func (d *Driver) assemble(records []applied) (Batch, error) {
 	if len(records) == 0 {
 		return Batch{}, fmt.Errorf("batch: assemble: no records")

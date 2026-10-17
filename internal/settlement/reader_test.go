@@ -300,7 +300,11 @@ func TestViewMomentum(t *testing.T) {
 	if want == 0 {
 		t.Fatal("the fixture momentum has a zero time, so the test would not tell a missing time from a read one")
 	}
-	if h, ts := v.Momentum(); h != fx.ReadHeight || ts != want {
+	h, ts, hash := v.Momentum()
+	if h != fx.ReadHeight || ts != want {
 		t.Fatalf("Momentum() = %d, %d; want %d, %d", h, ts, fx.ReadHeight, want)
+	}
+	if hash != ms[0].Momentum.Hash || hash == (types.Hash{}) {
+		t.Fatalf("Momentum() hash = %s; want the non-zero momentum hash %s", hash, ms[0].Momentum.Hash)
 	}
 }

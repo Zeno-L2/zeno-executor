@@ -28,7 +28,6 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	d.setup()
 	d.setRelayPause(true)
 
-	// Phase 2: the first batch across a restart.
 	t.Logf("phase 2: the first batch across a restart")
 	d.deposit(1)
 	d.startExecutor("executor-1", executorBin, configPath)
@@ -86,7 +85,6 @@ func TestSubmissionOnDevnet(t *testing.T) {
 		t.Fatalf("gates are %+v, want no pause, an active member naming %s and an active pillar", g, executorAddress)
 	}
 
-	// Phase 3: the submit pause and a PAUSED domain.
 	t.Logf("phase 3: the submit pause and a PAUSED domain")
 	d.setDomainPause(true)
 	d.deposit(2)
@@ -127,7 +125,6 @@ func TestSubmissionOnDevnet(t *testing.T) {
 	d.waitReceipt(local, call, "latest", momenta(confirmationDepth+10))
 	d.setDomainStatus(definition.DomainStatusActive)
 
-	// Phase 4: an aligned re-sync.
 	t.Logf("phase 4: an aligned re-sync")
 	e2.stop()
 	domainDir := filepath.Join(storage, "1")

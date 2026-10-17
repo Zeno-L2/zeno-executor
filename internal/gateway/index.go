@@ -101,8 +101,8 @@ func ikey(prefix string, parts ...[]byte) []byte {
 	return k
 }
 
-// Index is one domain's on-disk index (EXECUTOR §21.6). Poll is its
-// only writer; views of it are safe from any goroutine.
+// Index is one domain's on-disk index. Poll is its only writer; views
+// of it are safe from any goroutine.
 type Index struct {
 	db      *leveldb.DB
 	senders SenderSource

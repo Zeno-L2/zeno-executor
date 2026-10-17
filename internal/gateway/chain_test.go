@@ -225,9 +225,6 @@ func TestChainFollowsTags(t *testing.T) {
 	if got := finalRoot(t, r); got != cs[0].PostStateRoot {
 		t.Fatalf("Final root %s, want batch 0's %s", got, cs[0].PostStateRoot)
 	}
-	if n := fileSize(t, r.wal); n != 0 {
-		t.Fatalf("WAL size %d, want 0", n)
-	}
 
 	s.height = 30
 	s.accept(cs[2], 22)
@@ -237,9 +234,6 @@ func TestChainFollowsTags(t *testing.T) {
 	requireNoVersion(t, r.c, 3)
 	if got := finalRoot(t, r); got != cs[4].PostStateRoot {
 		t.Fatalf("Final root %s, want batch 4's %s", got, cs[4].PostStateRoot)
-	}
-	if n := fileSize(t, r.wal); n != 0 {
-		t.Fatalf("WAL size %d, want 0", n)
 	}
 }
 

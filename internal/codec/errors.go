@@ -14,7 +14,8 @@ var (
 	ErrUnknownVersion = errors.New("codec: unknown version")
 	// ErrOverflow is returned when a length or count prefix exceeds the remaining bytes.
 	ErrOverflow = errors.New("codec: length or count exceeds remaining bytes")
-	// ErrLimitExceeded is returned when a list or field exceeds a §25 bound.
+	// ErrLimitExceeded is returned when a list or field exceeds one of
+	// the Max* limits.
 	ErrLimitExceeded = errors.New("codec: limit exceeded")
 	// ErrNotSorted is returned when a list required to be ascending is not.
 	ErrNotSorted = errors.New("codec: not sorted")
@@ -26,13 +27,14 @@ var (
 	ErrInvalidKind = errors.New("codec: invalid kind")
 	// ErrInvalidStatus is returned for a status ordinal outside 0…8.
 	ErrInvalidStatus = errors.New("codec: invalid status")
-	// ErrZeroStorageBytes is returned when a BuyStorage input's bytes is zero (§10.7).
+	// ErrZeroStorageBytes is returned when a BuyStorage input's bytes
+	// is zero.
 	ErrZeroStorageBytes = errors.New("codec: BuyStorage bytes is zero")
 	// ErrNonEmptyWithdrawalPayload is returned when an L1Withdrawal outbox message carries a
 	// non-empty payload.
 	ErrNonEmptyWithdrawalPayload = errors.New("codec: non-empty withdrawal payload")
-	// ErrNonEmptyProofData is returned when a Phase-1 batch commitment's proofData is not the
-	// zero-length encoding.
+	// ErrNonEmptyProofData is returned when a batch commitment's
+	// proofData is not the zero-length encoding.
 	ErrNonEmptyProofData = errors.New("codec: non-empty proof data")
 	// ErrEmptyAssetFlowEntry is returned when an AssetFlowEntry has both amounts zero.
 	ErrEmptyAssetFlowEntry = errors.New("codec: empty asset flow entry")
@@ -48,11 +50,11 @@ var (
 	// ErrRootsPresent is returned when bytes claiming to be a ContractEffects blob also parse
 	// as a 9-field ExecutionResult (i.e. carry preStateRoot/postStateRoot).
 	ErrRootsPresent = errors.New("codec: roots present")
-	// ErrInvalidPolicy is returned when a ContractMetadata's upgrade_policy is not one of the
-	// §27.12 ordinals.
+	// ErrInvalidPolicy is returned when a ContractMetadata's
+	// upgrade_policy is not one of the Policy* ordinals.
 	ErrInvalidPolicy = errors.New("codec: invalid upgrade policy")
-	// ErrInvalidOwner is returned when a ContractMetadata's owner is inconsistent with its
-	// upgrade_policy (§27.12).
+	// ErrInvalidOwner is returned when a ContractMetadata's owner is
+	// inconsistent with its upgrade_policy.
 	ErrInvalidOwner = errors.New("codec: owner inconsistent with upgrade policy")
 	// ErrInvalidProofSide is returned when a MerkleProof step's side is
 	// not 0 or 1.

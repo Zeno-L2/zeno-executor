@@ -22,9 +22,10 @@ const (
 	snapshotExt   = ".snap"
 )
 
-// SnapshotHeader is the tag block a snapshot file carries (EXECUTOR §16). This package
-// interprets only STFSpecHash, which guards loading; InputSeq and Meta are recorded verbatim
-// and handed back unchanged, for the recovery layer's own bookkeeping.
+// SnapshotHeader is the tag block a snapshot file carries. This package
+// interprets only STFSpecHash, which guards loading; InputSeq and Meta
+// are recorded verbatim and handed back unchanged, for the recovery
+// layer's own bookkeeping.
 type SnapshotHeader struct {
 	// InputSeq is the last globalInputIndex whose effects the snapshotted leaf set includes.
 	InputSeq    uint64
@@ -98,13 +99,11 @@ func ListSnapshots(dir string) ([]SnapshotInfo, error) {
 	return out, nil
 }
 
-// OpenSnapshot opens walPath seeded from the snapshot dir/name, discarding any existing WAL
-// content: the snapshot is the durable state and the log holds only diffs applied after it,
-// which a boot always discards. It fails when the file's bytes do not hash to name, and when
-// the snapshot's STFSpecHash differs from stfSpecHash — a snapshot produced by a different STF
-// is never loaded (§16).
-// The open sets the log to mode 0600, whatever its mode was.
-func OpenSnapshot(walPath, dir, name string, stfSpecHash types.Hash) (*Store, error) {
+// OpenSnapshot opens a store seeded from the snapshot dir/name. It
+// fails when the file's bytes do not hash to name, and when the
+// snapshot's STFSpecHash differs from stfSpecHash: a snapshot produced
+// by a different STF is never loaded.
+func OpenSnapshot(dir, name string, stfSpecHash types.Hash) (*Store, error) {
 	body, err := os.ReadFile(filepath.Join(dir, name+snapshotExt))
 	if err != nil {
 		return nil, fmt.Errorf("state: read snapshot %s: %w", name, err)
@@ -119,52 +118,13 @@ func OpenSnapshot(walPath, dir, name string, stfSpecHash types.Hash) (*Store, er
 	if hdr.STFSpecHash != stfSpecHash {
 		return nil, fmt.Errorf("state: snapshot %s is tagged stfSpecHash %s, want %s", name, hdr.STFSpecHash, stfSpecHash)
 	}
-	return openFresh(walPath, leaves)
+	return newStore(leaves), nil
 }
 
-// OpenEmpty opens walPath with an empty leaf set, discarding any existing WAL content. It is
-// the genesis path: a first boot seeds the domain's StateInit into a store whose log starts
-// empty.
-// The open sets the log to mode 0600, whatever its mode was.
-func OpenEmpty(walPath string) (*Store, error) {
-	return openFresh(walPath, make(map[trie.Path][]byte))
-}
-
-// TruncateLog discards every record in the store's log, leaving the in-memory leaf set
-// untouched: it truncates the file to zero length and seeks back to the start. Both halves
-// matter — Apply writes at the file's current offset, so truncating without seeking would
-// leave the next record beyond a hole of zero bytes, which replay reads as a zero-length
-// record and rejects.
-//
-// The log's only reader is Open, which replays it from the start, so a caller that has a
-// durable image of this same leaf set elsewhere — and will reopen from that image rather than
-// from the log — loses nothing by discarding it, and bounds a file that otherwise grows for the
-// life of the process.
-func (s *Store) TruncateLog() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.log.Truncate(0); err != nil {
-		return fmt.Errorf("state: truncate log: %w", err)
-	}
-	if _, err := s.log.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("state: seek log: %w", err)
-	}
-	if err := s.log.Sync(); err != nil {
-		return fmt.Errorf("state: sync log: %w", err)
-	}
-	return nil
-}
-
-func openFresh(walPath string, leaves map[trie.Path][]byte) (*Store, error) {
-	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("state: open %s: %w", walPath, err)
-	}
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("state: chmod %s: %w", walPath, err)
-	}
-	return newStore(leaves, f), nil
+// OpenEmpty returns a store with an empty leaf set. It is the genesis
+// path: a first boot seeds the domain's StateInit into it.
+func OpenEmpty() *Store {
+	return newStore(make(map[trie.Path][]byte))
 }
 
 func encodeSnapshot(hdr SnapshotHeader, leaves map[trie.Path][]byte) []byte {

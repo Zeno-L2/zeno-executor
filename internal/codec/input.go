@@ -4,11 +4,11 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// InputKind is the §27.5 input type ordinal. Ordinals are fixed and MUST NOT be reused.
+// InputKind is the input type ordinal. Ordinals are fixed and MUST NOT
+// be reused.
 type InputKind uint8
 
 const (
@@ -22,9 +22,9 @@ const (
 	BuyStorage        InputKind = 7
 )
 
-// InputArgs is the kind-specific tail of a canonical input encoding (§27.5).
+// InputArgs is the kind-specific tail of a canonical input encoding.
 type InputArgs interface {
-	// Kind returns the §27.5 input_kind ordinal this tail encodes as.
+	// Kind returns the input_kind ordinal this tail encodes as.
 	Kind() InputKind
 }
 
@@ -53,20 +53,20 @@ type DepositArgs struct {
 // Kind returns Deposit.
 func (DepositArgs) Kind() InputKind { return Deposit }
 
-// DeployStartArgs is the input_kind = 2 tail (§11.1).
+// DeployStartArgs is the input_kind = 2 tail.
 type DeployStartArgs struct {
 	CodeHash     types.Hash
 	MetadataHash types.Hash
 	TotalSize    uint64
 	ChunkCount   uint32
-	Metadata     []byte // §27.12 encoding, carried verbatim; validated by the runtime at finalize
+	Metadata     []byte // ContractMetadata encoding, carried verbatim; validated by the runtime at finalize
 }
 
 // Kind returns DeployStart.
 func (DeployStartArgs) Kind() InputKind { return DeployStart }
 
-// DeployChunkArgs is the input_kind = 3 tail (§11.2). chunk_data is committed by chunk_hash,
-// not inlined.
+// DeployChunkArgs is the input_kind = 3 tail. chunk_data is committed
+// by chunk_hash, not inlined.
 type DeployChunkArgs struct {
 	CodeHash   types.Hash
 	ChunkIndex uint32
@@ -76,7 +76,7 @@ type DeployChunkArgs struct {
 // Kind returns DeployChunk.
 func (DeployChunkArgs) Kind() InputKind { return DeployChunk }
 
-// DeployFinalizeArgs is the input_kind = 4 tail (§11.3).
+// DeployFinalizeArgs is the input_kind = 4 tail.
 type DeployFinalizeArgs struct {
 	CodeHash types.Hash
 }
@@ -84,8 +84,8 @@ type DeployFinalizeArgs struct {
 // Kind returns DeployFinalize.
 func (DeployFinalizeArgs) Kind() InputKind { return DeployFinalize }
 
-// UpgradeArgs is the input_kind = 5 tail (§12). NewCodeHash is the pre-instrumentation
-// code_hash of the replacement bytecode.
+// UpgradeArgs is the input_kind = 5 tail. NewCodeHash is the
+// pre-instrumentation code_hash of the replacement bytecode.
 type UpgradeArgs struct {
 	ContractID  types.Hash
 	NewCodeHash types.Hash
@@ -94,7 +94,7 @@ type UpgradeArgs struct {
 // Kind returns Upgrade.
 func (UpgradeArgs) Kind() InputKind { return Upgrade }
 
-// TransferOwnershipArgs is the input_kind = 6 tail (§12, §27.5).
+// TransferOwnershipArgs is the input_kind = 6 tail.
 type TransferOwnershipArgs struct {
 	ContractID types.Hash
 	NewOwner   types.Address
@@ -103,8 +103,8 @@ type TransferOwnershipArgs struct {
 // Kind returns TransferOwnership.
 func (TransferOwnershipArgs) Kind() InputKind { return TransferOwnership }
 
-// BuyStorageArgs is the input_kind = 7 tail (§27.5): bytes of additional storage quota
-// purchased for contract_id. bytes is non-zero (§10.7).
+// BuyStorageArgs is the input_kind = 7 tail: bytes of additional
+// storage quota purchased for contract_id. bytes is non-zero.
 type BuyStorageArgs struct {
 	ContractID types.Hash
 	Bytes      uint64
@@ -113,9 +113,9 @@ type BuyStorageArgs struct {
 // Kind returns BuyStorage.
 func (BuyStorageArgs) Kind() InputKind { return BuyStorage }
 
-// Input is the canonical input encoding's source: input_kind:u8 || source_hash:bytes32 ||
-// <kind-specific tail> (§27.5). This is byte-identical to the inputHash preimage and the
-// inputRoot leaf.
+// Input is the canonical input encoding's source: input_kind:u8 ||
+// source_hash:bytes32 || <kind-specific tail>. This is byte-identical
+// to the inputHash preimage and the inputRoot leaf.
 type Input struct {
 	SourceAccountBlockHash types.Hash
 	Args                   InputArgs
@@ -322,10 +322,12 @@ func DecodeInput(b []byte) (Input, error) {
 	return in, nil
 }
 
-// CanonicalInput returns the §27.5 canonical input encoding for a raw payload: the payload
-// itself when it decodes as one of the eight defined kinds, and the input_kind ||
-// source_account_block_hash prefix alone for any other kind, which defines no tail. This is
-// the inputHash preimage, the inputRoot leaf, and the bundle record's inputData.
+// CanonicalInput returns the canonical input encoding for a raw
+// payload: the payload itself when it decodes as one of the eight
+// defined kinds, and the input_kind || source_account_block_hash prefix
+// alone for any other kind, which defines no tail. This is the
+// inputHash preimage, the inputRoot leaf, and the bundle record's
+// inputData.
 //
 // CanonicalInput reaches the prefix branch only through errors.Is(err, ErrInvalidKind), which
 // DecodeInput can report only after it has already consumed the 1-byte kind and the 32-byte
@@ -338,28 +340,4 @@ func CanonicalInput(payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	return payload, nil
-}
-
-// Hash returns inputHash = SHA3-256(canonical encoding) (§27.5).
-func (in Input) Hash() (types.Hash, error) {
-	b, err := in.Encode()
-	if err != nil {
-		return types.Hash{}, err
-	}
-	return hashOf(crypto.Hash(b)), nil
-}
-
-// InputRoot is the §27.3 Merkle root over the canonical encodings of inputs, in the given
-// slice order. The caller supplies inputs in ascending globalInputIndex order; this package
-// does not know input indices and must not sort.
-func InputRoot(inputs []Input) (types.Hash, error) {
-	elements := make([][]byte, len(inputs))
-	for i, in := range inputs {
-		b, err := in.Encode()
-		if err != nil {
-			return types.Hash{}, fmt.Errorf("codec: input root: %w", err)
-		}
-		elements[i] = b
-	}
-	return MerkleRoot(elements), nil
 }

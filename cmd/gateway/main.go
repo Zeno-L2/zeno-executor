@@ -1,7 +1,6 @@
-// Command gateway is the gateway (EXECUTOR §21): it follows each
-// configured domain's executor directory and Settlement, and keeps
-// each domain's checked state. It serves JSON-RPC over HTTP at
-// listenAddress.
+// Command gateway is the gateway: it follows each configured domain's
+// executor directory and Settlement, and keeps each domain's checked
+// state. It serves JSON-RPC over HTTP at listenAddress.
 package main
 
 import (

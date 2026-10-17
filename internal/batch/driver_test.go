@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -143,10 +142,7 @@ func (s *fakeReceiptStore) Put(daHash, receiptRoot types.Hash, sidecar []byte) e
 
 func openTestStore(t *testing.T) *state.Store {
 	t.Helper()
-	s, err := state.Open(filepath.Join(t.TempDir(), "state.wal"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
+	s := state.OpenEmpty()
 	t.Cleanup(func() { s.Close() })
 	return s
 }
@@ -561,7 +557,7 @@ func TestDriverCapCloseAndCarry(t *testing.T) {
 			t.Fatalf("batch2 len = %d, want 1", len(b2.Receipts))
 		}
 		if b2.Commitment.FirstInputSeq != 1 {
-			t.Fatalf("batch2 FirstInputSeq = %d, want 1 (B, resumed at step 8)", b2.Commitment.FirstInputSeq)
+			t.Fatalf("batch2 FirstInputSeq = %d, want 1 (B, resumed at cap evaluation)", b2.Commitment.FirstInputSeq)
 		}
 	})
 
@@ -802,7 +798,7 @@ func TestDriverReceiptFields(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("no AssetFlowSummary entry for asset %x (edge case 11: depositCredit regardless of status)", asset)
+			t.Fatalf("no AssetFlowSummary entry for asset %x (depositCredit regardless of status)", asset)
 		}
 	})
 
@@ -934,8 +930,9 @@ func TestDriverReceiptFields(t *testing.T) {
 			t.Fatalf("ReturnHash = %x, want %x", rec.ReturnHash, wantRet)
 		}
 
-		// edge case 8: diff[0].Path is written but never read (the fake's step has no reads),
-		// so its witness must still carry a pre-state proof for it.
+		// diff[0].Path is written but never read (the fake's step has
+		// no reads), so its witness must still carry a pre-state proof
+		// for it.
 		decoded, err := codec.DecodeBundle(got.Bundle)
 		if err != nil {
 			t.Fatalf("DecodeBundle: %v", err)
@@ -966,8 +963,9 @@ func TestDriverReceiptFields(t *testing.T) {
 
 // --- test 6b: partial claim asset flow ---
 
-// TestDriverPartialClaimAssetFlow drives one payable CallL2 whose contract claims 400 of a
-// 1000 deposit and checks the §18.4 identity on the batch's AssetFlowSummary.
+// TestDriverPartialClaimAssetFlow drives one payable CallL2 whose
+// contract claims 400 of a 1000 deposit and checks that DepositCredit -
+// WithdrawalDebit on the batch's AssetFlowSummary equals the claim.
 func TestDriverPartialClaimAssetFlow(t *testing.T) {
 	asset := assetN(1)
 	deposit := u256N(1000)

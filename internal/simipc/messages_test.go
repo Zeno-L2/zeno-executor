@@ -21,7 +21,7 @@ func gatewayMessages() []Message {
 		Config{DomainID: 7, MemoryLimit: 0, NetworkName: "testnet"},
 		Config{DomainID: 7, MemoryLimit: MinMemoryLimit, NetworkName: "testnet"},
 		Config{DomainID: 7, MemoryLimit: MaxMemoryLimit, NetworkName: "testnet"},
-		Simulate{GlobalInputIndex: 5, MomentumHeight: 11, MomentumTime: 22, L1Sender: types.Address{1, 2, 3}, InputData: []byte{0, 1, 2}},
+		Simulate{GlobalInputIndex: 5, MomentumHeight: 11, MomentumTime: 22, MomentumHash: types.Hash{4, 5, 6}, L1Sender: types.Address{1, 2, 3}, InputData: []byte{0, 1, 2}},
 		Simulate{InputData: bytes.Repeat([]byte{9}, MaxInputData)},
 		Value{Present: true, Value: []byte{1, 2}},
 		Value{Present: true, Value: []byte{}},
@@ -88,13 +88,36 @@ func be16(v uint16) []byte { return binary.BigEndian.AppendUint16(nil, v) }
 
 func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 
+// TestSimulateWireLayout pins the field order of a Simulate payload
+// against hand-built bytes, so a reorder applied to both encode and
+// decode is caught.
+func TestSimulateWireLayout(t *testing.T) {
+	payload := cat(be64(1), be64(2), be64(3),
+		bytes.Repeat([]byte{0xAA}, 32), bytes.Repeat([]byte{0xBB}, 20),
+		be32(1), []byte{0})
+	m, err := ReadFromGateway(bytes.NewReader(frame(TypeSimulate, payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := m.(Simulate)
+	if s.GlobalInputIndex != 1 || s.MomentumHeight != 2 || s.MomentumTime != 3 {
+		t.Fatalf("integers = %d %d %d", s.GlobalInputIndex, s.MomentumHeight, s.MomentumTime)
+	}
+	if s.MomentumHash != types.BytesToHashPanic(bytes.Repeat([]byte{0xAA}, 32)) {
+		t.Fatalf("momentum hash = %x", s.MomentumHash[:])
+	}
+	if !bytes.Equal(s.L1Sender[:], bytes.Repeat([]byte{0xBB}, 20)) {
+		t.Fatalf("l1 sender = %x", s.L1Sender[:])
+	}
+}
+
 func TestDecodeRejects(t *testing.T) {
 	name := []byte("net")
 	cfg := func(limit uint64, nameLen uint16, n []byte) []byte {
 		return cat(be32(1), be64(limit), be16(nameLen), n)
 	}
 	sim := func(dataLen uint32, data []byte) []byte {
-		return cat(be64(1), be64(2), be64(3), make([]byte, 20), be32(dataLen), data)
+		return cat(be64(1), be64(2), be64(3), make([]byte, 32), make([]byte, 20), be32(dataLen), data)
 	}
 	res := func(status byte, n uint32, body []byte) []byte {
 		return cat([]byte{status}, be64(1), make([]byte, 64), be32(0), be32(n), body)

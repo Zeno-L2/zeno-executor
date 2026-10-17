@@ -19,11 +19,13 @@ import (
 
 // Config is the plugin's construction-time configuration.
 type Config struct {
-	// NetworkName selects the fixed per-network chainID ("mainnet" | "testnet" | a named
-	// devnet); chainID = SHA3-256("ZENON_WASM_L2:" ‖ name), computed once at construction
-	// (§9.1). chain_id is not per-input.
+	// NetworkName selects the fixed per-network chainID ("mainnet" |
+	// "testnet" | a named devnet); chainID = SHA3-256("ZENON_WASM_L2:"
+	// ‖ name), computed once at construction. chain_id is not
+	// per-input.
 	NetworkName string
-	// CodeStorePath is the directory for the local, non-consensus code store (§4).
+	// CodeStorePath is the directory for the local, non-consensus code
+	// store.
 	CodeStorePath string
 	// FetchModule, when set, selects simulate mode: an in-memory code
 	// tier whose assembled-module misses call it.
@@ -81,14 +83,16 @@ func (p *Plugin) Genesis() domain.StateInit {
 	return domain.StateInit{}
 }
 
-// DecodeInput turns a canonical §27.5 payload into a typed Input.
+// DecodeInput turns a canonical payload into a typed Input.
 //
-// Its error return means halt: the canonical encoding is produced by our own input pipeline
-// from an account block whose structure Settlement's method ABI already constrained, so a
-// malformed encoding, a kind-3 chunk-hash or chunk-size mismatch, or a SourceData/kind
-// mismatch is an internal fault, not a consensus outcome. An input_kind outside the Phase-1
-// set {0..7} is instead returned as Input{Unsupported: true} with a nil error, so Apply can
-// emit the deterministic UNSUPPORTED_OPERATION status (§15).
+// Its error return means halt: the canonical encoding is produced by
+// our own input pipeline from an account block whose structure
+// Settlement's method ABI already constrained, so a malformed encoding,
+// a kind-3 chunk-hash or chunk-size mismatch, or a SourceData/kind
+// mismatch is an internal fault, not a consensus outcome. An input_kind
+// outside the implemented set {0..7} is instead returned as
+// Input{Unsupported: true} with a nil error, so Apply can emit the
+// deterministic UNSUPPORTED_OPERATION status.
 func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.Input, error) {
 	in, err := codec.DecodeInput(payload)
 	if err != nil {
@@ -119,16 +123,20 @@ func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.In
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
 	case codec.DeployStartArgs:
-		// A code_hash is reusable across deployment attempts (§11.5 expiry frees it, and §11.1
-		// rejects only a duplicate live record). The pending record and the chunk entries are
-		// keyed by (deployer, code_hash), so a start clears only its own deployer's earlier
-		// attempt and never reaches another deployer's. Each chunk's bytes are verified only
-		// against that input's own chunk_hash, never against code_hash as a set, so a surviving
-		// stale chunk would assemble into a mix that passes every per-chunk check and commits a
-		// status where a node with a complete view commits another. Deleting first restores the
-		// property the finalize path relies on: a missing part of the prefix is absence, and
-		// absence is a halt. The loop bound is a constant, the deletes are unconditional, and
-		// absence is not an error, so this is a pure function of the input.
+		// A code_hash is reusable across deployment attempts (expiry
+		// frees it, and only a duplicate live record is rejected). The
+		// pending record and the chunk entries are keyed by (deployer,
+		// code_hash), so a start clears only its own deployer's earlier
+		// attempt and never reaches another deployer's. Each chunk's
+		// bytes are verified only against that input's own chunk_hash,
+		// never against code_hash as a set, so a surviving stale chunk
+		// would assemble into a mix that passes every per-chunk check
+		// and commits a status where a node with a complete view
+		// commits another. Deleting first restores the property the
+		// finalize path relies on: a missing part of the prefix is
+		// absence, and absence is a halt. The loop bound is a constant,
+		// the deletes are unconditional, and absence is not an error,
+		// so this is a pure function of the input.
 		//
 		// This relies on DecodeInput and Apply being interleaved per input (decode i, apply i,
 		// decode i+1, ...), never batch-decoded ahead of Apply: a later DeployStart for the same
@@ -159,15 +167,17 @@ func (p *Plugin) Apply(state domain.StateAccess, in domain.Input) (domain.Effect
 		return domain.Effects{}, fmt.Errorf("wasm: apply: unexpected input type %T", in)
 	}
 	if input.Unsupported {
-		// §15 receipt side: gasUsed 0, zero contractId/codeHash, no outbox message —
-		// deposit_asset/deposit_amount live in the tail that could not be decoded.
+		// Receipt fields: gasUsed 0, zero contractId/codeHash, no
+		// outbox message. deposit_asset/deposit_amount live in the tail
+		// that could not be decoded.
 		return domain.Effects{Status: codec.StatusUnsupportedOperation}, nil
 	}
 
 	switch args := input.Args.(type) {
 	case codec.DeployStartArgs, codec.DeployChunkArgs:
-		// Kinds 2/3 (§11.1, §11.2): DecodeInput already wrote the pending record and the
-		// hash-verified chunk bytes to the local store, so the receipt is all that is left.
+		// Kinds 2/3: DecodeInput already wrote the pending record and
+		// the hash-verified chunk bytes to the local store, so the
+		// receipt is all that is left.
 		return domain.Effects{Status: codec.StatusSuccess}, nil
 	case codec.DeployFinalizeArgs:
 		return p.applyDeployFinalize(input.Ctx, args)
@@ -203,11 +213,12 @@ func deployChunkKey(deployer types.Address, codeHash types.Hash, chunkIndex uint
 	return key
 }
 
-// encodePendingRecord is the local, non-consensus encoding of a chunked deployment's pending
-// record: the fixed-width prefix metadata_hash(32) ‖ total_size(8, BE) ‖ chunk_count(4, BE),
-// followed by the raw metadata bytes with no length prefix. Any
-// encoding is legitimate here — the record never crosses the consensus boundary — but it must
-// be a pure function of the kind-2 input alone (§4).
+// encodePendingRecord is the local, non-consensus encoding of a chunked
+// deployment's pending record: the fixed-width prefix metadata_hash(32)
+// ‖ total_size(8, BE) ‖ chunk_count(4, BE), followed by the raw
+// metadata bytes with no length prefix. Any encoding is legitimate here
+// (the record never crosses the consensus boundary) but it must be a
+// pure function of the kind-2 input alone.
 func encodePendingRecord(metadataHash types.Hash, totalSize uint64, chunkCount uint32, metadata []byte) []byte {
 	buf := make([]byte, 0, len(metadataHash)+8+4+len(metadata))
 	buf = append(buf, metadataHash[:]...)

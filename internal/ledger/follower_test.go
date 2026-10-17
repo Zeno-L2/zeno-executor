@@ -313,6 +313,7 @@ func TestNextDeterminismAndOrdering(t *testing.T) {
 		same := a.Ctx.GlobalInputIndex == b.Ctx.GlobalInputIndex &&
 			a.Ctx.MomentumHeight == b.Ctx.MomentumHeight &&
 			a.Ctx.MomentumTime == b.Ctx.MomentumTime &&
+			a.Ctx.MomentumHash == b.Ctx.MomentumHash &&
 			a.Ctx.L1Sender == b.Ctx.L1Sender &&
 			bytes.Equal(a.Ctx.SourceData, b.Ctx.SourceData) &&
 			bytes.Equal(a.Payload, b.Payload)
@@ -408,9 +409,10 @@ func TestNextConfirmationFrontier(t *testing.T) {
 				t.Fatalf("Next %d: got height %d, want %d", i, in.Ctx.MomentumHeight, i+1)
 			}
 		}
-		// The eighth momentum is beyond what the requested window's count should ever
-		// have returned — a source protocol slip, not malformed content — so the refill
-		// stops silently rather than erroring (spec.md Edge cases).
+		// The eighth momentum is beyond what the requested window's
+		// count should ever have returned, a source protocol slip, not
+		// malformed content, so the refill stops silently rather than
+		// erroring.
 		if _, ok, err := f.Next(); ok || err != nil {
 			t.Fatalf("Next after drain: got (ok=%v, err=%v), want (false, nil)", ok, err)
 		}
@@ -1465,6 +1467,9 @@ func TestAssignmentSendsAcrossHeights(t *testing.T) {
 		}
 		if in.Ctx.MomentumHeight != wantHeights[i] || in.Ctx.MomentumTime != 1000+wantHeights[i] {
 			t.Fatalf("input %d: got (height %d, time %d), want (%d, %d)", i, in.Ctx.MomentumHeight, in.Ctx.MomentumTime, wantHeights[i], 1000+wantHeights[i])
+		}
+		if in.Ctx.MomentumHash != momHash(wantHeights[i]) {
+			t.Fatalf("input %d: momentum hash %s, want %s", i, in.Ctx.MomentumHash, momHash(wantHeights[i]))
 		}
 	}
 	if want := []uint64{4, 2}; !reflect.DeepEqual(source.heights, want) {

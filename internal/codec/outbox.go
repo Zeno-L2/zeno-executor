@@ -11,7 +11,7 @@ import (
 // makes an inconsistent kind/branch pair unrepresentable — there is no "inactive field must
 // be zero" check to enforce.
 type OutboxTarget interface {
-	// Kind returns the §27.4 kind ordinal this target encodes as.
+	// Kind returns the kind ordinal this target encodes as.
 	Kind() uint8
 }
 
@@ -35,7 +35,8 @@ type L1Withdrawal struct {
 // Kind returns KindL1Withdrawal.
 func (L1Withdrawal) Kind() uint8 { return KindL1Withdrawal }
 
-// OutboxMessage is one asynchronous message destined for L1 or another domain (§27.4).
+// OutboxMessage is one asynchronous message destined for L1 or
+// another domain.
 type OutboxMessage struct {
 	SourceContract types.Hash
 	InputIndex     uint64
@@ -164,9 +165,10 @@ func decodeOutboxMessageBody(r *reader) (OutboxMessage, error) {
 // payload length(4).
 const minOutboxEncodedSize = 32 + 8 + 4 + 1 + 32 + 4
 
-// writeOutboxList encodes a List<OutboxMessage> and enforces the §27.4 index rules shared by
-// ContractEffects and ExecutionResult: count ≤ max (the caller's bound: MaxOutboxPerExecution
-// for a ContractEffects, MaxOutboxPerResult for an ExecutionResult), ascending OutboxIndex
+// writeOutboxList encodes a List<OutboxMessage> and enforces the index
+// rules shared by ContractEffects and ExecutionResult: count ≤ max
+// (the caller's bound: MaxOutboxPerExecution for a ContractEffects,
+// MaxOutboxPerResult for an ExecutionResult), ascending OutboxIndex
 // from 0 with no gaps, and InputIndex == globalInputIndex.
 func writeOutboxList(w *writer, messages []OutboxMessage, globalInputIndex uint64, max int) error {
 	if len(messages) > max {
@@ -212,8 +214,9 @@ func readOutboxList(r *reader, globalInputIndex uint64, max int) ([]OutboxMessag
 	return messages, nil
 }
 
-// OutboxID computes the replay-protection identifier of an outbox message (§17.3):
-// SHA3-256(domainId:u32 || batchId:u64 || inputIndex:u64 || outboxIndex:u32).
+// OutboxID computes the replay-protection identifier of an outbox
+// message: SHA3-256(domainId:u32 || batchId:u64 || inputIndex:u64 ||
+// outboxIndex:u32).
 func OutboxID(domainID uint32, batchID, inputIndex uint64, outboxIndex uint32) types.Hash {
 	w := &writer{}
 	w.u32(domainID)

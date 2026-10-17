@@ -22,7 +22,7 @@ func writeArtifacts(storage string) (Layout, error) {
 	if err != nil {
 		return Layout{}, fmt.Errorf("new layout: %w", err)
 	}
-	if _, err := OpenMeta(l, Meta{DomainID: 1, ExecutorID: "exec-1", STFSpecHash: testSTF, Role: "EXECUTOR"}); err != nil {
+	if err := OpenMeta(l, Meta{DomainID: 1, ExecutorID: "exec-1"}); err != nil {
 		return l, fmt.Errorf("open meta: %w", err)
 	}
 
@@ -54,10 +54,7 @@ func writeArtifacts(storage string) (Layout, error) {
 		return l, fmt.Errorf("put receipts: %w", err)
 	}
 
-	store, err := state.OpenEmpty(l.StateWAL)
-	if err != nil {
-		return l, fmt.Errorf("open state: %w", err)
-	}
+	store := state.OpenEmpty()
 	defer store.Close()
 	root, err := store.Apply([]domain.StateDiffEntry{{Path: leafPath(1), Value: []byte{1}}})
 	if err != nil {
@@ -120,7 +117,7 @@ func checkModes(t *testing.T, l Layout) {
 		requireMode(t, dir, 0o755)
 		requireFilesMode(t, dir, 0o644)
 	}
-	for _, path := range []string{l.Cursor, l.Meta, l.StateWAL, l.Momenta} {
+	for _, path := range []string{l.Cursor, l.Meta, l.Momenta} {
 		requireMode(t, path, 0o600)
 	}
 	requireFilesMode(t, l.Snapshots, 0o600)
@@ -144,7 +141,7 @@ func TestModesCorrectedOnReopen(t *testing.T) {
 		t.Fatalf("writeArtifacts: %v", err)
 	}
 	chmods := map[string]os.FileMode{
-		l.Root: 0o755, l.Bundles: 0o700, l.Receipts: 0o700, l.Batches: 0o700, l.StateWAL: 0o644,
+		l.Root: 0o755, l.Bundles: 0o700, l.Receipts: 0o700, l.Batches: 0o700,
 	}
 	for path, mode := range chmods {
 		if err := os.Chmod(path, mode); err != nil {
@@ -161,15 +158,8 @@ func TestModesCorrectedOnReopen(t *testing.T) {
 	if _, err := NewReceiptStore(l.Receipts); err != nil {
 		t.Fatalf("NewReceiptStore: %v", err)
 	}
-	s, err := state.OpenEmpty(l.StateWAL)
-	if err != nil {
-		t.Fatalf("OpenEmpty: %v", err)
-	}
-	s.Close()
-
 	requireMode(t, l.Root, 0o711)
 	for _, dir := range []string{l.Bundles, l.Receipts, l.Batches} {
 		requireMode(t, dir, 0o755)
 	}
-	requireMode(t, l.StateWAL, 0o600)
 }

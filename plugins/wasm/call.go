@@ -12,8 +12,8 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
-// callArgs is the kind-0/1 intersection the execution pipeline consumes; a Deposit is a CallL2
-// with an empty frame payload (§27.5).
+// callArgs is the kind-0/1 intersection the execution pipeline
+// consumes; a Deposit is a CallL2 with an empty frame payload.
 type callArgs struct {
 	TargetContract types.Hash
 	PlasmaLimit    uint64
@@ -22,8 +22,9 @@ type callArgs struct {
 	Payload        []byte
 }
 
-// toCallArgs projects a kind-0 or kind-1 input onto callArgs, reporting false for every other
-// kind. It is where §27.5's "for Deposit the frame payload is empty" rule lives.
+// toCallArgs projects a kind-0 or kind-1 input onto callArgs, reporting
+// false for every other kind. A Deposit always gets an empty frame
+// payload: the DepositArgs case leaves Payload nil.
 func toCallArgs(args codec.InputArgs) (callArgs, bool) {
 	switch a := args.(type) {
 	case codec.CallL2Args:
@@ -46,11 +47,14 @@ func toCallArgs(args codec.InputArgs) (callArgs, bool) {
 	}
 }
 
-// applyCall runs the §18.2/§27.1 execution pipeline for a kind-0/1 input: two unconditional
-// reserved reads, deployed-target detection, module loading, frame assembly and encoding,
-// engine execution, and settlement.
+// applyCall runs the execution pipeline for a kind-0/1 input: two
+// unconditional reserved reads, deployed-target detection, module
+// loading, frame assembly and encoding, engine execution, and
+// settlement.
 func (p *Plugin) applyCall(state domain.StateAccess, ctx domain.InputContext, args callArgs) (domain.Effects, error) {
-	// §20: unconditional, in this order, before any code-store lookup.
+	// Both reserved reads are unconditional, in this order, and come
+	// before any code-store lookup, so the observed key set depends
+	// only on the input and never on cache warmth.
 	codeHashLeaf, codeHashPresent, err := state.Read(derive(args.TargetContract, keyCodeHash))
 	if err != nil {
 		return domain.Effects{}, fmt.Errorf("wasm: apply call: read code hash: %w", err)
@@ -84,7 +88,7 @@ func (p *Plugin) applyCall(state domain.StateAccess, ctx domain.InputContext, ar
 		Caps:             ctx.Caps,
 	}
 
-	// §18.2: no code hash ⇒ no deployed target, full refund, gas_used = 0.
+	// no code hash ⇒ no deployed target, full refund, gas_used = 0.
 	if !codeHashPresent {
 		return s.fail(codec.StatusValidationFailed, 0), nil
 	}
@@ -114,9 +118,9 @@ func (p *Plugin) applyCall(state domain.StateAccess, ctx domain.InputContext, ar
 	return s.settle(out)
 }
 
-// buildFrame assembles the §27.1 input frame a kind-0/1 invocation presents to the contract.
-// Construction cannot fail — the only encodable error is the deposit asset's, raised by
-// Encode — so it returns no error.
+// buildFrame assembles the input frame a kind-0/1 invocation presents
+// to the contract. Construction cannot fail (the only encodable error
+// is the deposit asset's, raised by Encode), so it returns no error.
 func buildFrame(chainID types.Hash, ctx domain.InputContext, args callArgs, codeHash types.Hash) codec.ExecutionInputFrame {
 	return codec.ExecutionInputFrame{
 		ContextVersion: codec.RuntimeProfileVersion,
@@ -126,6 +130,7 @@ func buildFrame(chainID types.Hash, ctx domain.InputContext, args callArgs, code
 		CodeHash:       codeHash,
 		MomentumHeight: ctx.MomentumHeight,
 		MomentumTime:   ctx.MomentumTime,
+		MomentumHash:   ctx.MomentumHash,
 		InputIndex:     ctx.GlobalInputIndex,
 		DepositAsset:   args.DepositAsset,
 		DepositAmount:  args.DepositAmount,
@@ -133,7 +138,8 @@ func buildFrame(chainID types.Hash, ctx domain.InputContext, args callArgs, code
 	}
 }
 
-// callerHash is the §9.2/§27.0/§14.1 L1 caller identity: SHA3-256("L1_CALLER:" || raw 20 address bytes).
+// callerHash is the L1 caller identity: SHA3-256("L1_CALLER:" || raw 20
+// address bytes).
 func callerHash(addr types.Address) types.Hash {
 	return keys.Caller(addr)
 }

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -173,10 +172,7 @@ func buildAndInstrument(t *testing.T, wasm []byte) ([]byte, types.Hash) {
 // Accessor.
 func newTestState(t *testing.T, leaves map[domain.Path][]byte) *state.Accessor {
 	t.Helper()
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.log"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { _ = store.Close() })
 
 	var diff []domain.StateDiffEntry
@@ -458,7 +454,7 @@ func TestRunBudgetClampedToInt64(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.Kind != Returned {
-		t.Fatalf("Kind = %v, want Returned (§10.1 clamp), got %v", out.Kind, out)
+		t.Fatalf("Kind = %v, want Returned (clamp), got %v", out.Kind, out)
 	}
 }
 
@@ -809,8 +805,9 @@ func TestRunGrowLimiter(t *testing.T) {
 }
 
 func TestRunNegativeReturnPassesThrough(t *testing.T) {
-	// A negative Ret is 04f's REVERT signal; this ticket only owns passing it through
-	// untouched, with no attempted result-pointer decode.
+	// A negative Ret is the plugin's REVERT signal; the engine only
+	// passes it through untouched, with no attempted result-pointer
+	// decode.
 	body := appendVarS64([]byte{0x42}, int64(-5))
 	body = append(body, 0x0B)
 	instrumented, codeHash := buildAndInstrument(t, buildModule(nil, nil, []byte{0x00}, body, 1))
@@ -856,7 +853,8 @@ func TestRunResultPointerOutOfBounds(t *testing.T) {
 }
 
 func TestRunResultBlobIsWholeRange(t *testing.T) {
-	// ptr=0, len=60000: the whole ContractEffects byte range 04f decodes, never shortened.
+	// ptr=0, len=60000: the whole ContractEffects byte range the plugin
+	// decodes, never shortened.
 	body := appendVarS64([]byte{0x42}, int64(60000))
 	body = append(body, 0x0B)
 	instrumented, codeHash := buildAndInstrument(t, buildModule(nil, nil, []byte{0x00}, body, 1))
@@ -895,8 +893,9 @@ func TestRunResultBlobIsWholeRange(t *testing.T) {
 // fixtures exist precisely to exercise what happens when validation is bypassed.
 
 func TestRunWithoutMemoryExportHalts(t *testing.T) {
-	// No memory section, exporting only run. Rule 9 would reject this; mod.Memory() on it is a
-	// typed nil, so an unguarded Write would nil-deref.
+	// No memory section, exporting only run. requireCoreExports would
+	// reject this; mod.Memory() on it is a typed nil, so an unguarded
+	// Write would nil-deref.
 	var raw []byte
 	raw = append(raw, wasmHeader...)
 

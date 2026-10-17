@@ -5,8 +5,9 @@ import (
 	"fmt"
 )
 
-// OutcomeKind is the deterministic classification Run assigns to one call. 04f maps it onto
-// the §15 receipt status; this package owns no status vocabulary.
+// OutcomeKind is the deterministic classification Run assigns to one
+// call. The plugin maps it onto the receipt status; this package owns
+// no status vocabulary.
 type OutcomeKind uint8
 
 const (
@@ -14,7 +15,7 @@ const (
 	Aborted
 	OutOfGas
 	Trapped
-	AbortTooLarge // env.abort with data_len > codec.MaxReturnData (§8.1 step 1)
+	AbortTooLarge // env.abort with data_len > codec.MaxReturnData
 )
 
 // Outcome is Run's deterministic result for one input. Every field is meaningful only for the

@@ -8,25 +8,27 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// LocalStateDiffEntry is one StateDiff entry as a contract returns it in a ContractEffects
-// blob (§27.2): the key is a length-prefixed local key, not yet derived. A nil Value means
-// deletion (the EMPTY sentinel); a non-nil Value, including zero-length, means present.
+// LocalStateDiffEntry is one StateDiff entry as a contract returns it
+// in a ContractEffects blob: the key is a length-prefixed local key,
+// not yet derived. A nil Value means deletion (the EMPTY sentinel); a
+// non-nil Value, including zero-length, means present.
 type LocalStateDiffEntry struct {
 	LocalKey []byte
 	Value    []byte
 }
 
-// StateDiffEntry is one StateDiff entry in the canonical, derived-key ExecutionResult form
-// (§27.2). Key is a trie.Path — an already-derived SMT position — encoded as 32 raw bytes,
-// identically to a bytes32.
+// StateDiffEntry is one StateDiff entry in the canonical, derived-key
+// ExecutionResult form. Key is a trie.Path (an already-derived SMT
+// position) encoded as 32 raw bytes, identically to a bytes32.
 type StateDiffEntry struct {
 	Key   trie.Path
 	Value []byte
 }
 
-// writeStateValue encodes the §27.2 value form: a nil Value is the EMPTY deletion sentinel
-// (length prefix 0xFFFFFFFF, no bytes); any other Value, including zero-length, is a present
-// value of that length.
+// writeStateValue encodes the state value form: a nil Value is the
+// EMPTY deletion sentinel (length prefix 0xFFFFFFFF, no bytes); any
+// other Value, including zero-length, is a present value of that
+// length.
 func writeStateValue(w *writer, value []byte) error {
 	if value == nil {
 		w.u32(EmptyValueLength)
@@ -39,9 +41,10 @@ func writeStateValue(w *writer, value []byte) error {
 	return nil
 }
 
-// readStateValue decodes the §27.2 value form: 0xFFFFFFFF decodes to nil (deletion);
-// 0x00000000 decodes to a non-nil empty value; any length in [MaxStateValueSize+1,
-// 0xFFFFFFFE] is rejected as ErrReservedLength.
+// readStateValue decodes the state value form: 0xFFFFFFFF decodes to
+// nil (deletion); 0x00000000 decodes to a non-nil empty value; any
+// length in [MaxStateValueSize+1, 0xFFFFFFFE] is rejected as
+// ErrReservedLength.
 func readStateValue(r *reader) ([]byte, error) {
 	l, err := r.u32()
 	if err != nil {
@@ -102,9 +105,10 @@ func decodeStateDiffEntry(r *reader) (StateDiffEntry, error) {
 	return StateDiffEntry{Key: key, Value: value}, nil
 }
 
-// writeLocalStateDiffList encodes a List<StateDiffEntry-local> verbatim, in the given order:
-// local entries need not be sorted, and duplicate local keys are not rejected (§27.2;
-// canonical order is over derived keys, which this package does not compute).
+// writeLocalStateDiffList encodes a List<StateDiffEntry-local>
+// verbatim, in the given order: local entries need not be sorted, and
+// duplicate local keys are not rejected (canonical order is over
+// derived keys, which this package does not compute).
 func writeLocalStateDiffList(w *writer, entries []LocalStateDiffEntry) error {
 	w.u32(uint32(len(entries)))
 	for _, e := range entries {
@@ -135,8 +139,8 @@ func readLocalStateDiffList(r *reader) ([]LocalStateDiffEntry, error) {
 	return entries, nil
 }
 
-// writeDerivedStateDiffList encodes a List<StateDiffEntry>, requiring strictly ascending
-// order by derived key with no duplicates (§27.2).
+// writeDerivedStateDiffList encodes a List<StateDiffEntry>, requiring
+// strictly ascending order by derived key with no duplicates.
 func writeDerivedStateDiffList(w *writer, entries []StateDiffEntry) error {
 	for i := 1; i < len(entries); i++ {
 		switch bytes.Compare(entries[i].Key[:], entries[i-1].Key[:]) {
@@ -183,8 +187,9 @@ func readDerivedStateDiffList(r *reader) ([]StateDiffEntry, error) {
 	return entries, nil
 }
 
-// ContractEffects is the blob a contract's run entry point returns (§27.1a): everything the
-// contract computed, before the runtime inserts the state roots it alone may compute.
+// ContractEffects is the blob a contract's run entry point returns:
+// everything the contract computed, before the runtime inserts the
+// state roots it alone may compute.
 type ContractEffects struct {
 	Version          uint16
 	GlobalInputIndex uint64
@@ -195,9 +200,10 @@ type ContractEffects struct {
 	ClaimedDeposit   U256
 }
 
-// Encode returns the canonical encoding of c. It rejects a struct whose bytes would also
-// parse as a 9-field ExecutionResult (i.e. one that would carry roots, §14.2) with
-// ErrRootsPresent, so no invalid struct has an encoding.
+// Encode returns the canonical encoding of c. It rejects a struct
+// whose bytes would also parse as a 9-field ExecutionResult (i.e. one
+// that would carry roots) with ErrRootsPresent, so no invalid struct
+// has an encoding.
 func (c ContractEffects) Encode() ([]byte, error) {
 	w := &writer{}
 	if err := encodeContractEffectsBody(w, c); err != nil {
@@ -209,10 +215,11 @@ func (c ContractEffects) Encode() ([]byte, error) {
 	return w.buf, nil
 }
 
-// DecodeContractEffects decodes a canonical ContractEffects blob. After a successful 7-field
-// decode, it additionally attempts DecodeExecutionResult on the same bytes and returns
-// ErrRootsPresent if that also succeeds — the fail-safe direction §14.2 requires for a blob
-// that happens to parse both ways.
+// DecodeContractEffects decodes a canonical ContractEffects blob.
+// After a successful 7-field decode, it additionally attempts
+// DecodeExecutionResult on the same bytes and returns ErrRootsPresent
+// if that also succeeds: the fail-safe direction for a blob that
+// happens to parse both ways.
 func DecodeContractEffects(b []byte) (ContractEffects, error) {
 	r := newReader(b)
 	c, err := decodeContractEffectsBody(r)
@@ -282,8 +289,9 @@ func decodeContractEffectsBody(r *reader) (ContractEffects, error) {
 	return c, nil
 }
 
-// ExecutionResult is the canonical, runtime-assembled result of one input's execution
-// (§27.1a): ContractEffects plus the pre/post state roots the runtime alone computes.
+// ExecutionResult is the canonical, runtime-assembled result of one
+// input's execution: ContractEffects plus the pre/post state roots the
+// runtime alone computes.
 type ExecutionResult struct {
 	Version          uint16
 	GlobalInputIndex uint64
@@ -322,8 +330,9 @@ func DecodeExecutionResult(b []byte) (ExecutionResult, error) {
 	return e, nil
 }
 
-// parsesAsExecutionResult reports whether b is a canonical 9-field ExecutionResult with no
-// bound on ReturnData, which is the roots-present probe of §14.2.
+// parsesAsExecutionResult reports whether b is a canonical 9-field
+// ExecutionResult with no bound on ReturnData, which is the
+// roots-present probe.
 func parsesAsExecutionResult(b []byte) bool {
 	r := newReader(b)
 	if _, err := decodeExecutionResultBody(r, ^uint32(0)); err != nil {

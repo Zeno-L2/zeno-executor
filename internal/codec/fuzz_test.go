@@ -210,8 +210,9 @@ func FuzzCanonicalDecode(f *testing.F) {
 		f.Add(familyIndex[name], enc)
 	}
 
-	// Additional seeds beyond one-per-family: every step 2…5 unit-test encoding and vector
-	// encoding, paired with the selector for its own family.
+	// Additional seeds beyond one-per-family: every unit-test encoding
+	// and vector encoding, paired with the selector for its own
+	// family.
 	addSeed := func(name string, enc []byte) { f.Add(familyIndex[name], enc) }
 
 	if b, err := sampleL1Withdrawal(0, 0).Encode(); err == nil {

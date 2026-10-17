@@ -325,11 +325,12 @@ func BenchmarkResultBlobAtBound(b *testing.B) {
 	})
 }
 
-// BenchmarkResultBlobAtTrueBound times settlement of a returned blob of exactly MaxResultBlob
-// bytes (64 KiB), the literal consensus bound §14.3 checks against, packed with the maximum
-// number of distinct StateDiff entries a two-page module's returned blob can carry. This is the
-// true-bound sibling of BenchmarkResultBlobAtBound, which uses the cheaper one-page shape
-// len(frame) bytes short of the bound instead.
+// BenchmarkResultBlobAtTrueBound times settlement of a returned blob of
+// exactly MaxResultBlob bytes (64 KiB), the literal consensus bound,
+// packed with the maximum number of distinct StateDiff entries a
+// two-page module's returned blob can carry. This is the true-bound
+// sibling of BenchmarkResultBlobAtBound, which uses the cheaper
+// one-page shape len(frame) bytes short of the bound instead.
 func BenchmarkResultBlobAtTrueBound(b *testing.B) {
 	frame := benchFrame(b)
 	l := MaxResultBlob

@@ -83,10 +83,12 @@ func TestPolicyNextDelayCaps(t *testing.T) {
 	}
 }
 
-// TestPolicyNextProgressResets exercises step 2's reset (Failures = 0, Delay = BackoffMin)
-// against the exit-75 (ipc.ExitTempFail) path, the only outcome whose next Backoff carries
-// b.Failures straight through without the step-4 "+1" a counted failure always adds; see
-// TestPolicyNextProgressResetThenCounts for a counted exit's Failures == 1 after the same reset.
+// TestPolicyNextProgressResets exercises the progress reset
+// (Failures = 0, Delay = BackoffMin) against the exit-75
+// (ipc.ExitTempFail) path, the only outcome whose next Backoff carries
+// b.Failures straight through without the "+1" a counted failure always
+// adds; see TestPolicyNextProgressResetThenCounts for a counted exit's
+// result (Failures == 1) after the same reset.
 func TestPolicyNextProgressResets(t *testing.T) {
 	p := Policy{StableAfter: 10 * time.Minute}
 	b := Backoff{Failures: 3, Delay: 32 * time.Second}
@@ -122,9 +124,10 @@ func TestPolicyNextProgressResets(t *testing.T) {
 	})
 }
 
-// TestPolicyNextProgressResetThenCounts shows that "progress resets Failures to 0" is not the
-// whole story: a counted-failure exit (here, 1) after a progress reset still adds step 4's "+1",
-// landing at Failures == 1, not 0.
+// TestPolicyNextProgressResetThenCounts shows that "progress resets
+// Failures to 0" is not the whole story: a counted-failure exit (here,
+// 1) after a progress reset still adds the counted-failure +1, landing
+// at Failures == 1, not 0.
 func TestPolicyNextProgressResetThenCounts(t *testing.T) {
 	p := Policy{StableAfter: 10 * time.Minute}
 	b := Backoff{Failures: 3, Delay: 32 * time.Second}
@@ -132,7 +135,7 @@ func TestPolicyNextProgressResetThenCounts(t *testing.T) {
 
 	_, wait, next := p.Next(b, end)
 	if next.Failures != 1 {
-		t.Fatalf("Failures = %d, want 1 (reset to 0, then step 4's +1)", next.Failures)
+		t.Fatalf("Failures = %d, want 1 (reset to 0, then the counted-failure +1)", next.Failures)
 	}
 	if wait != p.WithDefaults().BackoffMin {
 		t.Fatalf("wait = %v, want BackoffMin", wait)

@@ -33,6 +33,7 @@ type equalityVector struct {
 	GlobalInputIndex uint64            `json:"global_input_index"`
 	MomentumHeight   uint64            `json:"momentum_height"`
 	MomentumTime     uint64            `json:"momentum_time"`
+	MomentumHash     string            `json:"momentum_hash"`
 	L1Sender         string            `json:"l1_sender"`
 	CanonicalInput   string            `json:"canonical_input_hex"`
 	ModuleWasmHex    string            `json:"module_wasm_hex"`
@@ -119,7 +120,7 @@ func (nilReceipts) Put(types.Hash, types.Hash, []byte) error { return nil }
 
 func TestSimulatorEqualsBatch(t *testing.T) {
 	restoreMemoryLimit(t)
-	for _, id := range []string{"EXEC-008", "EXEC-009", "CV-ABORT-1", "EXEC-DEP-2", "CV-CAP-5", "CV-CAP-6"} {
+	for _, id := range []string{"EXEC-008", "EXEC-009", "CV-ABORT-1", "EXEC-DEP-2", "CV-CAP-5", "CV-CAP-6", "CV-FRAME-1"} {
 		t.Run(id, func(t *testing.T) { equalityRun(t, loadEqualityVector(t, id)) })
 	}
 }
@@ -144,10 +145,7 @@ func equalityRun(t *testing.T, v equalityVector) {
 	if err != nil {
 		t.Fatalf("wasm.New: %v", err)
 	}
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.wal"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
+	store := state.OpenEmpty()
 	t.Cleanup(func() { store.Close() })
 	var seed []domain.StateDiffEntry
 	for p, val := range v.PreState {
@@ -195,9 +193,12 @@ func equalityRun(t *testing.T, v equalityVector) {
 	// Batch 2 and the simulation run the vector's input from the same
 	// pre-state.
 	version := store.Version()
+	var momentumHash types.Hash
+	copy(momentumHash[:], mustHex(t, v.MomentumHash))
 	sim := simipc.Simulate{
 		GlobalInputIndex: v.GlobalInputIndex, MomentumHeight: v.MomentumHeight, MomentumTime: v.MomentumTime,
-		L1Sender: l1Sender, InputData: callPayload,
+		MomentumHash: momentumHash,
+		L1Sender:     l1Sender, InputData: callPayload,
 	}
 
 	var simPlugin *wasm.Plugin
@@ -283,7 +284,8 @@ func equalityRun(t *testing.T, v equalityVector) {
 	queue.inputs = append(queue.inputs, ledger.Input{
 		Ctx: domain.InputContext{
 			GlobalInputIndex: v.GlobalInputIndex, MomentumHeight: v.MomentumHeight, MomentumTime: v.MomentumTime,
-			L1Sender: l1Sender, Caps: caps,
+			MomentumHash: momentumHash,
+			L1Sender:     l1Sender, Caps: caps,
 		},
 		Payload: callPayload,
 	})

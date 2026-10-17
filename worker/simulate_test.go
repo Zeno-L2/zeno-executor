@@ -132,6 +132,7 @@ func (d *simDomain) Apply(state domain.StateAccess, in domain.Input) (domain.Eff
 	data := binary.BigEndian.AppendUint64(nil, idx)
 	data = binary.BigEndian.AppendUint64(data, si.ctx.MomentumHeight)
 	data = binary.BigEndian.AppendUint64(data, si.ctx.MomentumTime)
+	data = append(data, si.ctx.MomentumHash[:]...)
 	data = append(data, si.ctx.L1Sender[:]...)
 	return domain.Effects{
 		Status:  codec.StatusSuccess,
@@ -545,7 +546,8 @@ func TestSimulateResult(t *testing.T) {
 		sender[i] = 0x33
 	}
 	res, er := mustResult(t, g.simulate(simipc.Simulate{
-		GlobalInputIndex: 5, MomentumHeight: 11, MomentumTime: 22, L1Sender: sender,
+		GlobalInputIndex: 5, MomentumHeight: 11, MomentumTime: 22,
+		MomentumHash: types.Hash{0x44, 0x45}, L1Sender: sender,
 		InputData: callInput(t, "echo"),
 	}))
 	if res.Status != codec.StatusSuccess || res.GasUsed != 77 {
@@ -563,6 +565,8 @@ func TestSimulateResult(t *testing.T) {
 	wantData := binary.BigEndian.AppendUint64(nil, 5)
 	wantData = binary.BigEndian.AppendUint64(wantData, 11)
 	wantData = binary.BigEndian.AppendUint64(wantData, 22)
+	wantData = append(wantData, 0x44, 0x45)
+	wantData = append(wantData, make([]byte, 30)...)
 	wantData = append(wantData, sender[:]...)
 	if !bytes.Equal(er.Events[0].Data, wantData) {
 		t.Errorf("echo event = %x, want %x", er.Events[0].Data, wantData)
@@ -582,13 +586,6 @@ func TestSimulateResult(t *testing.T) {
 	if len(er.Outbox) != 1 || string(er.ReturnData) != "ret" {
 		t.Errorf("outbox %d, return data %q", len(er.Outbox), er.ReturnData)
 	}
-}
-
-// rawFrame builds a frame with an arbitrary type and payload.
-func rawFrame(t simipc.Type, payload []byte) []byte {
-	out := binary.BigEndian.AppendUint32(nil, uint32(1+len(payload)))
-	out = append(out, byte(t))
-	return append(out, payload...)
 }
 
 func encoded(t *testing.T, m simipc.Message) []byte {

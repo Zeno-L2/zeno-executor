@@ -75,7 +75,7 @@ func readAsGateway(storage string) int {
 	if _, err := os.ReadDir(root); !errors.Is(err, fs.ErrPermission) {
 		fail("list %s: err = %v, want permission denied", root, err)
 	}
-	for _, rel := range []string{"cursor", "meta.json", "state/wal", "momentum_hashes/window.json"} {
+	for _, rel := range []string{"cursor", "meta.json", "momentum_hashes/window.json"} {
 		path := filepath.Join(root, rel)
 		if _, err := os.ReadFile(path); !errors.Is(err, fs.ErrPermission) {
 			fail("read %s: err = %v, want permission denied", path, err)
@@ -118,9 +118,9 @@ func TestModesUnderUIDSeparation(t *testing.T) {
 	bin := filepath.Join(base, "recovery.test")
 	copyTestBinary(t, self, bin)
 
-	// 022 is the production umask. Under it NewLayout's unchmodded state/ and momentum_hashes/
-	// are 0755, so only the file modes can deny the second user state/wal and
-	// momentum_hashes/window.json.
+	// 022 is the production umask. Under it NewLayout's unchmodded
+	// momentum_hashes/ is 0755, so only the file mode can deny the
+	// second user momentum_hashes/window.json.
 	old := syscall.Umask(0o022)
 	defer syscall.Umask(old)
 

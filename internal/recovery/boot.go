@@ -26,10 +26,12 @@ import (
 // no Config and have no depth to check.
 const MaxConfirmationDepth = 1023
 
-// ErrHalted marks a consistency fault: the executor stops and stays stopped until an operator
-// acts (EXECUTOR §15). It is never auto-retried and never recovered from in-process — including
-// by the bounded source retry, which returns a source error wrapping ErrHalted immediately
-// rather than sleeping through its budget on a failure that cannot become transient.
+// ErrHalted marks a consistency fault: the executor stops and stays
+// stopped until an operator acts. It is never auto-retried and never
+// recovered from in-process, including by the bounded source retry,
+// which returns a source error wrapping ErrHalted immediately rather
+// than sleeping through its budget on a failure that cannot become
+// transient.
 var ErrHalted = errors.New("recovery: halted")
 
 // ErrSourceUnavailable marks a momentum or anchor source that stayed unavailable through the
@@ -40,27 +42,29 @@ var ErrSourceUnavailable = errors.New("recovery: source unavailable")
 // ErrBundleMissing reports that no bundle is stored for a DAHash.
 var ErrBundleMissing = errors.New("recovery: bundle missing")
 
-// Anchor is the most recent FINALIZED batch for a domain: the state root it committed and the
-// last globalInputIndex it consumed (EXECUTOR §14).
+// Anchor is the most recent FINALIZED batch for a domain: the state
+// root it committed and the last globalInputIndex it consumed.
 type Anchor struct {
 	PostStateRoot types.Hash
 	LastInputSeq  uint64
 }
 
-// AnchorSource reads the recovery anchor from Settlement storage. ok == false means no batch
-// for the domain has ever been FINALIZED, in which case the anchor is genesis — the empty SMT
-// with nothing consumed. "Nothing consumed" crosses this seam as ok == false and never as a
-// sentinel sequence number: its on-chain representation is a Settlement concern (SPEC §32). An
-// implementation whose failure is permanent rather than transient wraps ErrHalted, which skips
-// the bounded retry.
+// AnchorSource reads the recovery anchor from Settlement storage. ok ==
+// false means no batch for the domain has ever been FINALIZED, in which
+// case the anchor is genesis: the empty SMT with nothing consumed.
+// "Nothing consumed" crosses this seam as ok == false and never as a
+// sentinel sequence number: its on-chain representation is a Settlement
+// concern. An implementation whose failure is permanent rather than
+// transient wraps ErrHalted, which skips the bounded retry.
 type AnchorSource interface {
 	FinalizedAnchor(domainID uint32) (Anchor, bool, error)
 }
 
-// RetryPolicy is the bounded-retry schedule for the two transient conditions the machine
-// tolerates. A zero field takes its package default, so the zero RetryPolicy is the production
-// schedule and a test can shrink the intervals it would otherwise sleep through. EXECUTOR §14
-// tags both schedules [BINARY]: they shift how soon a fault is reported, never correctness,
+// RetryPolicy is the bounded-retry schedule for the two transient
+// conditions the machine tolerates. A zero field takes its package
+// default, so the zero RetryPolicy is the production schedule and a
+// test can shrink the intervals it would otherwise sleep through. Both
+// schedules shift how soon a fault is reported, never correctness,
 // unlike ConfirmationDepth, which has no default at all.
 type RetryPolicy struct {
 	// AwaitDAAttempts/AwaitDAInterval re-check one bundle this process wrote itself, which is
@@ -68,9 +72,9 @@ type RetryPolicy struct {
 	// completing, not a condition that benefits from waiting longer. Defaults: 5, 200ms.
 	AwaitDAAttempts int
 	AwaitDAInterval time.Duration
-	// SourceAttempts/SourceInterval bound a znnd read failure and a znnd that is behind the
-	// recorded momentum window (EXECUTOR §15). Defaults: 5, 1s; exhaustion returns an error
-	// wrapping ErrSourceUnavailable.
+	// SourceAttempts/SourceInterval bound a znnd read failure and a
+	// znnd that is behind the recorded momentum window. Defaults: 5,
+	// 1s; exhaustion returns an error wrapping ErrSourceUnavailable.
 	SourceAttempts int
 	SourceInterval time.Duration
 }
@@ -100,7 +104,6 @@ type Config struct {
 	Layout            Layout
 	DomainID          uint32
 	ExecutorID        string
-	Role              string
 	STFSpecHash       types.Hash
 	ConfirmationDepth uint64
 	Domain            domain.Domain
@@ -196,12 +199,7 @@ func boot(cfg Config) (Ready, error) {
 	var rdy Ready
 
 	enter("BOOT")
-	if _, err := OpenMeta(cfg.Layout, Meta{
-		DomainID:    cfg.DomainID,
-		ExecutorID:  cfg.ExecutorID,
-		STFSpecHash: cfg.STFSpecHash,
-		Role:        cfg.Role,
-	}); err != nil {
+	if err := OpenMeta(cfg.Layout, Meta{DomainID: cfg.DomainID, ExecutorID: cfg.ExecutorID}); err != nil {
 		return rdy, err
 	}
 
@@ -281,10 +279,7 @@ func openGenesis(cfg Config) (*state.Store, error) {
 	if len(init.Paths) != len(init.Values) {
 		return nil, fmt.Errorf("recovery: genesis StateInit has %d paths and %d values", len(init.Paths), len(init.Values))
 	}
-	store, err := state.OpenEmpty(cfg.Layout.StateWAL)
-	if err != nil {
-		return nil, fmt.Errorf("recovery: %w", err)
-	}
+	store := state.OpenEmpty()
 	if len(init.Paths) == 0 {
 		return store, nil
 	}
@@ -319,7 +314,7 @@ func loadSnapshot(cfg Config, pos Position) (*state.Store, error) {
 			wrongTag++
 			continue
 		}
-		store, err := state.OpenSnapshot(cfg.Layout.StateWAL, cfg.Layout.Snapshots, info.Name, cfg.STFSpecHash)
+		store, err := state.OpenSnapshot(cfg.Layout.Snapshots, info.Name, cfg.STFSpecHash)
 		if err != nil {
 			unloadable++
 			continue
@@ -610,19 +605,22 @@ func momentumHashes(moms []*nom.DetailedMomentum) map[uint64]types.Hash {
 // The caller builds a fresh Follower at the returned Position, so the next expected ordinal
 // rolls back with the cursor.
 //
-// The plugin's local code store is not rolled back: domain.Domain exposes no rollback hook.
-// A replayed canonical DeployStartArgs deletes every chunk slot and the pending record for its
-// (deployer, code_hash) before rewriting them, so a retracted start's slots are rewritten
-// idempotently, and a finalize or upgrade naming a code_hash whose start was retracted is not an input at all,
-// because Settlement accepted no matching start on the canonical chain. Replay rewrites every
-// chunk a canonical finalize assembles, because Settlement accepts a finalize only once every
-// chunk is present (§11.3). The unrepaired path (EXECUTOR §15): the retracted branch saw a
-// pending record expire (§11.5) and accepted a second DeployContractStart for the same
-// deployer and code_hash. That second record survives the rollback, and a canonical finalize
-// for the first record assembles against it. Records are keyed by (deployer, code_hash), so
-// another deployer's start cannot reach the record. The operator remedy is to stop the
-// executor, remove the domain directory and any plugin state kept outside it, and re-sync from
-// genesis.
+// The plugin's local code store is not rolled back: domain.Domain
+// exposes no rollback hook. A replayed canonical DeployStartArgs
+// deletes every chunk slot and the pending record for its (deployer,
+// code_hash) before rewriting them, so a retracted start's slots are
+// rewritten idempotently, and a finalize or upgrade naming a code_hash
+// whose start was retracted is not an input at all, because Settlement
+// accepted no matching start on the canonical chain. Replay rewrites
+// every chunk a canonical finalize assembles, because Settlement
+// accepts a finalize only once every chunk is present. The unrepaired
+// path: the retracted branch saw a pending record expire and accepted a
+// second DeployContractStart for the same deployer and code_hash. That
+// second record survives the rollback, and a canonical finalize for the
+// first record assembles against it. Records are keyed by (deployer,
+// code_hash), so another deployer's start cannot reach the record. The
+// operator remedy is to stop the executor, remove the domain directory
+// and any plugin state kept outside it, and re-sync from genesis.
 func Rollback(cfg Config, forkParent uint64) (Ready, error) {
 	if err := cfg.validate(needDomain); err != nil {
 		return Ready{}, err

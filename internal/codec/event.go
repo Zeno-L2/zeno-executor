@@ -6,7 +6,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// Event is one execution log entry (§27.3). Events are execution metadata, never state.
+// Event is one execution log entry. Events are execution metadata,
+// never state.
 type Event struct {
 	ContractID types.Hash
 	InputIndex uint64
@@ -93,9 +94,10 @@ func decodeEventBody(r *reader) (Event, error) {
 	return e, nil
 }
 
-// writeEventList encodes a List<Event> and enforces the §27.3 index rules shared by
-// ContractEffects and ExecutionResult: count ≤ MaxEventsPerExecution, ascending EventIndex
-// from 0 with no gaps, and InputIndex == globalInputIndex.
+// writeEventList encodes a List<Event> and enforces the index rules
+// shared by ContractEffects and ExecutionResult: count ≤
+// MaxEventsPerExecution, ascending EventIndex from 0 with no gaps, and
+// InputIndex == globalInputIndex.
 func writeEventList(w *writer, events []Event, globalInputIndex uint64) error {
 	if len(events) > MaxEventsPerExecution {
 		return ErrLimitExceeded

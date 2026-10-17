@@ -39,7 +39,7 @@ func readPathClient(t *testing.T, fx *znndtest.Fixture, srv *znndtest.Server, de
 
 	executor := types.Address{0x09}
 	cfg := Config{ExecutorAddress: executor, NetworkName: "devnet", ConfirmationDepth: depth, StoragePath: "/var/lib/executor"}
-	w := WorkerConfig{DomainID: fx.DomainID, Role: "EXECUTOR", STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
+	w := WorkerConfig{DomainID: fx.DomainID, STFSpecHash: types.Hash{0x01}, MemoryLimit: 1 << 30, CPULimit: 1}
 	if err := ipc.WriteMessage(sEnd, cfg.workerConfig(w)); err != nil {
 		t.Fatalf("WriteMessage config: %v", err)
 	}
@@ -75,7 +75,6 @@ func bootConfig(t *testing.T, fx *znndtest.Fixture, depth uint64, client *ipc.Cl
 		Layout:            layout,
 		DomainID:          fx.DomainID,
 		ExecutorID:        "exec-1",
-		Role:              "EXECUTOR",
 		STFSpecHash:       types.Hash{0x01},
 		ConfirmationDepth: depth,
 		Domain:            emptyDomain{},
@@ -254,6 +253,9 @@ func TestFollowerEndToEnd(t *testing.T) {
 		}
 		if got[i].Ctx.MomentumHeight != a.SendHeight {
 			t.Fatalf("input %d: momentum height %d, want %d", i, got[i].Ctx.MomentumHeight, a.SendHeight)
+		}
+		if got[i].Ctx.MomentumHash != sendMomentum.Momentum.Hash {
+			t.Fatalf("input %d: momentum hash %s, want %s", i, got[i].Ctx.MomentumHash, sendMomentum.Momentum.Hash)
 		}
 		decoded, err := codec.DecodeInput(got[i].Payload)
 		if err != nil {

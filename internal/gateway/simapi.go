@@ -15,7 +15,7 @@ import (
 	"github.com/digitalSloth/go-executor/internal/simipc"
 )
 
-// simulateResult is zeno_simulate's result (EXECUTOR §21.8).
+// simulateResult is zeno_simulate's result.
 type simulateResult struct {
 	DomainID       uint32          `json:"domainId"`
 	BatchID        uint64          `json:"batchId"`       // the tag's batch, whose state the input ran on
@@ -25,6 +25,7 @@ type simulateResult struct {
 	InputIndex     uint64          `json:"inputIndex"`
 	MomentumHeight uint64          `json:"momentumHeight"`
 	MomentumTime   uint64          `json:"momentumTime"`
+	MomentumHash   types.Hash      `json:"momentumHash"`
 	Status         string          `json:"status"` // codec.Status.String()
 	GasUsed        uint64          `json:"gasUsed"`
 	AbortCode      int32           `json:"abortCode"`
@@ -202,13 +203,14 @@ func (s *Server) simulate(params []json.RawMessage, b *budget) (any, error) {
 		return nil, &rpcError{codeNotAvailable, "simulation is not available until the gateway's first poll reads Settlement; retry later"}
 	}
 
-	height, unixTime := view.Momentum()
+	height, unixTime, hash := view.Momentum()
 	code, _ := s.readerOf(c).(domain.CodeSource)
 	j := &simJob{
 		req: simipc.Simulate{
 			GlobalInputIndex: r.head.Pending.LastInputSeq + 1,
 			MomentumHeight:   height,
 			MomentumTime:     unixTime,
+			MomentumHash:     hash,
 			L1Sender:         sender,
 			InputData:        data,
 		},
@@ -258,6 +260,7 @@ func simResultOf(c *Chain, r tagRead, j *simJob, out simOutcome) (simulateResult
 		InputIndex:     j.req.GlobalInputIndex,
 		MomentumHeight: j.req.MomentumHeight,
 		MomentumTime:   j.req.MomentumTime,
+		MomentumHash:   j.req.MomentumHash,
 		Status:         out.res.Status.String(),
 		GasUsed:        out.res.GasUsed,
 		AbortCode:      out.res.AbortCode,

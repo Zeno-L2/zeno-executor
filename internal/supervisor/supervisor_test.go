@@ -158,7 +158,6 @@ func workerConfig(id uint32, binary string, memoryLimit int64, cpuLimit float64)
 	return WorkerConfig{
 		DomainID:    id,
 		Binary:      binary,
-		Role:        "EXECUTOR",
 		STFSpecHash: types.Hash{0xAA},
 		MemoryLimit: memoryLimit,
 		CPULimit:    cpuLimit,
@@ -454,9 +453,9 @@ func TestHaltedWorkerIsNotRestarted(t *testing.T) {
 		}
 		return recovery.Anchor{}, false, nil
 	}}
-	watcher := workerConfig(3, workerBinary, 1<<30, 1)
-	watcher.Role = "WATCHER"
-	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1), watcher)
+	badHash := workerConfig(3, workerBinary, 1<<30, 1)
+	badHash.STFSpecHash = types.Hash{}
+	cfg := supervisorConfig(storage, workerConfig(1, workerBinary, 1<<30, 1), workerConfig(2, workerBinary, 1<<30, 1), badHash)
 	sup, _, _ := startSupervisor(t, cfg, src, shrunkPolicy)
 
 	waitFor(t, 30*time.Second, "worker 1 HALTED", func() bool { return statusFor(sup, 1).State == StateHalted })

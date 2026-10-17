@@ -10,7 +10,6 @@
     {
       "domainId": 1,
       "binary": "/usr/local/bin/worker-wasm",
-      "role": "EXECUTOR",
       "stfSpecHash": "0000000000000000000000000000000000000000000000000000000000000001",
       "memoryLimit": 1073741824,
       "cpuLimit": 1.0

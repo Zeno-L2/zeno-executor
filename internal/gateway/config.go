@@ -23,12 +23,11 @@ import (
 var ErrConfig = errors.New("gateway: invalid configuration")
 
 // defaultListenAddress is the JSON-RPC listen address when the
-// configuration leaves listenAddress empty (EXECUTOR §17).
+// configuration leaves listenAddress empty.
 const defaultListenAddress = "127.0.0.1:35999"
 
-// Config is the gateway's boot configuration (EXECUTOR §17), decoded
-// from one JSON file with DisallowUnknownFields, so no setting is
-// silently ignored.
+// Config is the gateway's boot configuration, decoded from one JSON
+// file with DisallowUnknownFields, so no setting is silently ignored.
 type Config struct {
 	ZnndEndpoint      string           `json:"znndEndpoint"`
 	NetworkName       string           `json:"networkName"`
@@ -40,7 +39,7 @@ type Config struct {
 	Simulation        SimulationConfig `json:"simulation"`
 }
 
-// SimulationConfig is the simulation object (EXECUTOR §17, §21.8).
+// SimulationConfig is the simulation object of the configuration.
 type SimulationConfig struct {
 	Enabled       *bool  `json:"enabled"`       // nil: true after LoadConfig, off in NewServer
 	MaxGas        uint64 `json:"maxGas"`        // 0: defaultSimMaxGas

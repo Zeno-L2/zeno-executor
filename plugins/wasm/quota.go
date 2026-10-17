@@ -39,10 +39,11 @@ func leafSize(length int) int64 {
 	return StateLeafOverhead + int64(length)
 }
 
-// chargeQuota is step 6a (§13.8). It sums the net change in counted leaf bytes across the
-// contract's derived entries and applies it to the quota leaf. It returns the diff with the
-// updated quota entry appended, or ok == false when the change exceeds the purchased quota.
-// A net change of zero reads no quota leaf and adds no entry. An error means halt.
+// chargeQuota is step 6a. It sums the net change in counted leaf bytes
+// across the contract's derived entries and applies it to the quota
+// leaf. It returns the diff with the updated quota entry appended, or
+// ok == false when the change exceeds the purchased quota. A net change
+// of zero reads no quota leaf and adds no entry. An error means halt.
 func (s settlement) chargeQuota(diff []domain.StateDiffEntry) ([]domain.StateDiffEntry, bool, error) {
 	var delta int64
 	for _, e := range diff {
@@ -88,7 +89,7 @@ func (s settlement) chargeQuota(diff []domain.StateDiffEntry) ([]domain.StateDif
 	return append(diff, domain.StateDiffEntry{Path: quotaPath, Value: encodeQuota(purchased, newUsed)}), true, nil
 }
 
-// applyBuyStorage serves input_kind 7 (§13.8, §15): it adds args.Bytes to the target
+// applyBuyStorage serves input_kind 7: it adds args.Bytes to the target
 // contract's purchased quota.
 func (p *Plugin) applyBuyStorage(state domain.StateAccess, args codec.BuyStorageArgs) (domain.Effects, error) {
 	// Unconditional, in this order, before any branch: the witness set is the same on every

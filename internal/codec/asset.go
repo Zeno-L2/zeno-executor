@@ -6,10 +6,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// AssetID is the canonical 32-byte encoding of a 10-byte ZTS identifier (§18.1): bytes
-// [0:22] are zero, and bytes [22:32] are the ZTS identifier in its native byte order. The
-// all-zero AssetID is valid — it is the "no deposit" sentinel of §27.1 and maps to
-// types.ZeroTokenStandard.
+// AssetID is the canonical 32-byte encoding of a 10-byte ZTS
+// identifier: bytes [0:22] are zero, and bytes [22:32] are the ZTS
+// identifier in its native byte order. The all-zero AssetID is valid:
+// it is the "no deposit" sentinel and maps to types.ZeroTokenStandard.
 type AssetID [32]byte
 
 // AssetIDFromZTS encodes zts into the canonical AssetID alignment: the ZTS bytes at [22:32],

@@ -71,11 +71,12 @@ type dataSeg struct {
 	bytes  []byte
 }
 
-// buildModule builds a module.Validate-accepted module: a type section carrying run's
-// (i32,i32)->i64; a function section (run only); a memory section {min pages}; an export
-// section exporting memory and run; the code section (run's body only); and, when data !=
-// nil, an active data segment emitted after the code section. No env imports are needed for
-// this ticket's fixtures.
+// buildModule builds a module.Validate-accepted module: a type section
+// carrying run's (i32,i32)->i64; a function section (run only); a
+// memory section {min pages}; an export section exporting memory and
+// run; the code section (run's body only); and, when data != nil, an
+// active data segment emitted after the code section. No env imports
+// are needed for these fixtures.
 func buildModule(data *dataSeg, locals, body []byte, pages uint32) []byte {
 	var out []byte
 	out = append(out, wasmHeader...)
@@ -203,7 +204,7 @@ func TestToCallArgs(t *testing.T) {
 			t.Fatal("toCallArgs: ok = false, want true")
 		}
 		if got.Payload != nil {
-			t.Fatalf("toCallArgs(Deposit).Payload = %v, want nil (§27.5)", got.Payload)
+			t.Fatalf("toCallArgs(Deposit).Payload = %v, want nil", got.Payload)
 		}
 		want := callArgs{TargetContract: in.TargetContract, PlasmaLimit: in.PlasmaLimit, DepositAsset: in.DepositAsset, DepositAmount: in.DepositAmount, Payload: nil}
 		if !reflect.DeepEqual(got, want) {
@@ -242,6 +243,7 @@ func TestBuildFrame(t *testing.T) {
 				GlobalInputIndex: 42,
 				MomentumHeight:   100,
 				MomentumTime:     200, // distinct from MomentumHeight so a swap is caught
+				MomentumHash:     types.Hash{7, 7, 7},
 				L1Sender:         types.Address{3, 3, 3},
 			}
 			args := callArgs{
@@ -275,6 +277,9 @@ func TestBuildFrame(t *testing.T) {
 			}
 			if f.MomentumTime != ctx.MomentumTime {
 				t.Errorf("MomentumTime = %d, want %d", f.MomentumTime, ctx.MomentumTime)
+			}
+			if f.MomentumHash != ctx.MomentumHash {
+				t.Errorf("MomentumHash = %x, want %x", f.MomentumHash, ctx.MomentumHash)
 			}
 			if f.InputIndex != ctx.GlobalInputIndex {
 				t.Errorf("InputIndex = %d, want %d", f.InputIndex, ctx.GlobalInputIndex)

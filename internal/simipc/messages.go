@@ -98,6 +98,7 @@ type Config struct {
 // Simulate asks for one simulation.
 type Simulate struct {
 	GlobalInputIndex, MomentumHeight, MomentumTime uint64
+	MomentumHash                                   types.Hash
 	L1Sender                                       types.Address
 	InputData                                      []byte // canonical input encoding, kind 0 or 1
 }
@@ -236,6 +237,7 @@ func encode(m Message) ([]byte, error) {
 		b = binary.BigEndian.AppendUint64(b, v.GlobalInputIndex)
 		b = binary.BigEndian.AppendUint64(b, v.MomentumHeight)
 		b = binary.BigEndian.AppendUint64(b, v.MomentumTime)
+		b = append(b, v.MomentumHash[:]...)
 		b = append(b, v.L1Sender[:]...)
 		b = binary.BigEndian.AppendUint32(b, uint32(len(v.InputData)))
 		b = append(b, v.InputData...)
@@ -413,6 +415,7 @@ func decode(t Type, payload []byte) (Message, error) {
 		s.GlobalInputIndex = r.u64()
 		s.MomentumHeight = r.u64()
 		s.MomentumTime = r.u64()
+		copy(s.MomentumHash[:], r.take(len(s.MomentumHash)))
 		copy(s.L1Sender[:], r.take(len(s.L1Sender)))
 		n := r.u32()
 		if r.err == nil && (n == 0 || n > MaxInputData) {

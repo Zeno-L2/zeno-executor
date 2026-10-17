@@ -340,7 +340,7 @@ type hexBytes []byte
 
 func (b hexBytes) MarshalText() ([]byte, error) { return []byte(hex.EncodeToString(b)), nil }
 
-// receiptJSON is one receipt (SPEC §27.7).
+// receiptJSON is one receipt.
 type receiptJSON struct {
 	InputIndex    uint64     `json:"inputIndex"`
 	InputHash     types.Hash `json:"inputHash"`
@@ -358,7 +358,7 @@ type receiptJSON struct {
 	OutboxCount   uint32     `json:"outboxCount"`
 }
 
-// eventJSON is one event (SPEC §27.3).
+// eventJSON is one event.
 type eventJSON struct {
 	ContractID types.Hash   `json:"contractId"`
 	InputIndex uint64       `json:"inputIndex"`
@@ -367,8 +367,8 @@ type eventJSON struct {
 	Data       hexBytes     `json:"data"`
 }
 
-// outboxJSON is one outbox message (SPEC §27.4) with its outboxId.
-// The target fields of the other kind are null.
+// outboxJSON is one outbox message with its outboxId. The target fields
+// of the other kind are null.
 type outboxJSON struct {
 	OutboxID       types.Hash     `json:"outboxId"`
 	SourceContract types.Hash     `json:"sourceContract"`
@@ -901,8 +901,7 @@ const maxBatchOutbox = codec.MaxBatchInputs * codec.MaxOutboxPerResult
 var errOutboxBusy = errors.New("processedOutbox reads are at their cap")
 
 // outboxProofResult is zeno_getOutboxProof's result: the RelayMessage
-// arguments for one outbox message (SPEC §17.3, §27.3) and its
-// processedOutbox state.
+// arguments for one outbox message and its processedOutbox state.
 type outboxProofResult struct {
 	DomainID        uint32     `json:"domainId"`
 	BatchID         uint64     `json:"batchId"`
@@ -911,7 +910,7 @@ type outboxProofResult struct {
 	OutboxID        types.Hash `json:"outboxId"`
 	OutboxRoot      types.Hash `json:"outboxRoot"`
 	Message         hexBytes   `json:"message"`        // canonical encoding
-	InclusionProof  hexBytes   `json:"inclusionProof"` // §27.3 MerkleProof
+	InclusionProof  hexBytes   `json:"inclusionProof"` // MerkleProof
 	Decoded         outboxJSON `json:"decoded"`
 	ProcessedOutbox bool       `json:"processedOutbox"`
 }

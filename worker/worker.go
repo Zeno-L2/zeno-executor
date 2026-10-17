@@ -102,7 +102,6 @@ func run(ctx context.Context, conn io.ReadWriter, newPlugin NewPlugin) int {
 		DomainID:          cfg.DomainID,
 		ExecutorID:        cfg.ExecutorAddress.String(),
 		StoragePath:       cfg.StoragePath,
-		Role:              cfg.Role,
 		STFSpecHash:       cfg.STFSpecHash,
 		ConfirmationDepth: cfg.ConfirmationDepth,
 		MaxPendingBatches: cfg.MaxPendingBatches,
@@ -129,9 +128,10 @@ func run(ctx context.Context, conn io.ReadWriter, newPlugin NewPlugin) int {
 	return status
 }
 
-// exitStatus maps runtime.Run's result and the channel's broken state to a process exit
-// status. The first matching row wins; see the package's spec for the full table and why the
-// broken row sits above ExitTempFail.
+// exitStatus maps runtime.Run's result and the channel's broken state
+// to a process exit status. The first matching case wins: a broken
+// channel exits 1 even when the run error would otherwise map to
+// ExitTempFail.
 func exitStatus(runErr, broken error) int {
 	switch {
 	case errors.Is(runErr, runtime.ErrConfig):

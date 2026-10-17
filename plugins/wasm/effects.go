@@ -28,9 +28,9 @@ type settlement struct {
 	Caps             domain.CapLookup // the input's withdrawal-cap lookup, read by step 5a
 }
 
-// settle maps a completed Outcome onto the §15 status, the gas_used that status defines, the
-// §7.5 abort code where the status is REVERT, and the Effects the runtime commits. Its error
-// return means halt.
+// settle maps a completed Outcome onto the receipt status, the gas_used
+// that status defines, the abort code where the status is REVERT, and
+// the Effects the runtime commits. Its error return means halt.
 func (s settlement) settle(out engine.Outcome) (domain.Effects, error) {
 	switch out.Kind {
 	case engine.OutOfGas:
@@ -80,8 +80,8 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
-	// Step 2a (§27.1a): every event and outbox message must be attributed to the executing
-	// contract.
+	// Step 2a: every event and outbox message must be attributed to the
+	// executing contract.
 	for _, e := range eff.Events {
 		if e.ContractID != s.ContractID {
 			return s.fail(codec.StatusRuntimeFault, metered), nil
@@ -113,24 +113,29 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
-	// Step 5: outbox capacity for the refund (§27.4). The refund occupies the 33rd slot, so the
-	// bound is the ExecutionResult's MaxOutboxPerResult, not the contract's MaxOutboxPerExecution.
-	// Step 1's decode already bounds the contract's own messages at MaxOutboxPerExecution, so this
-	// cannot fail today; it is kept because it mirrors the MaxOutboxPerResult >=
-	// MaxOutboxPerExecution + 1 invariant that result.Encode()'s own bound depends on below. If
-	// that invariant ever breaks, a contract-triggered Encode failure at the end of settle becomes
+	// Step 5: outbox capacity for the refund. The refund occupies the
+	// 33rd slot, so the bound is the ExecutionResult's
+	// MaxOutboxPerResult, not the contract's MaxOutboxPerExecution.
+	// Step 1's decode already bounds the contract's own messages at
+	// MaxOutboxPerExecution, so this cannot fail today; it is kept
+	// because it mirrors the MaxOutboxPerResult >=
+	// MaxOutboxPerExecution + 1 invariant that result.Encode()'s own
+	// bound depends on below. If that invariant ever breaks, a
+	// contract-triggered Encode failure at the end of settle becomes
 	// this step's RUNTIME_FAULT instead of an uncontrolled halt.
 	remainder := subU256(s.DepositAmount, eff.ClaimedDeposit)
 	if remainder != (codec.U256{}) && len(eff.Outbox)+1 > codec.MaxOutboxPerResult {
 		return s.fail(codec.StatusRuntimeFault, metered), nil
 	}
 
-	// Step 5a (§27.9, §10.6): the per-asset withdrawal cap applies to this input's contract
-	// withdrawals, summed per asset. The caps are the input's Caps answers, read in one call
-	// after the footprint check (Settlement's MaxBatchWithdrawal at the momentum confirming the
-	// receive, 0 for an asset with no AssetConfig). The deposit amount is not counted, so step
-	// 5a never limits a deposit's size; the deposit asset counts toward the asset footprint
-	// because every deposit adds a depositCredit to the batch's AssetFlowSummary.
+	// Step 5a: the per-asset withdrawal cap applies to this input's
+	// contract withdrawals, summed per asset. The caps are the input's
+	// Caps answers, read in one call after the footprint check
+	// (Settlement's MaxBatchWithdrawal at the momentum confirming the
+	// receive, 0 for an asset with no AssetConfig). The deposit amount
+	// is not counted, so step 5a never limits a deposit's size; the
+	// deposit asset counts toward the asset footprint because every
+	// deposit adds a depositCredit to the batch's AssetFlowSummary.
 	totals := map[codec.AssetID]*big.Int{}
 	for _, m := range eff.Outbox {
 		w, ok := m.Target.(codec.L1Withdrawal)
@@ -171,15 +176,15 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 		}
 	}
 
-	// Step 6: the §10.4 post-execution effect charge.
+	// Step 6: the post-execution effect charge.
 	charge := effectCharge(eff)
 	if remaining < charge {
 		return s.fail(codec.StatusOutOfGas, s.GasBudget), nil
 	}
 	gasUsed := metered + charge
 
-	// Step 6a (§13.8): charge the net growth of the contract's leaves against its storage
-	// quota, and add the updated quota leaf to the diff.
+	// Step 6a: charge the net growth of the contract's leaves against
+	// its storage quota, and add the updated quota leaf to the diff.
 	derived, quotaOK, err := s.chargeQuota(derived)
 	if err != nil {
 		return domain.Effects{}, err
@@ -233,8 +238,8 @@ func (s settlement) validate(out engine.Outcome) (domain.Effects, error) {
 	}, nil
 }
 
-// sortStateDiff orders entries ascending by derived path in place, as §27.2's canonical StateDiff
-// ordering requires, and returns them.
+// sortStateDiff orders entries ascending by derived path in place, as
+// the canonical StateDiff ordering requires, and returns them.
 func sortStateDiff(entries []domain.StateDiffEntry) []domain.StateDiffEntry {
 	sort.Slice(entries, func(i, j int) bool {
 		return bytes.Compare(entries[i].Path[:], entries[j].Path[:]) < 0
@@ -252,9 +257,9 @@ func toCodecStateDiff(entries []domain.StateDiffEntry) []codec.StateDiffEntry {
 	return out
 }
 
-// fail assembles the discard-all-but-refund shape: empty StateDiff, no events, no contract
-// outbox, zero ClaimedDeposit, empty ReturnData, and the full-deposit refund (if any) at
-// outbox_index 0 (§14.3, §15, §18.5).
+// fail assembles the discard-all-but-refund shape: empty StateDiff, no
+// events, no contract outbox, zero ClaimedDeposit, empty ReturnData,
+// and the full-deposit refund (if any) at outbox_index 0.
 func (s settlement) fail(status codec.Status, gasUsed uint64) domain.Effects {
 	return domain.Effects{
 		Status:         status,
@@ -269,10 +274,12 @@ func (s settlement) fail(status codec.Status, gasUsed uint64) domain.Effects {
 	}
 }
 
-// effectCharge is the §10.4 post-execution charge over the contract's declared effects: one per
-// StateDiff entry by value bytes (a deletion charges base only), one per event by data bytes,
-// one per contract outbox message by payload bytes, and one for ReturnData, charged
-// unconditionally including when it is empty. The runtime-emitted refund is not charged (§10.6).
+// effectCharge is the post-execution charge over the contract's
+// declared effects: one per StateDiff entry by value bytes (a deletion
+// charges base only), one per event by data bytes, one per contract
+// outbox message by payload bytes, and one for ReturnData, charged
+// unconditionally including when it is empty. The runtime-emitted
+// refund is not charged.
 func effectCharge(eff codec.ContractEffects) uint64 {
 	var total uint64
 	for _, e := range eff.StateDiff {

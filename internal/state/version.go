@@ -18,9 +18,9 @@ type Version struct {
 }
 
 // Apply returns the state after diff, under the canonical applier
-// Store.Apply uses (SPEC §13.5.1): a nil Value deletes its path, and
-// any other Value, including a non-nil zero-length one, sets a
-// present leaf. v itself is unchanged.
+// Store.Apply uses: a nil Value deletes its path, and any other Value,
+// including a non-nil zero-length one, sets a present leaf. v itself is
+// unchanged.
 func (v Version) Apply(diff []domain.StateDiffEntry) Version {
 	next := v
 	for _, e := range diff {

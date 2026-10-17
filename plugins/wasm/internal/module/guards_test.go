@@ -12,11 +12,13 @@ import (
 	"testing"
 )
 
-// TestErrorCoverage scans errors.go for every declared reason and asserts two things: every
-// scanned name is registered in the hand-written map below (a new reason was declared and not
-// registered), and every registered value is errors.Is-matched by at least one rejectionCases
-// entry (a declared reason no fixture exercises). This is what stops 04d/04e from silently
-// eroding this ticket's guarantees.
+// TestErrorCoverage scans errors.go for every declared reason and
+// asserts two things: every scanned name is registered in the
+// hand-written map below (a new reason was declared and not
+// registered), and every registered value is errors.Is-matched by at
+// least one rejectionCases entry (a declared reason no fixture
+// exercises). This is what stops the error set from silently drifting
+// away from the cases that cover it.
 func TestErrorCoverage(t *testing.T) {
 	known := map[string]error{
 		"ErrModuleTooLarge":              ErrModuleTooLarge,

@@ -18,8 +18,8 @@ import (
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
 )
 
-// --- seeding helpers: drive kinds 2 and 3 through DecodeInput with real canonical payloads, so
-// the 04a caching path is exercised end to end.
+// --- seeding helpers: drive kinds 2 and 3 through DecodeInput with
+// real canonical payloads, so the caching path is exercised end to end.
 
 func decodeStart(t *testing.T, p *Plugin, args codec.DeployStartArgs, ctx domain.InputContext) {
 	t.Helper()
@@ -37,8 +37,8 @@ func decodeChunk(t *testing.T, p *Plugin, sender types.Address, codeHash types.H
 	}
 }
 
-// splitChunks splits raw per SPEC.md:610: every chunk but the last exactly MaxDeployChunkData,
-// the last the remainder.
+// splitChunks splits raw into chunks: every chunk but the last exactly
+// MaxDeployChunkData, the last the remainder.
 func splitChunks(raw []byte) [][]byte {
 	var chunks [][]byte
 	for i := 0; i < len(raw); i += MaxDeployChunkData {
@@ -89,7 +89,8 @@ func upgradeState(id, oldCodeHash types.Hash, policyPresent bool, policy []byte,
 	return &mapState{values: values}
 }
 
-// assertUpgradeReads checks §20's fixed, branch-independent four-key read order.
+// assertUpgradeReads checks the fixed, branch-independent four-key read
+// order.
 func assertUpgradeReads(t *testing.T, state *mapState, id types.Hash) {
 	t.Helper()
 	want := []domain.Path{
@@ -1105,8 +1106,8 @@ func TestApplyUpgradeSucceedsWithMalformedPreCodeHashWidth(t *testing.T) {
 
 // --- transfer ownership: read order and every status row.
 
-// assertTransferReads checks §20's fixed, branch-independent three-key read order (no
-// keyPreCodeHash read).
+// assertTransferReads checks the fixed, branch-independent three-key
+// read order (no keyPreCodeHash read).
 func assertTransferReads(t *testing.T, state *mapState, id types.Hash) {
 	t.Helper()
 	want := []domain.Path{

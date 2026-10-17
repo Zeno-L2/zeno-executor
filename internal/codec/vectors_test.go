@@ -1,9 +1,10 @@
 package codec
 
-// Conformance test against internal/codec/testdata/serialization-conformance-v1.json — the
-// §31 serialization/commitment/bundle vector suite this package authors (EXECUTOR.md P-7
-// puts executor-side conformance vectors in testdata/). This file is the normative companion
-// artifact's consumer; CV-COMMIT-1's encoded_hex is the byte-level contract Settlement must
+// Conformance test against
+// internal/codec/testdata/serialization-conformance-v1.json, the
+// serialization, commitment and bundle vector suite this package
+// authors. This file is the normative companion artifact's consumer;
+// CV-COMMIT-1's encoded_hex is the byte-level contract Settlement must
 // reproduce.
 
 import (
@@ -193,7 +194,6 @@ func testGenericReject(t *testing.T, vec vectorRaw, decode func([]byte) error) {
 
 func testInputRoot(t *testing.T, vec vectorRaw) {
 	t.Helper()
-	inputs := make([]Input, len(vec.Inputs))
 	elements := make([][]byte, len(vec.Inputs))
 	for i, iv := range vec.Inputs {
 		encoded := mustHexBytes(t, iv.EncodedHex)
@@ -208,28 +208,17 @@ func testInputRoot(t *testing.T, vec vectorRaw) {
 		if !bytes.Equal(gotEncoded, encoded) {
 			t.Fatalf("input %d (%s): Encode did not reproduce encoded_hex", i, iv.Kind)
 		}
-		gotHash, err := in.Hash()
-		if err != nil {
-			t.Fatalf("input %d (%s): Hash: %v", i, iv.Kind, err)
-		}
-		wantHash := hashOf(crypto.Hash(encoded))
-		if gotHash != wantHash {
-			t.Fatalf("input %d (%s): Hash mismatch: got %x, want %x (independent SHA3)", i, iv.Kind, gotHash, wantHash)
-		}
+		gotHash := hashOf(crypto.Hash(encoded))
 		if hex.EncodeToString(gotHash[:]) != iv.InputHashHex {
 			t.Fatalf("input %d (%s): input_hash_hex mismatch: got %x, want %s", i, iv.Kind, gotHash, iv.InputHashHex)
 		}
-		inputs[i] = in
 		elements[i] = encoded
 	}
 
-	got, err := InputRoot(inputs)
-	if err != nil {
-		t.Fatalf("InputRoot: %v", err)
-	}
+	got := MerkleRoot(elements)
 	want := refMerkleRoot(elements)
 	if got != want {
-		t.Fatalf("InputRoot mismatch: got %x, want %x (independent Merkle recomputation)", got, want)
+		t.Fatalf("MerkleRoot mismatch: got %x, want %x (independent Merkle recomputation)", got, want)
 	}
 	if hex.EncodeToString(got[:]) != vec.ExpectedInputRoot {
 		t.Fatalf("expected_input_root mismatch: got %x, want %s", got, vec.ExpectedInputRoot)
@@ -393,8 +382,9 @@ func testBundle(t *testing.T, vec vectorRaw) {
 		t.Fatalf("record 2 PostStateRoot mismatch: got %x, want %x", rec2ER.PostStateRoot, rec3Root)
 	}
 
-	// Step 6: DecodeBundle round-trips byte-for-byte and crypto.Hash(bundle_hex) (recomputed
-	// inline, not via BundleHash) equals expected_da_hash.
+	// Step 6: DecodeBundle round-trips byte-for-byte, and
+	// crypto.Hash(bundle_hex), recomputed inline, equals
+	// expected_da_hash.
 	rebuilt, err := EncodeBundle(bundleRecords)
 	if err != nil {
 		t.Fatalf("EncodeBundle: %v", err)
@@ -536,8 +526,9 @@ func leavesMapFromSlices(paths []trie.Path, values [][]byte) map[string]string {
 	return m
 }
 
-// replayStateDiff applies diff onto the leaf set given by paths/values per §13.5.1 (nil
-// deletes, any other value sets), returning the resulting parallel slices.
+// replayStateDiff applies diff onto the leaf set given by paths/values
+// (nil deletes, any other value sets), returning the resulting
+// parallel slices.
 func replayStateDiff(paths []trie.Path, values [][]byte, diff []StateDiffEntry) ([]trie.Path, [][]byte) {
 	leaves := make(map[trie.Path][]byte, len(paths)+len(diff))
 	for i, p := range paths {

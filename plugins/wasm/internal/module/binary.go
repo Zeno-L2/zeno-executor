@@ -6,11 +6,13 @@ import (
 	"fmt"
 )
 
-// This file owns the byte-level shape of the format: the section splitter, the low-level
-// vector/name reader every rule builds on, and the per-instruction immediate decoder (the
-// "skipper" rule 13 uses to classify and consume one instruction at a time). It never
-// pre-sizes a slice from a declared count: every vector in the format is parsed one entry at
-// a time and appended, and a count that cannot fit the bytes remaining is rejected first.
+// This file owns the byte-level shape of the format: the section
+// splitter, the low-level vector/name reader every rule builds on, and
+// the per-instruction immediate decoder (the "skipper" parseCode uses
+// to classify and consume one instruction at a time). It never
+// pre-sizes a slice from a declared count: every vector in the format
+// is parsed one entry at a time and appended, and a count that cannot
+// fit the bytes remaining is rejected first.
 
 // parsePreamble checks the \0asm magic and the 01 00 00 00 version, returning the bytes that
 // follow.
@@ -174,8 +176,8 @@ func (r *reader) readName() (string, error) {
 	return string(bs), nil
 }
 
-// checkValType classifies a single valtype byte (rule 3, reused by globals, locals and block
-// types).
+// checkValType classifies a single valtype byte (the type section's
+// check, reused by globals, locals and block types).
 func checkValType(b byte) error {
 	switch b {
 	case 0x7F, 0x7E:

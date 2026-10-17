@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -31,10 +30,11 @@ const (
 	receiptExt = ".receipts"
 )
 
-// File and directory modes. bundles/, receipts/ and batches/ are the gateway's read
-// interface (EXECUTOR §16): their directories are readDirMode and their files readFileMode,
-// inside a domain directory other users can traverse but not list. Every other file this
-// package writes is privateFileMode. Each mode is set by an explicit chmod, never by the
+// File and directory modes. bundles/, receipts/ and batches/ are the
+// gateway's read interface: their directories are readDirMode and their
+// files readFileMode, inside a domain directory other users can
+// traverse but not list. Every other file this package writes is
+// privateFileMode. Each mode is set by an explicit chmod, never by the
 // umask.
 const (
 	domainDirMode   os.FileMode = 0o711
@@ -43,11 +43,12 @@ const (
 	privateFileMode os.FileMode = 0o600
 )
 
-// Layout is the per-domain on-disk tree (EXECUTOR §16), rooted at <storagePath>/<domainId>.
-// Momenta is the path of momentum_hashes/window.json; every other field that names a
-// directory (Snapshots, Bundles, Receipts, Batches) is that directory.
+// Layout is the per-domain on-disk tree, rooted at
+// <storagePath>/<domainId>. Momenta is the path of
+// momentum_hashes/window.json; every other field that names a directory
+// (Snapshots, Bundles, Receipts, Batches) is that directory.
 type Layout struct {
-	Root, StateWAL, Snapshots, Bundles, Receipts, Batches, Cursor, Momenta, Meta string
+	Root, Snapshots, Bundles, Receipts, Batches, Cursor, Momenta, Meta string
 }
 
 // ResolveLayout returns the tree for domainID under storagePath
@@ -57,7 +58,6 @@ func ResolveLayout(storagePath string, domainID uint32) Layout {
 	root := filepath.Join(storagePath, strconv.FormatUint(uint64(domainID), 10))
 	return Layout{
 		Root:      root,
-		StateWAL:  filepath.Join(root, "state", "wal"),
 		Snapshots: filepath.Join(root, "snapshots"),
 		Bundles:   filepath.Join(root, "bundles"),
 		Receipts:  filepath.Join(root, "receipts"),
@@ -73,7 +73,7 @@ func ResolveLayout(storagePath string, domainID uint32) Layout {
 // umask.
 func NewLayout(storagePath string, domainID uint32) (Layout, error) {
 	l := ResolveLayout(storagePath, domainID)
-	for _, dir := range []string{filepath.Dir(l.StateWAL), l.Snapshots, l.Bundles, l.Receipts, l.Batches, filepath.Dir(l.Momenta)} {
+	for _, dir := range []string{l.Snapshots, l.Bundles, l.Receipts, l.Batches, filepath.Dir(l.Momenta)} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, fmt.Errorf("recovery: create %s: %w", dir, err)
 		}
@@ -89,52 +89,34 @@ func NewLayout(storagePath string, domainID uint32) (Layout, error) {
 
 // Meta is meta.json: the identity this tree was created under.
 type Meta struct {
-	DomainID    uint32     `json:"domainId"`
-	ExecutorID  string     `json:"executorId"`
-	STFSpecHash types.Hash `json:"stfSpecHash"`
-	Role        string     `json:"role"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	LastBootAt  time.Time  `json:"lastBootAt"`
+	DomainID   uint32 `json:"domainId"`
+	ExecutorID string `json:"executorId"`
 }
 
-// OpenMeta reads meta.json, creating it from want on first boot, and rejects a tree created for
-// a different domainId or executorId — a storage path reused under another identity is a
-// consistency fault, not a fresh start. A differing stfSpecHash is recorded rather than
-// rejected: §16 makes the snapshot's own tag the load guard.
-func OpenMeta(l Layout, want Meta) (Meta, error) {
-	now := time.Now().UTC()
-	if want.CreatedAt.IsZero() {
-		want.CreatedAt = now
-	}
-	if want.LastBootAt.IsZero() {
-		want.LastBootAt = now
-	}
-
+// OpenMeta creates meta.json from want on first boot. On every later
+// boot it reads the file back and rejects a tree created for a
+// different domainId or executorId: a storage path reused under
+// another identity is a consistency fault, not a fresh start. It never
+// rewrites an existing file.
+func OpenMeta(l Layout, want Meta) error {
 	var got Meta
 	found, err := readJSON(l.Meta, &got)
 	if err != nil {
-		return Meta{}, fmt.Errorf("recovery: read meta: %w", err)
+		return fmt.Errorf("recovery: read meta: %w", err)
 	}
 	if !found {
 		if err := writeJSON(l.Meta, want, privateFileMode); err != nil {
-			return Meta{}, fmt.Errorf("recovery: write meta: %w", err)
+			return fmt.Errorf("recovery: write meta: %w", err)
 		}
-		return want, nil
+		return nil
 	}
-
 	if got.DomainID != want.DomainID {
-		return Meta{}, fmt.Errorf("recovery: storage tree belongs to domain %d, configured for %d", got.DomainID, want.DomainID)
+		return fmt.Errorf("recovery: storage tree belongs to domain %d, configured for %d", got.DomainID, want.DomainID)
 	}
 	if got.ExecutorID != want.ExecutorID {
-		return Meta{}, fmt.Errorf("recovery: storage tree belongs to executor %q, configured for %q", got.ExecutorID, want.ExecutorID)
+		return fmt.Errorf("recovery: storage tree belongs to executor %q, configured for %q", got.ExecutorID, want.ExecutorID)
 	}
-	got.STFSpecHash = want.STFSpecHash
-	got.Role = want.Role
-	got.LastBootAt = want.LastBootAt
-	if err := writeJSON(l.Meta, got, privateFileMode); err != nil {
-		return Meta{}, fmt.Errorf("recovery: write meta: %w", err)
-	}
-	return got, nil
+	return nil
 }
 
 // Position is one durably committed executor position: the input sequence the state includes,
@@ -203,13 +185,12 @@ func validatePosition(pos Position) error {
 	return nil
 }
 
-// StatusBuilt marks a batch this executor built and committed locally. It is the only status
-// Phase 1 records: nothing submits yet, so the record carries no txHash and no
-// submittedAtHeight. Both are omitted JSON fields, so the submitting ticket adds them and
-// widens Status without a format migration.
+// StatusBuilt marks a batch this executor built and committed locally.
+// It is the only status a BatchRecord carries, and the record has no
+// txHash or submittedAtHeight field.
 const StatusBuilt = "BUILT"
 
-// BatchRecord is one committed batch's metadata (EXECUTOR §16).
+// BatchRecord is one committed batch's metadata.
 type BatchRecord struct {
 	BatchID       uint64     `json:"batchId"`
 	Status        string     `json:"status"`
@@ -436,9 +417,10 @@ func removeSnapshot(l Layout, name string) error {
 	return nil
 }
 
-// BundleStore persists DA bundles by DAHash, one file each, and satisfies batch.BundleStore.
-// Bundles are never deleted: they are the only durable copy of a superseded CodeHash (SPEC §12)
-// and of an un-finalized batch's own DA payload, and a bundle orphaned by a discarded batch is
+// BundleStore persists DA bundles by DAHash, one file each, and
+// satisfies batch.BundleStore. Bundles are never deleted: they are the
+// only durable copy of a superseded CodeHash and of an un-finalized
+// batch's own DA payload, and a bundle orphaned by a discarded batch is
 // retained by the same rule.
 type BundleStore struct {
 	dir string
@@ -509,8 +491,9 @@ func (b *BundleStore) Has(daHash types.Hash) (bool, error) {
 	return false, fmt.Errorf("recovery: stat bundle %s: %w", daHash, err)
 }
 
-// ReceiptStore persists receipt sidecars (EXECUTOR §21.2) by DAHash, one file each, and
-// satisfies batch.ReceiptStore. Sidecars are retained forever, as bundles are.
+// ReceiptStore persists receipt sidecars by DAHash, one file each, and
+// satisfies batch.ReceiptStore. Sidecars are retained forever, as
+// bundles are.
 type ReceiptStore struct {
 	dir string
 }
@@ -560,7 +543,7 @@ func (s *ReceiptStore) Put(daHash, receiptRoot types.Hash, sidecar []byte) error
 // cursor and its window from a snapshot alone — writes a record for every batch built since the
 // previous commit, reconciles window into the recorded momentum window, and renames the new
 // cursor over the old, the single step that makes everything before it durable. It then prunes
-// snapshots to the retention ladder and truncates the store's log.
+// snapshots to the retention ladder.
 //
 // A non-empty window argument must end at the position being committed: its last entry's Height
 // must equal pos.MomentumHeight and its Hash must equal pos.MomentumHash. That is what keeps the
@@ -653,9 +636,6 @@ func Commit(cfg Config, store *state.Store, pos Position, records []BatchRecord,
 	if err := retainSnapshots(cfg, pos, snapName); err != nil {
 		return err
 	}
-	if err := store.TruncateLog(); err != nil {
-		return fmt.Errorf("recovery: %w", err)
-	}
 	return nil
 }
 
@@ -682,8 +662,8 @@ func mergeWindow(recorded, window []MomentumRef, depth uint64) []MomentumRef {
 	return out
 }
 
-// retainSnapshots keeps exactly the cursor's snapshot, the floor and the rung, and deletes every
-// other snapshot written by Commit (see the retention ladder in the package's design).
+// retainSnapshots keeps exactly the cursor's snapshot, the floor and
+// the rung, and deletes every other snapshot written by Commit.
 func retainSnapshots(cfg Config, committed Position, cursorName string) error {
 	snaps, err := listPositioned(cfg.Layout)
 	if err != nil {
