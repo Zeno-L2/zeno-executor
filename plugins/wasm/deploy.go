@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
@@ -133,6 +134,14 @@ func (p *Plugin) prepareModule(deployer types.Address, preCodeHash types.Hash) (
 	return derivedHash, record.Metadata, true, nil
 }
 
+// ErrEngineCompile is returned by deriveModuleErr when the engine
+// refuses the original or the instrumented module.
+var ErrEngineCompile = errors.New("wasm: engine refused the module")
+
+// ErrDerivePanic is returned by deriveModuleErr when a derivation step
+// panics.
+var ErrDerivePanic = errors.New("wasm: module derivation panicked")
+
 // deriveModule is prepareModule's step 5 (Derive): validation, the
 // engine compile of the original, instrumentation, the engine compile
 // of the instrumented output, and the CodeHash derivation. It has no
@@ -141,28 +150,40 @@ func (p *Plugin) prepareModule(deployer types.Address, preCodeHash types.Hash) (
 // under the pinned engine, so a rejection here is a rejection on every
 // node. ok == false is VALIDATION_FAILED.
 func (p *Plugin) deriveModule(assembled []byte) (instrumented []byte, codeHash types.Hash, ok bool) {
+	instrumented, codeHash, err := deriveModuleErr(assembled)
+	if err != nil {
+		return nil, types.Hash{}, false
+	}
+	return instrumented, codeHash, true
+}
+
+// deriveModuleErr is the body of deriveModule with the rejection
+// reason kept. A panic becomes ErrDerivePanic, both engine compile
+// failures become ErrEngineCompile, and module.Validate and
+// module.Instrument errors are returned unchanged.
+func deriveModuleErr(assembled []byte) (instrumented []byte, codeHash types.Hash, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			instrumented = nil
 			codeHash = types.Hash{}
-			ok = false
+			err = fmt.Errorf("%w: %v", ErrDerivePanic, r)
 		}
 	}()
 
 	if err := module.Validate(assembled, moduleLimits()); err != nil {
-		return nil, types.Hash{}, false
+		return nil, types.Hash{}, err
 	}
 	if err := engine.Compile(context.Background(), assembled); err != nil {
-		return nil, types.Hash{}, false
+		return nil, types.Hash{}, fmt.Errorf("%w: %v", ErrEngineCompile, err)
 	}
 	inst, err := module.Instrument(assembled, moduleLimits())
 	if err != nil {
-		return nil, types.Hash{}, false
+		return nil, types.Hash{}, err
 	}
 	if err := engine.Compile(context.Background(), inst); err != nil {
-		return nil, types.Hash{}, false
+		return nil, types.Hash{}, fmt.Errorf("%w: %v", ErrEngineCompile, err)
 	}
-	return inst, CodeHash(inst), true
+	return inst, CodeHash(inst), nil
 }
 
 // applyDeployFinalize serves input_kind 4. It takes no StateAccess: a

@@ -73,8 +73,8 @@ func decodeContractMetadataBody(r *reader) (ContractMetadata, error) {
 	return m, nil
 }
 
-// Encode writes version:u16 || upgrade_policy:u8 || owner:20 with no validation. Only tests
-// and vector construction call this: the runtime never encodes metadata.
+// Encode writes version:u16 || upgrade_policy:u8 || owner:20 with no validation. Tests,
+// vector construction and zeno-exec call this; the runtime never encodes metadata.
 func (m ContractMetadata) Encode() []byte {
 	w := &writer{}
 	w.u16(m.Version)

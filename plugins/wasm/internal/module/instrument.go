@@ -454,6 +454,26 @@ func parseMemoryLoose(payload []byte) (min uint32, err error) {
 	return lr.min, nil
 }
 
+// InitialPages returns the declared minimum of the module's one memory.
+// It reads the memory section of a validated module and returns
+// ErrNotValidated when the module has none.
+func InitialPages(validated []byte) (uint32, error) {
+	rest, err := parsePreamble(validated)
+	if err != nil {
+		return 0, err
+	}
+	secs, err := splitSections(rest)
+	if err != nil {
+		return 0, err
+	}
+	for _, s := range secs {
+		if s.id == 5 {
+			return parseMemoryLoose(s.payload)
+		}
+	}
+	return 0, fmt.Errorf("no memory section: %w", ErrNotValidated)
+}
+
 // appendExportName appends a length-prefixed name, the same encoding readName decodes. Named
 // distinctly from fixtures_test.go's identical test-only appendName to avoid a same-package
 // redeclaration.

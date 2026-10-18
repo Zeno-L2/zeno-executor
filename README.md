@@ -34,6 +34,7 @@ conflict.
 | `cmd/executor` | The supervisor binary: loads the configuration and submission key, then runs `internal/supervisor` until shutdown. |
 | `cmd/gateway` | The gateway binary (EXECUTOR §21): loads its configuration, waits for the `znnd` node, boots each served domain from its snapshot cache, follows every domain and serves JSON-RPC over HTTP at `listenAddress` until shutdown. |
 | `cmd/worker-wasm` | The WASM domain worker binary: the supervisor starts it with its channel on descriptor 3. It also runs in simulate mode: the gateway starts it in simulate mode, one pool per domain. |
+| `cmd/zeno-exec` | The local contract tool. It runs a module through the deploy-time checks, and runs deploy, call and deposit sessions through the wasm plugin over in-memory state, from the command line or a loopback HTTP server. Its core is `plugins/wasm/zenoexec`. |
 | `internal/testbin` | Test-only binaries the test suites build and exec as real, separate processes: a domain worker stub, which also runs in simulate mode, and the key-isolation probe. |
 
 ## Building
@@ -401,6 +402,55 @@ Verified files live in `<storagePath>/<domainId>/bundles/` and `receipts/` (dire
 A request with no `Origin` header (curl, a server) is served. A browser request is served only when its `Origin` equals an `allowedOrigins` entry; any other `Origin`, including `null`, gets 403 and runs nothing, and the same rule applies to a WebSocket upgrade. Preflight `OPTIONS` requests are answered for `POST` with `Content-Type`, and on the file routes for `GET` and `HEAD` with `Range`.
 
 On SIGINT or SIGTERM the gateway first closes every WebSocket connection with 1001, then stops accepting, waits up to 10 s for the requests in flight, closes the remaining connections, stops every simulator (a running simulation finishes or times out first), and then closes each domain's index. A second SIGINT or SIGTERM during that wait ends the process at once.
+
+## Running zeno-exec
+
+```
+go build -o <dir>/ ./cmd/zeno-exec
+<dir>/zeno-exec version
+<dir>/zeno-exec validate [--metadata immutable|owner:<address>] <module.wasm>
+<dir>/zeno-exec run [--network testnet] [--gas-budget <gas>]
+<dir>/zeno-exec serve [--listen 127.0.0.1:8547] [--allow-origin <origin>]... [--network testnet]
+```
+
+`zeno-exec` is a developer tool: it checks and runs contract modules with the real validator, instrumenter and runtime, with no node, executor or chain. zeno-wasm-sdk's `cargo zeno` runs it, and `serve` offers the same sessions over HTTP to a browser page on the same machine. Every subcommand writes JSON on stdout and exits 0 on success, 1 on a reported failure and 2 on a usage error. `--network` (default `testnet`) is the network name the plugin derives its chain id from. `version` prints `version`, `revision` and `modified`: `version` comes from `-ldflags "-X main.version=<v>"` and is `devel` otherwise, and the other two come from Go's VCS stamp. Go counts untracked files as `modified`.
+
+`validate` runs the checks a deploy runs, through `plugins/wasm.CheckModule`, which shares its code with the deploy path: the validator, both engine compiles and the instrumenter. It reads at most `MaxCodeSize` + 1 bytes and refuses a path that is not a regular file with exit 2. Success prints `ok`, `codeHash`, `instrumentedCodeHash`, `size`, `instrumentedSize`, `initialPages`, and with `--metadata` also `metadata` and `metadataHash`. `--metadata owner:<address>` takes a `z1` address or 40 lowercase hex digits and refuses the zero address. Failure prints `{"ok":false,"error":{"kind","message"}}` and exits 1. `kind` is a stable snake_case name: one per `module.Err*` sentinel (listed in `plugins/wasm/zenoexec/kinds.go`), `engine_compile`, `internal_panic`, `invalid_metadata`, or `unknown`.
+
+`run` reads one JSON command per line from stdin and writes one JSON result per line, in one session over empty state. Inputs are indexed from 1, and every asset's withdrawal cap is 2^256-1. Addresses are `z1` bech32 or 40 lowercase hex digits. Hashes (`contractId`, `asset`), byte strings (`localKey`, `value`), `module` and `payload` are lowercase hex with no `0x`. Amounts are decimal strings. An unknown op or member is a `bad_command`. A line over 4 MiB writes a `bad_command` result and exits 1. `--gas-budget` (default 0, no limit) refuses, as a `bad_command`, a call or deposit whose `plasmaLimit` exceeds the gas left. A `call`, `deposit`, `transferOwnership` or `buyStorage` that returns a receipt subtracts its `gasUsed` from the gas left.
+
+| `op` | Members | Effect |
+|---|---|---|
+| `deploy` | `sender`, `module`, `metadata` (`"immutable"` or `{"owner": <address>}`) | Stages the module and finalizes it. A successful result adds `contractId` and `codeHash` beside `receipt`. |
+| `upgrade` | `sender`, `contractId`, `module`, `metadata` optional | Stages the module (with `IMMUTABLE` metadata unless given) and upgrades to it. |
+| `transferOwnership` | `sender`, `contractId`, `newOwner` | Transfers the contract's ownership. |
+| `buyStorage` | `sender`, `contractId`, `bytes` (a JSON integer) | Buys storage quota. |
+| `call` | `sender`, `contractId`, `payload`, optional `deposit` (`{"asset","amount"}`) and `plasmaLimit` (default 10,000,000) | Calls the contract. |
+| `deposit` | `sender`, `contractId`, `asset`, `amount`, optional `plasmaLimit` (default 10,000,000) | Deposits an asset into the contract. |
+| `setStorage` | `contractId`, `localKey`, `value` (hex, or `null` to delete) | Writes the contract leaf directly and moves the quota leaf's used bytes by the size change, raising purchased bytes to at least used. It refuses the reserved keys (code hash, pre-code hash, upgrade policy, owner, quota) and oversized keys or values. Result `{"ok":true}`. |
+| `getStorage` | `contractId`, `localKey` | Result `{"ok":true,"value": hex or null}`. |
+
+A receipt result is `{"ok":true,"receipt":{...}}` with `status`, `gasUsed`, `abortCode`, `contractId`, `codeHash`, `returnData`, `events`, `outbox`, `stateDiff` in `zeno_simulate`'s encodings, plus `claimedDeposit` (decimal string); every outbox message's `outboxId` is `null`. A failed command is `{"ok":false,"error":{"kind","message"}}` with kind `bad_command` (a line that does not decode, a budget refusal, or a `setStorage` refusal) or `halt` (the plugin refused the input, or the executor's effects check refused its effects). The input that halts changes no state, but uses up its input index; a `deploy` or `upgrade` that halts after staging keeps the inputs staged before it. The session continues after either kind.
+
+`serve` prints `{"listen":"<address>"}` once it listens. `--listen` must name host `127.0.0.1` or `::1`, else exit 2; port 0 picks a free port, and the printed address names it. `POST /v1/run` takes exactly `{"commands":[...]}` (400 otherwise) and answers `{"results":[...]}`, one `run` result per command. `GET /v1/version` answers the `version` output. Both answer `OPTIONS` preflights; another method gets 405 and another path 404. A `Host` header other than `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>` gets 403, which blocks DNS rebinding. A request with no `Origin` header is served. One `Origin` of `http://localhost[:port]`, `http://127.0.0.1[:port]` or an `--allow-origin` entry gets `Access-Control-Allow-Origin`; any other `Origin`, or more than one, gets 403. `--allow-origin` takes an `http` or `https` `scheme://host[:port]` exactly, and a malformed one exits 2.
+
+`serve` limits a request. It needs `Content-Type: application/json` (415), a body of at most 2 MiB (413) sent within 10 s (408), and at most 64 commands (400). At most 4 requests run at once (503). Each request runs all its commands in one child process, `zeno-exec run --network <n> --gas-budget 200000000`, started from the `serve` binary's own path. State therefore carries across one request's commands, and nothing survives between requests. The child gets its own `TMPDIR`, which `serve` removes after the child exits. Once its body is read, a request's commands have 10 s: then the child is killed and the answer is 504 at once. A child that crashes or writes the wrong number of results gives 500 `session failed`. A call or deposit whose `plasmaLimit` passes the 200,000,000 budget left gets a `bad_command` result. On SIGINT or SIGTERM `serve` stops accepting, waits up to 5 s for requests in flight, kills the running children, removes their temporary directories and exits 0. A SIGKILL of `serve` itself can leave a child running until its current command ends: about 500 s for the many-locals module the tests use, and no fixed bound for others, because gas does not bound its time (see the next paragraph). The child stops at its next result write, because its stdout is a pipe to the dead `serve`.
+
+The gas table (`plugins/wasm/internal/module/wasm-gas-table-v1.json`) has no charge for a function's declared locals, so entering a function that declares many locals costs time its gas does not count. One `run` call at a high `plasmaLimit` can therefore take minutes. `serve` kills a request's child 10 s after the request's body is read.
+
+`serve` is a local developer tool, not a service. Never expose it: no reverse proxy, port forward or tunnel, because those pass the loopback and `Host` checks on the developer's behalf. It runs caller-chosen modules on the host.
+
+`scripts/release-zeno-exec.sh <major.minor.patch>` builds `zeno-exec-<os>-<arch>` for `darwin` and `linux` on `amd64` and `arm64`, with `CGO_ENABLED=0`, `-trimpath` and `-ldflags "-X main.version=<version>"`, into `dist/zeno-exec-v<version>/` (ignored by `.gitignore`), writes `SHA256SUMS` sorted by file name, and prints both. It sets `GOTOOLCHAIN=go1.23.12` and fails unless `go version` reports that version, so two runs from clean checkouts of the same commits of this repository and `../go-zenon` give identical `SHA256SUMS`. An uncommitted or untracked file sets `vcs.modified` in the binary and changes its bytes. A malformed version exits 2.
+
+`.github/workflows/zeno-exec-release.yml` runs when a `zeno-exec-v*` tag is pushed. It checks out this repository and go-zenon side by side (because of the `go.mod` `replace`), with go-zenon taken from `GO_ZENON_REPO` at `GO_ZENON_REF`. It installs Go `GO_VERSION`, which must equal the script's `GO_VERSION`, and runs the script with the tag's version. It records a build-provenance attestation, creates the tag's release when missing, and uploads the four binaries and `SHA256SUMS`. Push the `GO_ZENON_REF` commit to `GO_ZENON_REPO` before pushing a tag. `gh attestation verify <file> --repo digitalSloth/go-executor` checks a downloaded binary's provenance. Assets live at `https://github.com/digitalSloth/go-executor/releases/download/zeno-exec-v<version>/zeno-exec-<os>-<arch>`.
+
+A consumer that pins a release relies on the following:
+
+- zeno-wasm-sdk pins one release by `version`, `revision` (the commit the tag names) and the SHA-256 of each of the four binaries, taken from the release's `SHA256SUMS`, keyed by the asset suffix (`darwin-amd64`, `darwin-arm64`, `linux-amd64`, `linux-arm64`) (`crates/cargo-zeno/zeno-exec.pin` in zeno-wasm-sdk).
+- It runs `zeno-exec version`, compares `revision` with the pin, and warns when `modified` is true (`crates/cargo-zeno/src/zeno_exec.rs` in zeno-wasm-sdk).
+- After the workflow publishes a release, set the pin's `version`, `revision` and four checksums together.
+- Never replace a published binary: a pinned consumer refuses bytes that differ from its checksum. The upload step uses `--clobber`, so re-running the workflow for an existing tag overwrites its assets.
+- For how `cargo zeno` finds the binary, see zeno-wasm-sdk's `README.md`.
 
 ## Docker
 
