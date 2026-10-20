@@ -68,6 +68,11 @@ type memoryGrowSurcharge struct {
 	PerPage uint64 `json:"per_page"`
 }
 
+// functionEntry is the artifact's function_entry object.
+type functionEntry struct {
+	LocalsPerGas uint64 `json:"locals_per_gas"`
+}
+
 // surcharges is the artifact's surcharges object.
 type surcharges struct {
 	BrTable    brTableSurcharge    `json:"br_table"`
@@ -107,6 +112,7 @@ type gasTable struct {
 	OpcodeCount                int                        `json:"opcode_count"`
 	Opcodes                    []opcodeEntry              `json:"opcodes"`
 	MemoryModel                memoryModel                `json:"memory_model"`
+	FunctionEntry              functionEntry              `json:"function_entry"`
 	Surcharges                 surcharges                 `json:"surcharges"`
 	HostFunctions              hostFunctions              `json:"host_functions"`
 	PostExecutionEffectCharges postExecutionEffectCharges `json:"post_execution_effect_charges"`
@@ -149,6 +155,9 @@ func mustParseGasTable(raw []byte) gasTable {
 	if !brTableFound {
 		panic("module: gas table has no br_table opcode entry")
 	}
+	if t.FunctionEntry.LocalsPerGas == 0 {
+		panic("module: gas table function_entry.locals_per_gas = 0, want >= 1")
+	}
 
 	return t
 }
@@ -179,6 +188,18 @@ func OpcodeCost(op Opcode) (uint64, bool) {
 // both.
 func BrTableCost(targets int) uint64 {
 	return table.brTableBaseCost + table.Surcharges.BrTable.PerTargetEntry*uint64(targets+1)
+}
+
+// LocalsEntryCost returns the charge a function's entry segment carries for declared locals
+// (parameters excluded): ceil(declared / locals_per_gas), 0 when declared is 0. It never
+// overflows: it divides before rounding up.
+func LocalsEntryCost(declared uint64) uint64 {
+	k := table.FunctionEntry.LocalsPerGas
+	q := declared / k
+	if declared%k != 0 {
+		q++
+	}
+	return q
 }
 
 // MemoryGrowPageCost returns only the per-page surcharge for growing memory by pages pages
@@ -272,9 +293,11 @@ func ceilDiv32(n int) uint64 {
 // immediately follows a segment terminator. A segment runs from a leader up to and
 // including the instruction before the next leader. Its cost is the sum of its own
 // instructions' table costs, charged once immediately before its first instruction; a
-// segment whose total is 0 emits no charge. Two exceptions to "table cost": a br_table
-// contributes BrTableCost(N) -- its base plus one entry per target including the default
-// -- in place of OpcodeCost(0x0E), never both; and a memory.grow contributes only its base
+// segment whose total is 0 emits no charge. A function's entry segment, the one its first
+// instruction leads, also carries LocalsEntryCost of the function's declared locals. Nothing
+// branches to a function's first instruction, so that charge is paid once per call. Two
+// exceptions to "table cost": a br_table contributes BrTableCost(N) -- its base plus one
+// entry per target including the default -- in place of OpcodeCost(0x0E), never both; and a memory.grow contributes only its base
 // opcode cost, its per-page surcharge being charged at run time against the actual growth.
 // A terminator's own cost is paid by the segment that reaches it (control can only reach it
 // by falling into it), never by the segment after it -- a charge placed before

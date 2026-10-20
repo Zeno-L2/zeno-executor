@@ -1885,6 +1885,38 @@ func callVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
+	{
+		idx := nextIndex()
+		blob := segBlob(t, idx)
+		specs = append(specs, vectorSpec{
+			ID:         "CV-LOCALS-1",
+			Purpose:    "a function declaring `MaxLocalsPerFunction` (8,192) `i64` locals pays `ceil(8192 / locals_per_gas)` once at entry: `SUCCESS` at the metered gas",
+			Shape:      "call",
+			BatchID:    2,
+			Ctx:        stdCtx(idx),
+			Args:       codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID: cid2,
+			Module:     localsCallModule(localsDecl(MaxLocalsPerFunction, 0x7E), returnBlobBody(blobOffset, len(blob)), []dataSeg{{offset: blobOffset, bytes: blob}}),
+			WantStatus: codec.StatusSuccess,
+		})
+	}
+
+	{
+		idx := nextIndex()
+		blob := segBlob(t, idx)
+		specs = append(specs, vectorSpec{
+			ID:         "CV-LOCALS-2",
+			Purpose:    "the same call one gas short of that function's entry segment: `OUT_OF_GAS` before its first instruction runs",
+			Shape:      "call",
+			BatchID:    2,
+			Ctx:        stdCtx(idx),
+			Args:       codec.CallL2Args{TargetContract: cid2, PlasmaLimit: module.InitialMemoryCost(1) + costOf(t, 0x10, 0x42, 0x0B, 0x0B) + module.LocalsEntryCost(MaxLocalsPerFunction) - 1},
+			ContractID: cid2,
+			Module:     localsCallModule(localsDecl(MaxLocalsPerFunction, 0x7E), returnBlobBody(blobOffset, len(blob)), []dataSeg{{offset: blobOffset, bytes: blob}}),
+			WantStatus: codec.StatusOutOfGas,
+		})
+	}
+
 	return specs
 }
 

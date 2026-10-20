@@ -70,6 +70,22 @@ func TestOpcodeCostFullTableRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLocalsEntryCost(t *testing.T) {
+	k := table.FunctionEntry.LocalsPerGas
+	for _, c := range []struct {
+		declared, want uint64
+	}{
+		{0, 0},
+		{1, 1},
+		{k, 1},
+		{k + 1, 2},
+	} {
+		if got := LocalsEntryCost(c.declared); got != c.want {
+			t.Errorf("LocalsEntryCost(%d) = %d, want %d", c.declared, got, c.want)
+		}
+	}
+}
+
 func TestWorkedExamples(t *testing.T) {
 	if got := HostCost(HostStorageRead, 100); got != 240 {
 		t.Errorf("HostCost(HostStorageRead, 100) = %d, want 240", got)
@@ -271,6 +287,10 @@ func TestMustParseGasTablePanics(t *testing.T) {
 		{
 			name: "metering_version not 1",
 			json: `{"metering_version":2,"opcode_count":0,"opcodes":[]}`,
+		},
+		{
+			name: "function_entry.locals_per_gas zero",
+			json: `{"metering_version":1,"opcode_count":1,"opcodes":[{"mnemonic":"br_table","opcode":"0x0E","cost":2}]}`,
 		},
 	}
 	for _, c := range cases {

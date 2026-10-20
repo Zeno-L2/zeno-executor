@@ -542,26 +542,28 @@ type instrRecord struct {
 	start, end int
 }
 
-// decodeBody splits a function body into its locals declaration (returned verbatim) and its
-// instruction stream, decoding the stream once into a slice of instrRecord with the same
+// decodeBody splits a function body into its locals declaration (returned verbatim, with the
+// sum of its group counts as declared) and its instruction stream, decoding the stream once into a slice of instrRecord with the same
 // classifyOpcode discipline validateBody uses (binary.go:396): the opcode is classified before
 // any immediate is read, so an opcode outside the accepted set is rejected instead of
 // desynchronizing the decoder. The final end -- the one that takes a depth seeded at 1 to 0 --
 // is located by decoding, not by index; a stream that runs out before reaching depth 0, or
 // that leaves bytes after that end, is ErrNotValidated. A zero-length instruction stream hits
 // the former case immediately.
-func decodeBody(body []byte) (localsBytes, instrBytes []byte, instrs []instrRecord, finalEnd int, err error) {
+func decodeBody(body []byte) (localsBytes, instrBytes []byte, instrs []instrRecord, finalEnd int, declared uint64, err error) {
 	lr := newReader(body)
 	localsCount, err := lr.readVecCount()
 	if err != nil {
-		return nil, nil, nil, 0, err
+		return nil, nil, nil, 0, 0, err
 	}
 	for i := uint32(0); i < localsCount; i++ {
-		if _, err := lr.readVarU32(); err != nil {
-			return nil, nil, nil, 0, err
+		n, err := lr.readVarU32()
+		if err != nil {
+			return nil, nil, nil, 0, 0, err
 		}
+		declared += uint64(n)
 		if _, err := lr.readByte(); err != nil {
-			return nil, nil, nil, 0, err
+			return nil, nil, nil, 0, 0, err
 		}
 	}
 	localsBytes = body[:lr.pos]
@@ -571,20 +573,20 @@ func decodeBody(body []byte) (localsBytes, instrBytes []byte, instrs []instrReco
 	depth := 1
 	for {
 		if r.atEnd() {
-			return nil, nil, nil, 0, fmt.Errorf("instruction stream ends before its implicit block closes: %w", ErrNotValidated)
+			return nil, nil, nil, 0, 0, fmt.Errorf("instruction stream ends before its implicit block closes: %w", ErrNotValidated)
 		}
 		start := r.pos
 		op, err := r.readByte()
 		if err != nil {
-			return nil, nil, nil, 0, err
+			return nil, nil, nil, 0, 0, err
 		}
 		if err := classifyOpcode(r, op); err != nil {
-			return nil, nil, nil, 0, fmt.Errorf("opcode 0x%02X: %w", op, err)
+			return nil, nil, nil, 0, 0, fmt.Errorf("opcode 0x%02X: %w", op, err)
 		}
 		switch {
 		case op == 0x02 || op == 0x03 || op == 0x04: // block, loop, if
 			if _, err := r.readByte(); err != nil { // block type
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 			depth++
 		case op == 0x05: // else: neutral
@@ -592,58 +594,58 @@ func decodeBody(body []byte) (localsBytes, instrBytes []byte, instrs []instrReco
 			depth--
 		case op == 0x0C || op == 0x0D: // br, br_if
 			if _, err := r.readVarU32(); err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x0E: // br_table
 			n, err := r.readVecCount()
 			if err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 			for i := uint32(0); i < n; i++ {
 				if _, err := r.readVarU32(); err != nil {
-					return nil, nil, nil, 0, err
+					return nil, nil, nil, 0, 0, err
 				}
 			}
 			if _, err := r.readVarU32(); err != nil { // default target
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x10: // call
 			if _, err := r.readVarU32(); err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x11: // call_indirect
 			if _, err := r.readVarU32(); err != nil { // type index
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 			if _, err := r.readVarU32(); err != nil { // table index
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op >= 0x20 && op <= 0x22: // local.get, local.set, local.tee
 			if _, err := r.readVarU32(); err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x23 || op == 0x24: // global.get, global.set
 			if _, err := r.readVarU32(); err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op >= 0x28 && op <= 0x3E: // memarg loads/stores
 			if _, err := r.readVarU32(); err != nil { // align
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 			if _, err := r.readVarU32(); err != nil { // offset
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x3F || op == 0x40: // memory.size, memory.grow
 			if _, err := r.readByte(); err != nil { // reserved memory index byte
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x41: // i32.const
 			if _, err := r.readVarS32(); err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		case op == 0x42: // i64.const
 			if _, err := r.readVarS64(); err != nil {
-				return nil, nil, nil, 0, err
+				return nil, nil, nil, 0, 0, err
 			}
 		default:
 			// no immediate
@@ -655,9 +657,9 @@ func decodeBody(body []byte) (localsBytes, instrBytes []byte, instrs []instrReco
 		}
 	}
 	if r.remaining() != 0 {
-		return nil, nil, nil, 0, fmt.Errorf("trailing bytes after the final end: %w", ErrNotValidated)
+		return nil, nil, nil, 0, 0, fmt.Errorf("trailing bytes after the final end: %w", ErrNotValidated)
 	}
-	return localsBytes, instrBytes, instrs, finalEnd, nil
+	return localsBytes, instrBytes, instrs, finalEnd, declared, nil
 }
 
 // instrCost returns rec's metered cost: OpcodeCost for every opcode except br_table, which
@@ -713,9 +715,10 @@ func segmentLeaderTotals(instrBytes []byte, instrs []instrRecord) ([]uint64, err
 // instructions with segment charges, memory.grow and return rewritten in place, the final
 // end's own segment charge if it is itself a leader with a non-zero total (load-bearing: see the
 // emission site below for why), the wrapper's end, a call to __zenon_exit, and the function's own
-// end. base is I+F, the index of the first entity this pass appends.
+// end. The entry segment's charge includes LocalsEntryCost of the declared-locals sum
+// decodeBody returns. base is I+F, the index of the first entity this pass appends.
 func rewriteBody(body []byte, sig funcSig, base uint32) ([]byte, error) {
-	localsBytes, instrBytes, instrs, finalEnd, err := decodeBody(body)
+	localsBytes, instrBytes, instrs, finalEnd, declared, err := decodeBody(body)
 	if err != nil {
 		return nil, err
 	}
@@ -723,6 +726,7 @@ func rewriteBody(body []byte, sig funcSig, base uint32) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	segTotal[0] += LocalsEntryCost(declared)
 
 	out := make([]byte, 0, len(body)+32)
 	out = append(out, localsBytes...)

@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/types"
@@ -640,4 +641,163 @@ func BenchmarkCodeStoreReloadAtBound(b *testing.B) {
 		}
 		b.ReportMetric(float64(gas), "gas/op")
 	})
+}
+
+// countedLoopModule returns a one-page module whose run (type (i32,i32)->i64, function 0) runs
+// calls iters times, counting in mutable i32 global 0, then returns i64 0. types follow run's
+// type at index 1; callees follow run at function index 1.
+func countedLoopModule(calls []byte, iters int32, types []wasmFuncType, callees []wasmFunc) []byte {
+	body := []byte{0x03, 0x40}
+	body = append(body, calls...)
+	body = append(body, 0x23, 0x00, 0x41, 0x01, 0x6A, 0x24, 0x00)
+	body = append(body, 0x23, 0x00, 0x41)
+	body = appendVarS64(body, int64(iters))
+	body = append(body, 0x47, 0x0D, 0x00, 0x0B, 0x42, 0x00, 0x0B)
+
+	return buildWasmModule(wasmModuleSpec{
+		Types:       append([]wasmFuncType{{Params: []byte{0x7F, 0x7F}, Results: []byte{0x7E}}}, types...),
+		Funcs:       append([]wasmFunc{{TypeIdx: 0, Locals: []byte{0x00}, Body: body}}, callees...),
+		MemoryPages: 1,
+		Globals:     1,
+		Exports: []wasmExport{
+			{Name: "memory", Kind: 0x02, Index: 0},
+			{Name: "run", Kind: 0x00, Index: 0},
+		},
+	})
+}
+
+// BenchmarkLocalsZeroing times calls to functions that declare locals, at MaxInputGas, and
+// reports ns/gas over the gas each module actually used and ns/call. The zero-locals child is
+// the plain-call baseline.
+func BenchmarkLocalsZeroing(b *testing.B) {
+	sixteen := bytes.Repeat([]byte{0x10, 0x01}, 16)
+
+	type child struct {
+		name    string
+		calls   []byte
+		iters   int32
+		types   []wasmFuncType
+		callees []wasmFunc
+		perOp   int
+	}
+	flat := func(name string, n uint32, vt byte) child {
+		callee := wasmFunc{TypeIdx: 1, Locals: localsDecl(n, vt), Body: []byte{0x0B}}
+		return child{name, sixteen, 4096, []wasmFuncType{{}}, []wasmFunc{callee}, 16 * 4096}
+	}
+
+	children := []child{flat("flat-0", 0, 0x7F)}
+	for _, vt := range []struct {
+		name string
+		b    byte
+	}{{"i32", 0x7F}, {"i64", 0x7E}} {
+		for _, n := range []uint32{64, 1024, 8192} {
+			children = append(children, flat(fmt.Sprintf("flat-%s-%d", vt.name, n), n, vt.b))
+		}
+	}
+
+	var wideCalls []byte
+	var wideCallees []wasmFunc
+	for i := 1; i <= 127; i++ {
+		wideCalls = append(wideCalls, 0x10)
+		wideCalls = appendVarU32(wideCalls, uint32(i))
+		wideCallees = append(wideCallees, wasmFunc{TypeIdx: 1, Locals: localsDecl(8192, 0x7E), Body: []byte{0x0B}})
+	}
+	children = append(children, child{"wide-i64-8192", wideCalls, 512, []wasmFuncType{{}}, wideCallees, 127 * 512})
+
+	deepCalls := []byte{0x41}
+	deepCalls = appendVarS64(deepCalls, 510)
+	deepCalls = append(deepCalls, 0x10, 0x01)
+	deepCallee := wasmFunc{
+		TypeIdx: 1,
+		Locals:  localsDecl(8191, 0x7E),
+		Body:    []byte{0x20, 0x00, 0x04, 0x40, 0x20, 0x00, 0x41, 0x01, 0x6B, 0x10, 0x01, 0x0B, 0x0B},
+	}
+	children = append(children, child{"deep-i64-8191", deepCalls, 128, []wasmFuncType{{Params: []byte{0x7F}}}, []wasmFunc{deepCallee}, 511 * 128})
+
+	eng := newBenchEngine(b)
+	frame := benchFrame(b)
+
+	for _, c := range children {
+		m := instrumentFor(b, countedLoopModule(c.calls, c.iters, c.types, c.callees))
+
+		out, err := eng.Run(engine.HostContext{State: &mapState{}}, m.hash, m.inst, frame, MaxInputGas)
+		if err != nil {
+			b.Fatalf("%s: warm-up Run: %v", c.name, err)
+		}
+		if out.Kind != engine.Returned {
+			b.Fatalf("%s: warm-up Run: Kind = %v, want Returned", c.name, out.Kind)
+		}
+		gas := out.GasUsed - module.InitialMemoryCost(1)
+
+		b.Run(c.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := eng.Run(engine.HostContext{State: &mapState{}}, m.hash, m.inst, frame, MaxInputGas); err != nil {
+					b.Fatal(err)
+				}
+			}
+			elapsed := float64(b.Elapsed().Nanoseconds()) / float64(b.N)
+			b.ReportMetric(float64(gas), "gas/op")
+			b.ReportMetric(elapsed/float64(gas), "ns/gas")
+			b.ReportMetric(elapsed/float64(c.perOp), "ns/call")
+		})
+	}
+}
+
+// BenchmarkLocalsLoopAtBudget times a loop that calls a function declaring MaxLocalsPerFunction
+// i64 locals until its gas budget runs out, at three budgets, and reports ns/gas over the budget.
+func BenchmarkLocalsLoopAtBudget(b *testing.B) {
+	m := instrumentFor(b, buildWasmModule(wasmModuleSpec{
+		Types: []wasmFuncType{
+			{Params: []byte{0x7F, 0x7F}, Results: []byte{0x7E}},
+			{},
+		},
+		Funcs: []wasmFunc{
+			{TypeIdx: 0, Locals: []byte{0x00}, Body: []byte{0x03, 0x40, 0x10, 0x01, 0x0C, 0x00, 0x0B, 0x42, 0x00, 0x0B}},
+			{TypeIdx: 1, Locals: localsDecl(MaxLocalsPerFunction, 0x7E), Body: []byte{0x0B}},
+		},
+		MemoryPages: 1,
+		Exports: []wasmExport{
+			{Name: "memory", Kind: 0x02, Index: 0},
+			{Name: "run", Kind: 0x00, Index: 0},
+		},
+	}))
+
+	eng := newBenchEngine(b)
+	frame := benchFrame(b)
+
+	out, err := eng.Run(engine.HostContext{State: &mapState{}}, m.hash, m.inst, frame, callPlasmaLimit)
+	if err != nil {
+		b.Fatalf("warm-up Run: %v", err)
+	}
+	if out.Kind != engine.OutOfGas {
+		b.Fatalf("warm-up Run: Kind = %v, want OutOfGas", out.Kind)
+	}
+	if out.GasUsed != callPlasmaLimit {
+		b.Fatalf("warm-up Run: GasUsed = %d, want %d", out.GasUsed, uint64(callPlasmaLimit))
+	}
+
+	for _, c := range []struct {
+		name   string
+		budget uint64
+	}{
+		{"budget-100k", 100_000},
+		{"plasmaLimit", callPlasmaLimit},
+		{"MaxInputGas", MaxInputGas},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				out, err := eng.Run(engine.HostContext{State: &mapState{}}, m.hash, m.inst, frame, c.budget)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if out.Kind != engine.OutOfGas {
+					b.Fatalf("Kind = %v, want OutOfGas", out.Kind)
+				}
+			}
+			b.ReportMetric(float64(c.budget), "gas/op")
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(c.budget), "ns/gas")
+		})
+	}
 }
