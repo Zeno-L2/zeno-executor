@@ -4,11 +4,12 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // TestMain lets the test binary act as the session child that serve
-// starts: "__child <network> <gas budget>" runs the command loop, and
-// "__crash" exits at once.
+// starts: "__child <network> <gas budget>" runs the command loop,
+// "__crash" exits at once, and "__hang" sleeps until it is killed.
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -20,6 +21,9 @@ func TestMain(m *testing.M) {
 			os.Exit(0)
 		case "__crash":
 			os.Exit(3)
+		case "__hang":
+			time.Sleep(time.Hour)
+			os.Exit(0)
 		}
 	}
 	os.Exit(m.Run())

@@ -13,7 +13,6 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm"
 	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
 )
 
@@ -302,44 +301,22 @@ func waitSlotsFree(t *testing.T, within time.Duration) {
 	}
 }
 
-// manyLocalsModule is a valid module whose run calls, in a loop, a
-// function that declares 8192 i64 locals. The gas table charges the
-// call a flat amount, so the loop burns wall time far faster than gas.
-func manyLocalsModule() []byte {
-	out := append([]byte{}, wasmHeader...)
-	out = append(out, section(1, []byte{0x02, 0x60, 0x00, 0x00, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E})...)
-	out = append(out, section(3, []byte{0x02, 0x00, 0x01})...)
-	out = append(out, section(5, []byte{0x01, 0x00, 0x01})...)
-	exportSec := []byte{0x02}
-	exportSec = appendName(exportSec, "memory")
-	exportSec = append(exportSec, 0x02, 0x00)
-	exportSec = appendName(exportSec, "run")
-	exportSec = append(exportSec, 0x00, 0x01)
-	out = append(out, section(7, exportSec)...)
-	f := []byte{0x01, 0x80, 0x40, 0x7E, 0x0B}
-	run := []byte{0x00, 0x03, 0x40, 0x10, 0x00, 0x0C, 0x00, 0x0B, 0x42, 0x00, 0x0B}
-	code := []byte{0x02}
-	code = appendVarU32(code, uint32(len(f)))
-	code = append(code, f...)
-	code = appendVarU32(code, uint32(len(run)))
-	code = append(code, run...)
-	out = append(out, section(10, code)...)
-	return out
+// hangBody is a request body the hanging child never answers.
+const hangBody = `{"commands":[{"op":"nope"}]}`
+
+// newHangHandler returns a handler whose session child sleeps until it is killed.
+func newHangHandler(t *testing.T) http.Handler {
+	t.Helper()
+	h, err := NewHandler(ServeConfig{Network: "testnet", ChildCommand: []string{os.Args[0], "__hang"}, Port: testPort})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return h
 }
 
-func TestServeKillsSlowChild(t *testing.T) {
-	old := requestTimeout
-	requestTimeout = 2 * time.Second
-	t.Cleanup(func() { requestTimeout = old })
-
-	raw := manyLocalsModule()
-	if _, err := wasm.CheckModule(raw, nil); err != nil {
-		t.Fatalf("the many-locals module must validate: %v", err)
-	}
-	h := newTestHandler(t)
-	call := fmt.Sprintf(`{"op":"call","sender":%q,"contractId":%q,"payload":"","plasmaLimit":10000000}`, senderHex, firstContractID())
-	body := `{"commands":[` + deployLine(raw) + `,` + call + `]}`
-
+// childPID polls for the first registered session child. The channel carries its PID, or is
+// closed after 4 s with no child observed.
+func childPID() <-chan int {
 	pids := make(chan int, 1)
 	go func() {
 		for i := 0; i < 400; i++ {
@@ -354,24 +331,51 @@ func TestServeKillsSlowChild(t *testing.T) {
 		}
 		close(pids)
 	}()
+	return pids
+}
 
-	start := time.Now()
-	rec := do(h, "POST", "/v1/run", "application/json", "", okHost, body)
-	if rec.Code != 504 {
-		t.Fatalf("status = %d, want 504", rec.Code)
-	}
-	if d := time.Since(start); d > requestTimeout+2*time.Second {
-		t.Fatalf("request took %v, want under %v", d, requestTimeout+2*time.Second)
-	}
-	waitSlotsFree(t, 2*time.Second)
-
+// receivePID returns the PID childPID reported, and fails when no child was observed.
+func receivePID(t *testing.T, pids <-chan int) int {
+	t.Helper()
 	pid, ok := <-pids
 	if !ok {
 		t.Fatal("no session child was observed")
 	}
+	return pid
+}
+
+// requireChildExited fails unless the child with the given PID is gone. It first waits for the
+// request slots to free: a slot is released only after the child has been reaped, so a killed
+// child is no longer a zombie by then.
+func requireChildExited(t *testing.T, pid int) {
+	t.Helper()
+	waitSlotsFree(t, 5*time.Second)
 	if err := syscall.Kill(pid, 0); err == nil {
 		t.Fatalf("session child %d still exists", pid)
 	}
+}
+
+func TestServeKillsSlowChild(t *testing.T) {
+	old := requestTimeout
+	requestTimeout = 2 * time.Second
+	t.Cleanup(func() { requestTimeout = old })
+
+	h := newHangHandler(t)
+	pids := childPID()
+
+	start := time.Now()
+	rec := do(h, "POST", "/v1/run", "application/json", "", okHost, hangBody)
+	if rec.Code != 504 {
+		t.Fatalf("status = %d, want 504", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "request timed out") {
+		t.Fatalf("body = %q, want it to contain %q", rec.Body, "request timed out")
+	}
+	if d := time.Since(start); d > requestTimeout+2*time.Second {
+		t.Fatalf("request took %v, want under %v", d, requestTimeout+2*time.Second)
+	}
+
+	requireChildExited(t, receivePID(t, pids))
 	childMu.Lock()
 	n := len(children)
 	childMu.Unlock()
@@ -413,11 +417,16 @@ func TestServeRemovesRequestTempDir(t *testing.T) {
 	old := requestTimeout
 	requestTimeout = time.Second
 	t.Cleanup(func() { requestTimeout = old })
-	call := fmt.Sprintf(`{"op":"call","sender":%q,"contractId":%q,"payload":"","plasmaLimit":10000000}`, senderHex, firstContractID())
-	body := `{"commands":[` + deployLine(manyLocalsModule()) + `,` + call + `]}`
-	if rec := do(h, "POST", "/v1/run", "application/json", "", okHost, body); rec.Code != 504 {
+	hang := newHangHandler(t)
+	pids := childPID()
+	rec = do(hang, "POST", "/v1/run", "application/json", "", okHost, hangBody)
+	if rec.Code != 504 {
 		t.Fatalf("slow: status = %d, want 504", rec.Code)
 	}
+	if !strings.Contains(rec.Body.String(), "request timed out") {
+		t.Fatalf("slow: body = %q, want it to contain %q", rec.Body, "request timed out")
+	}
+	requireChildExited(t, receivePID(t, pids))
 	left("after a 504")
 }
 
@@ -431,31 +440,21 @@ func TestStopSessionsRemovesRequestTempDir(t *testing.T) {
 	})
 
 	h := newTestHandler(t)
-	call := fmt.Sprintf(`{"op":"call","sender":%q,"contractId":%q,"payload":"","plasmaLimit":10000000}`, senderHex, firstContractID())
-	body := `{"commands":[` + deployLine(manyLocalsModule()) + `,` + call + `]}`
-	codes := make(chan int, 1)
-	go func() { codes <- do(h, "POST", "/v1/run", "application/json", "", okHost, body).Code }()
-	for i := 0; ; i++ {
-		childMu.Lock()
-		n := len(children)
-		childMu.Unlock()
-		if n == 1 {
-			break
-		}
-		if i == 400 {
-			t.Fatal("no session child was observed")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	hang := newHangHandler(t)
+	pids := childPID()
+	recs := make(chan *httptest.ResponseRecorder, 1)
+	go func() { recs <- do(hang, "POST", "/v1/run", "application/json", "", okHost, hangBody) }()
+	pid := receivePID(t, pids)
 
 	StopSessions()
 	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
 		t.Fatalf("%d entries left in the temporary directory", len(ents))
 	}
-	if code := <-codes; code != 500 {
-		t.Fatalf("status = %d, want 500", code)
+	rec := <-recs
+	if rec.Code != 500 || !strings.Contains(rec.Body.String(), "session failed") {
+		t.Fatalf("status = %d, body = %q, want 500 session failed", rec.Code, rec.Body)
 	}
-	waitSlotsFree(t, time.Second)
+	requireChildExited(t, pid)
 	if rec := do(h, "POST", "/v1/run", "application/json", "", okHost, `{"commands":[{"op":"nope"}]}`); rec.Code != 500 {
 		t.Fatalf("after StopSessions: status = %d, want 500", rec.Code)
 	}

@@ -273,6 +273,8 @@ Vector IDs are stable names; gaps in numbering are intentional.
 | `CV-QUOTA-8` | `BuyStorage` whose `purchased + bytes` is `2^64` is `VALIDATION_FAILED`, and its receipt carries the unchanged `CodeHash` |
 | `EXEC-FAIL-OUTBOX-1` | a failed input carrying a deposit, proving §14.3's discard |
 | `CV-FRAME-1` | the contract returns the frame's `momentum_hash` as its `ReturnData` and takes its `input_index` from the frame: `SUCCESS`, and `return_hash` commits the momentum hash |
+| `CV-LOCALS-1` | a function declaring `MaxLocalsPerFunction` (8,192) `i64` locals pays `ceil(8192 / locals_per_gas)` once at entry: `SUCCESS` at the metered gas |
+| `CV-LOCALS-2` | the same call one gas short of that function's entry segment: `OUT_OF_GAS` before its first instruction runs |
 
 `CV-DEPLOY-1` and `CV-DEPLOY-2` together are the single-chunk sizing case: the kind-2 record
 declaring `chunk_count == 1` and the kind-3 chunk that carries the whole module.

@@ -15,14 +15,14 @@
   },
   "unit": "L2 gas (plasma) units",
   "cost_principles": [
-    "1 = trivial: consts, locals, simple integer add/sub/bitwise/shift/rotate, comparisons",
-    "2 = light: loads/stores, mul, clz/ctz/popcnt, global access, select, integer conversions, memory.size",
+    "1 = trivial: consts, locals, simple integer add/sub/bitwise/shift/rotate, comparisons, integer conversions",
+    "2 = light: loads/stores, mul, clz/ctz/popcnt, global access, select, memory.size",
     "5 = integer div/rem (variable-latency) and memory.grow base",
     "branch/call overhead modeled explicitly (br/br_if/br_table=2, return=2, call=5, call_indirect=10)"
   ],
   "block_metering": {
     "model": "basic-block charge injection",
-    "rule": "Gas for straight-line instructions MUST be summed per basic block and decremented once at block entry (the standard fuel model). The observable cost of executing a basic block MUST equal the sum of its instructions' table costs. Branch/call costs are the costs of the branch/call instructions themselves.",
+    "rule": "Gas for straight-line instructions MUST be summed per basic block and decremented once at block entry (the standard fuel model). The observable cost of executing a basic block MUST equal the sum of its instructions' table costs, plus the function_entry locals charge for a function's entry segment. Branch/call costs are the costs of the branch/call instructions themselves.",
     "note": "Instrumentation is deterministic (SPEC.md §11.3). Two implementations MUST decrement identical totals for identical executed basic-block sequences."
   },
   "memory_model": {
@@ -30,6 +30,10 @@
     "memory_grow_base": 5,
     "memory_grow_per_page": 1000,
     "note": "memory.grow base is in the opcode table; per-page surcharge here. Initial memory declared at instantiation is charged as memory_grow_per_page * initial_pages against the input budget before execution begins."
+  },
+  "function_entry": {
+    "locals_per_gas": 2,
+    "rule": "A locally defined function's entry segment, the basic block led by the first instruction of its body, costs ceil(L / locals_per_gas) more than the sum of its instructions' table costs. L is the sum of the counts in the function's locals vector (its declared locals); parameters are not counted. ceil(L / k) = (L + k - 1) // k, so L = 0 adds nothing. The charge is part of that segment's single decrement, so it is paid once per call, whether by call, call_indirect or the runtime's call of run, before the function's first instruction runs."
   },
   "opcode_count": 104,
   "opcodes": [

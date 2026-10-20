@@ -3554,6 +3554,40 @@ func checkCVFRAME1(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// localsEntryCharge is the entry charge of a function declaring MaxLocalsPerFunction locals,
+// derived from testLocalsPerGas rather than module.LocalsEntryCost, which is the generator's own
+// path.
+const localsEntryCharge = (MaxLocalsPerFunction + testLocalsPerGas - 1) / testLocalsPerGas
+
+// localsCallPath is the original opcodes the CV-LOCALS-* modules execute outside the callee's
+// locals: call, i64.const, the callee's end and run's end.
+var localsCallPath = []byte{0x10, 0x42, 0x0B, 0x0B}
+
+// checkCVLOCALS1 checks that the call pays the callee's entry charge once: gas_used is the
+// initial memory charge, the executed opcodes, the entry charge and the effect charge.
+func checkCVLOCALS1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkPathGas(t, vec, 1, localsEntryCharge, localsCallPath)
+}
+
+// checkCVLOCALS2 checks that the budget sits one gas short of everything but the effect charge:
+// the shared OUT_OF_GAS base, then a plasma_limit one below the entry segment's end.
+func checkCVLOCALS2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	checkOutOfGasBase(t, vec)
+	want := module.InitialMemoryCost(1) + localsEntryCharge - 1
+	for _, op := range localsCallPath {
+		cost, ok := module.OpcodeCost(module.Opcode(op))
+		if !ok {
+			t.Fatalf("no gas-table cost for opcode 0x%02X", op)
+		}
+		want += cost
+	}
+	if *vec.Input.PlasmaLimit != want {
+		t.Fatalf("plasma_limit = %d, want %d", *vec.Input.PlasmaLimit, want)
+	}
+}
+
 // abortCharge is abort's charge for dataLen bytes: 1 + 10 *
 // ceil(dataLen / 32).
 func abortCharge(n uint64) uint64 { return 1 + 10*((n+31)/32) }
@@ -3777,6 +3811,8 @@ func checkConditions(t *testing.T, vec vectorJSON, status string, want blobCondi
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-002":           checkN1WitnessBackendTripwire,
 	"CV-FRAME-1":         checkCVFRAME1,
+	"CV-LOCALS-1":        checkCVLOCALS1,
+	"CV-LOCALS-2":        checkCVLOCALS2,
 	"EXEC-FAIL-OUTBOX-1": checkN2DiscardNotVacuous,
 	"EXEC-006":           checkEXEC006DescendingLocalKeys,
 	"EXEC-012":           checkEXEC012AbsentRead,

@@ -173,6 +173,9 @@ type chargeCase struct {
 	code    []byte
 	arg0    int32
 	wantOps []byte
+	// declared is the sum of the counts in locals: the function's entry segment pays
+	// module.LocalsEntryCost(declared) on top of its instructions' costs.
+	declared uint64
 }
 
 // chargeCases returns the six required cases: a taken br_if, a false if condition, a branch
@@ -252,8 +255,9 @@ func chargeCases() []chargeCase {
 			wantOps: []byte{0x20, 0x04, 0x42, 0x1A, 0x05, 0x42, 0x0B},
 		},
 		{
-			name:   "loop-back edge",
-			locals: []byte{0x01, 0x01, 0x7F}, // 1 group: 1 i32 local (index 2)
+			name:     "loop-back edge",
+			locals:   []byte{0x01, 0x01, 0x7F}, // 1 group: 1 i32 local (index 2)
+			declared: 1,
 			code: []byte{
 				0x41, 0x03, // i32.const 3
 				0x21, 0x02, // local.set 2
@@ -270,13 +274,43 @@ func chargeCases() []chargeCase {
 			// loop (0x03) is itself a terminator, so it belongs to the prologue's segment, not
 			// the segment after it; the loop's own end is reached by iteration 3's fall-through
 			// and forms its own one-instruction segment (br_if, the segment before it, is also
-			// a terminator), distinct from the final i64.const/end segment that follows it.
+			// a terminator), distinct from the final i64.const/end segment that follows it. The
+			// declared local's entry charge is part of the prologue segment and is paid once, not
+			// per iteration.
 			wantOps: []byte{
 				0x41, 0x21, 0x03, // prologue: i32.const, local.set, loop
 				0x20, 0x41, 0x6B, 0x22, 0x0D, // loop-body segment, iteration 1
 				0x20, 0x41, 0x6B, 0x22, 0x0D, // iteration 2
 				0x20, 0x41, 0x6B, 0x22, 0x0D, // iteration 3 (br_if false, falls through)
 				0x0B,       // the loop's own end, its own segment
+				0x42, 0x0B, // i64.const, end (function)
+			},
+		},
+		{
+			// A body whose first instruction is a loop: the loop terminates the entry segment, so
+			// the back-edges land in the next segment and the entry charge stays outside the loop.
+			name:     "loop first",
+			locals:   []byte{0x01, 0x01, 0x7F}, // 1 group: 1 i32 local (index 2)
+			declared: 1,
+			code: []byte{
+				0x03, 0x40, // loop (void)
+				0x20, 0x02, // local.get 2
+				0x41, 0x01, // i32.const 1
+				0x6A,       // i32.add
+				0x22, 0x02, // local.tee 2
+				0x41, 0x03, // i32.const 3
+				0x49,       // i32.lt_u
+				0x0D, 0x00, // br_if 0
+				0x0B,       // end (loop)
+				0x42, 0x2A, // i64.const 42
+				0x0B, // end (function)
+			},
+			wantOps: []byte{
+				0x03,                                     // loop
+				0x20, 0x41, 0x6A, 0x22, 0x41, 0x49, 0x0D, // iteration 1
+				0x20, 0x41, 0x6A, 0x22, 0x41, 0x49, 0x0D, // iteration 2
+				0x20, 0x41, 0x6A, 0x22, 0x41, 0x49, 0x0D, // iteration 3 (br_if false, falls through)
+				0x0B,       // the loop's own end
 				0x42, 0x0B, // i64.const, end (function)
 			},
 		},
@@ -321,7 +355,7 @@ func TestInstrumentedChargeMatchesExecutedPath(t *testing.T) {
 				t.Fatalf("Instrument = %v, want nil", err)
 			}
 
-			want := opsCost(t, c.wantOps...)
+			want := opsCost(t, c.wantOps...) + module.LocalsEntryCost(c.declared)
 			ret, used := gasUsed(t, instrumented, 1_000_000, c.arg0, 0)
 			if ret != 42 {
 				t.Errorf("run = %d, want 42", ret)
