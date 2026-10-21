@@ -3,6 +3,7 @@ package wasm
 import (
 	"bytes"
 	"errors"
+	"math"
 	"math/big"
 	"sort"
 	"testing"
@@ -1917,6 +1918,8 @@ func callVectors(t *testing.T) []vectorSpec {
 		})
 	}
 
+	specs = append(specs, moduleVectors(t, nextIndex)...)
+
 	return specs
 }
 
@@ -2036,4 +2039,250 @@ func unsupportedVector() vectorSpec {
 		},
 		WantStatus: codec.StatusUnsupportedOperation,
 	}
+}
+
+// growExpectBody is i32.const delta; memory.grow; i32.const want; i32.ne; if; unreachable; end:
+// it traps unless memory.grow by delta returns want.
+func growExpectBody(delta, want int32) []byte {
+	b := []byte{0x41}
+	b = appendVarS64(b, int64(delta))
+	b = append(b, 0x40, 0x00, 0x41)
+	b = appendVarS64(b, int64(want))
+	return append(b, 0x47, 0x04, 0x40, 0x00, 0x0B)
+}
+
+// constI32 is i32.const v; constI64 is i64.const v.
+func constI32(v int64) []byte { return appendVarS64([]byte{0x41}, v) }
+func constI64(v int64) []byte { return appendVarS64([]byte{0x42}, v) }
+
+// cat concatenates byte slices into a new slice.
+func cat(parts ...[]byte) []byte {
+	var b []byte
+	for _, p := range parts {
+		b = append(b, p...)
+	}
+	return b
+}
+
+// indirectModule is a module whose run (type 0, (i32,i32)->i64) carries body and whose second
+// function f (type 1, ()->()) fills table slot 0 of a two-slot table; slot 1 stays
+// uninitialized. The one data segment holds blob at blobOffset.
+func indirectModule(blob, body []byte) []byte {
+	return buildWasmModule(wasmModuleSpec{
+		Types: []wasmFuncType{
+			{Params: []byte{0x7F, 0x7F}, Results: []byte{0x7E}},
+			{},
+		},
+		Funcs: []wasmFunc{
+			{TypeIdx: 0, Locals: []byte{0x00}, Body: body},
+			{TypeIdx: 1, Locals: []byte{0x00}, Body: []byte{0x0B}},
+		},
+		MemoryPages: 1,
+		TableMin:    2,
+		Elements:    []wasmElem{{Offset: 0, Funcs: []uint32{1}}},
+		Exports: []wasmExport{
+			{Name: "memory", Kind: 0x02, Index: 0},
+			{Name: "run", Kind: 0x00, Index: 0},
+		},
+		Data: []dataSeg{{offset: blobOffset, bytes: blob}},
+	})
+}
+
+// moduleVectors returns the trap, r < 0, frame, memory, storage_read, event and deposit-refund
+// vectors, drawing their indices from nextIndex.
+func moduleVectors(t *testing.T, nextIndex func() uint64) []vectorSpec {
+	var specs []vectorSpec
+	zero := []byte{0x00}
+
+	// row returns a call-shape spec for the next index; the caller sets Module and any field
+	// beyond the defaults.
+	row := func(idx uint64, id, purpose string, status codec.Status) vectorSpec {
+		return vectorSpec{
+			ID:         id,
+			Purpose:    purpose,
+			Shape:      "call",
+			BatchID:    2,
+			Ctx:        stdCtx(idx),
+			Args:       codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit},
+			ContractID: cid2,
+			WantStatus: status,
+		}
+	}
+
+	trapRows := []struct {
+		id, purpose string
+		indirect    bool
+		code        func() []byte
+	}{
+		{"CV-TRAP-DIV-1", "integer division by zero (`i32.div_u`) traps: `RUNTIME_FAULT` at the metered gas", false,
+			func() []byte { return cat(constI32(1), constI32(0), []byte{0x6E, 0x1A}) }},
+		{"CV-TRAP-OVF-1", "`i32.div_s` of `-2^31` by `-1` overflows and traps: `RUNTIME_FAULT` at the metered gas", false,
+			func() []byte { return cat(constI32(-2147483648), constI32(-1), []byte{0x6D, 0x1A}) }},
+		{"CV-TRAP-MEM-1", "an `i32.load` whose four bytes cross the end of memory traps, though its first three bytes are in bounds: `RUNTIME_FAULT` at the metered gas", false,
+			func() []byte { return cat(constI32(65533), []byte{0x28, 0x02, 0x00, 0x1A}) }},
+		{"CV-TRAP-TABLE-1", "a `call_indirect` past the end of the table traps: `RUNTIME_FAULT` at the metered gas", true,
+			func() []byte { return cat(constI32(2), []byte{0x11, 0x01, 0x00}) }},
+		{"CV-TRAP-NULL-1", "a `call_indirect` to an uninitialized table element traps: `RUNTIME_FAULT` at the metered gas", true,
+			func() []byte { return cat(constI32(1), []byte{0x11, 0x01, 0x00}) }},
+		{"CV-TRAP-SIG-1", "a `call_indirect` whose expected type differs from the function's type traps: `RUNTIME_FAULT` at the metered gas", true,
+			func() []byte { return cat(constI32(0), constI32(0), constI32(0), []byte{0x11, 0x00, 0x00, 0x1A}) }},
+	}
+	for _, tr := range trapRows {
+		idx := nextIndex()
+		empty := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx})
+		body := cat(tr.code(), returnBlobBody(blobOffset, len(empty)))
+		v := row(idx, tr.id, tr.purpose, codec.StatusRuntimeFault)
+		if tr.indirect {
+			v.Module = indirectModule(empty, body)
+		} else {
+			v.Module = blobModuleBody(empty, body)
+		}
+		specs = append(specs, v)
+	}
+
+	for _, neg := range []struct {
+		id, purpose string
+		r           int64
+	}{
+		{"CV-NEG-1", "`run` returns `-7`: `REVERT` with `abort_code` 7, empty revert data and a zero `return_hash`", -7},
+		{"CV-NEG-2", "`run` returns `-2^63`: `(-r)` truncated to `i32` is 0, so `REVERT` with `abort_code` 0", math.MinInt64},
+	} {
+		idx := nextIndex()
+		v := row(idx, neg.id, neg.purpose, codec.StatusRevert)
+		v.Module = buildWasmModule(runModuleSpec(nil, 1, zero, cat(constI64(neg.r), []byte{0x0B}), nil))
+		specs = append(specs, v)
+	}
+
+	{
+		idx := nextIndex()
+		sentinel := bytes.Repeat([]byte{0xEE}, 24)
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx, ReturnData: sentinel})
+		if n := bytes.Count(blob, sentinel); n != 1 {
+			t.Fatalf("CV-FRAME-2: the sentinel occurs %d times in the blob, want 1", n)
+		}
+		at := uint32(bytes.Index(blob, sentinel))
+		body := cat(frameCopy(blobOffset+at, 250, 3), returnBlobBody(blobOffset, len(blob)))
+		v := row(idx, "CV-FRAME-2", "the input frame is written after the data segments: a segment over bytes 0 to 265 keeps only its bytes past the 258-byte frame, and memory past the segment is zero", codec.StatusSuccess)
+		v.Args = codec.CallL2Args{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, Payload: []byte{0xCA, 0xFE, 0xBA, 0xBE}}
+		v.Module = buildWasmModule(runModuleSpec(nil, 1, zero, body,
+			[]dataSeg{{offset: 0, bytes: bytes.Repeat([]byte{0xAA}, 266)}, {offset: blobOffset, bytes: blob}}))
+		specs = append(specs, v)
+	}
+
+	{
+		idx := nextIndex()
+		v := row(idx, "CV-FRAME-3", "a module declaring 0 initial pages cannot hold the frame: `RUNTIME_FAULT`, `run` is never called, and `gas_used` is the initial-memory charge, 0", codec.StatusRuntimeFault)
+		v.Module = buildWasmModule(runModuleSpec(nil, 0, zero, cat(constI64(0), []byte{0x0B}), nil))
+		specs = append(specs, v)
+	}
+
+	// growModule is a one-page module whose run executes body, then returns the segBlob.
+	growModule := func(idx uint64, max uint32, body ...[]byte) []byte {
+		blob := segBlob(t, idx)
+		spec := runModuleSpec(nil, 1, zero, cat(cat(body...), returnBlobBody(blobOffset, len(blob))), []dataSeg{{offset: blobOffset, bytes: blob}})
+		spec.MemoryMax = max
+		return buildWasmModule(spec)
+	}
+	{
+		idx := nextIndex()
+		v := row(idx, "CV-GROW-2", "a module declaring a memory maximum of 1 page: `memory.grow` by 1 returns `-1` and pays no per-page surcharge", codec.StatusSuccess)
+		v.Module = growModule(idx, 1, growExpectBody(1, -1))
+		specs = append(specs, v)
+	}
+	{
+		idx := nextIndex()
+		v := row(idx, "CV-GROW-3", "a module declaring no memory maximum grows from 1 page to exactly `MaxMemory` (64 pages), and one more page returns `-1`", codec.StatusSuccess)
+		v.Module = growModule(idx, 0, growExpectBody(63, 1), growExpectBody(1, -1))
+		specs = append(specs, v)
+	}
+	{
+		idx := nextIndex()
+		v := row(idx, "CV-GROW-4", "a module declaring a memory maximum of 65 pages is capped at `MaxMemory`: it grows to 64 pages, and one more page returns `-1`", codec.StatusSuccess)
+		v.Module = growModule(idx, 65, growExpectBody(63, 1), growExpectBody(1, -1))
+		specs = append(specs, v)
+	}
+	{
+		idx := nextIndex()
+		v := row(idx, "CV-GROW-5", "a module declaring a memory maximum of 2 pages grows to exactly 2: `memory.grow` returns the old size 1, and `memory.size` is then 2", codec.StatusSuccess)
+		sizeIs2 := cat([]byte{0x3F, 0x00}, constI32(2), []byte{0x47, 0x04, 0x40, 0x00, 0x0B})
+		v.Module = growModule(idx, 2, growExpectBody(1, 1), sizeIs2)
+		specs = append(specs, v)
+	}
+
+	// readRow is a storage_read module whose body is hostResultGuardBody-shaped; data holds the
+	// key at 1024 and the blob at 1032.
+	readRow := func(idx uint64, id, purpose string, key string, blob, body []byte, status codec.Status, preState map[domain.Path][]byte) vectorSpec {
+		v := row(idx, id, purpose, status)
+		v.Module = buildWasmModule(runModuleSpec([]string{"storage_read"}, 1, zero, body,
+			[]dataSeg{{offset: 1024, bytes: []byte(key)}, {offset: 1032, bytes: blob}}))
+		v.ExtraPreState = preState
+		return v
+	}
+	value8 := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	pre8 := func() map[domain.Path][]byte { return map[domain.Path][]byte{derive(cid2, []byte("value8")): value8} }
+	{
+		idx := nextIndex()
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx})
+		specs = append(specs, readRow(idx, "CV-READ-3", "`storage_read` of an absent key returns `-1` though its out buffer crosses the end of memory: the absent check precedes the out-buffer check",
+			"missing", blob, hostResultGuardBody(1024, 7, 65532, 8, -1, 1032, len(blob)), codec.StatusSuccess, nil))
+	}
+	{
+		idx := nextIndex()
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx})
+		specs = append(specs, readRow(idx, "CV-READ-4", "`storage_read` returns `-2` when `out_len` is below the value's length, though its out buffer crosses the end of memory: that path never checks the buffer",
+			"value8", blob, hostResultGuardBody(1024, 6, 65534, 4, -2, 1032, len(blob)), codec.StatusSuccess, pre8()))
+	}
+	{
+		idx := nextIndex()
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx})
+		specs = append(specs, readRow(idx, "CV-READ-5", "`storage_read` traps when its out buffer crosses the end of memory, though the value's 8 bytes at `out_ptr` would fit: `RUNTIME_FAULT` at the metered gas, including the read charge",
+			"value8", blob, hostResultGuardBody(1024, 6, 65528, 16, 8, 1032, len(blob)), codec.StatusRuntimeFault, pre8()))
+	}
+	{
+		idx := nextIndex()
+		sentinel := bytes.Repeat([]byte{0xEE}, 16)
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx, ReturnData: sentinel})
+		if n := bytes.Count(blob, sentinel); n != 1 {
+			t.Fatalf("CV-READ-6: the sentinel occurs %d times in the blob, want 1", n)
+		}
+		at := uint32(bytes.Index(blob, sentinel))
+		specs = append(specs, readRow(idx, "CV-READ-6", "`storage_read` into a 16-byte out buffer writes exactly the value's 8 bytes at `out_ptr` and returns 8: the buffer's other 8 bytes keep their contents",
+			"value8", blob, hostResultGuardBody(1024, 6, 1032+at, 16, 8, 1032, len(blob)), codec.StatusSuccess, pre8()))
+	}
+	{
+		idx := nextIndex()
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx})
+		specs = append(specs, readRow(idx, "CV-READ-7", "`storage_read` traps when its key range crosses the end of memory, though the key is absent: `RUNTIME_FAULT` at the metered gas, because the key-range check precedes the absent check",
+			"missing", blob, hostResultGuardBody(65532, 8, 2048, 8, -1, 1032, len(blob)), codec.StatusRuntimeFault, nil))
+	}
+
+	{
+		idx := nextIndex()
+		var events []codec.Event
+		for i := 0; i < 3; i++ {
+			events = append(events, codec.Event{
+				ContractID: cid2,
+				InputIndex: idx,
+				EventIndex: uint32(i),
+				Topics:     []types.Hash{repeatedHash(byte(0xA1 + i))},
+				Data:       []byte{'e', byte('0' + i)},
+			})
+		}
+		blob := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx, Events: events})
+		v := row(idx, "CV-EVENTS-1", "three distinct events: `SUCCESS`, the result lists them in `event_index` order, and the per-input `event_root` promotes the odd third leaf unchanged", codec.StatusSuccess)
+		v.Module = blobModule(blob)
+		specs = append(specs, v)
+	}
+
+	{
+		idx := nextIndex()
+		empty := encodeEffects(t, codec.ContractEffects{Version: codec.ExecutionResultVersion, GlobalInputIndex: idx})
+		v := row(idx, "EXEC-DEP-12", "a `Deposit` of 1000 whose contract claims 0 and emits nothing: `SUCCESS`, and the full refund is the only outbox message, at `outbox_index` 0", codec.StatusSuccess)
+		v.Args = codec.DepositArgs{TargetContract: cid2, PlasmaLimit: callPlasmaLimit, DepositAsset: testAsset(), DepositAmount: u256(1000)}
+		v.Module = blobModule(empty)
+		v.WithdrawalCaps = capsOfOne()
+		specs = append(specs, v)
+	}
+
+	return specs
 }

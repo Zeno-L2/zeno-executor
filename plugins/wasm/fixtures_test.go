@@ -22,6 +22,13 @@ type wasmImport struct {
 	Module  string
 	Name    string
 	TypeIdx uint32
+	Desc    []byte // the raw import descriptor; nil emits a function import of TypeIdx
+}
+
+// wasmCustom is one custom section: its name and the bytes that follow the name.
+type wasmCustom struct {
+	Name    string
+	Payload []byte
 }
 
 // wasmFunc is one locally defined function: its declared type index, its raw locals vector
@@ -46,8 +53,9 @@ type wasmElem struct {
 }
 
 // wasmModuleSpec describes a whole module: arbitrary types, arbitrary imports, arbitrary
-// function bodies, one memory, an optional table, optional globals, arbitrary exports, any
-// number of active element segments and any number of active data segments.
+// function bodies, one memory with an optional maximum, an optional table, optional globals,
+// arbitrary exports, an optional start function, any number of active element segments, any
+// number of active data segments and trailing custom sections.
 // A data segment's offset must be below 2^31: it is emitted as an i32.const immediate, whose
 // signed LEB128 encoding of a larger value is six bytes and is not a valid i32 constant.
 type wasmModuleSpec struct {
@@ -55,15 +63,18 @@ type wasmModuleSpec struct {
 	Imports     []wasmImport
 	Funcs       []wasmFunc
 	MemoryPages uint32
+	MemoryMax   uint32 // the memory's declared maximum in pages; 0 declares none
 	TableMin    uint32
 	Globals     uint32
 	Exports     []wasmExport
+	Start       *uint32 // the start function's index; nil emits no start section
 	Elements    []wasmElem
 	Data        []dataSeg
+	Custom      []wasmCustom // custom sections, emitted after every other section, in order
 }
 
 // buildWasmModule encodes spec as a WASM binary. Sections whose slice is empty are omitted,
-// except the memory section, which is always emitted.
+// except the memory section, which is always emitted. A nil Start emits no start section.
 func buildWasmModule(spec wasmModuleSpec) []byte {
 	var out []byte
 	out = append(out, wasmHeader...)
@@ -81,6 +92,10 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 		for _, im := range spec.Imports {
 			importSec = appendName(importSec, im.Module)
 			importSec = appendName(importSec, im.Name)
+			if im.Desc != nil {
+				importSec = append(importSec, im.Desc...)
+				continue
+			}
 			importSec = append(importSec, 0x00) // func import kind
 			importSec = appendVarU32(importSec, im.TypeIdx)
 		}
@@ -103,6 +118,10 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 	}
 
 	memSec := appendVarU32([]byte{0x01, 0x00}, spec.MemoryPages)
+	if spec.MemoryMax > 0 {
+		memSec = appendVarU32([]byte{0x01, 0x01}, spec.MemoryPages)
+		memSec = appendVarU32(memSec, spec.MemoryMax)
+	}
 	out = append(out, section(5, memSec)...)
 
 	if spec.Globals > 0 {
@@ -121,6 +140,10 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 			exportSec = appendVarU32(exportSec, ex.Index)
 		}
 		out = append(out, section(7, exportSec)...)
+	}
+
+	if spec.Start != nil {
+		out = append(out, section(8, appendVarU32(nil, *spec.Start))...)
 	}
 
 	if len(spec.Elements) > 0 {
@@ -157,6 +180,10 @@ func buildWasmModule(spec wasmModuleSpec) []byte {
 			dataSec = append(dataSec, d.bytes...)
 		}
 		out = append(out, section(11, dataSec)...)
+	}
+
+	for _, c := range spec.Custom {
+		out = append(out, section(0, append(appendName(nil, c.Name), c.Payload...))...)
 	}
 
 	return out

@@ -103,7 +103,7 @@ func seedCodeStore(t *testing.T, p *Plugin, vec vectorJSON, warmInstrumented boo
 	t.Helper()
 
 	if vec.ModuleWasmHex == "" {
-		return // the unsupported_kind, ownership and buy_storage vectors: nothing to seed.
+		return // the unsupported_kind, ownership, buy_storage and undeployed_target vectors: nothing to seed.
 	}
 	raw := mustHex(t, vec.ModuleWasmHex)
 
@@ -111,7 +111,13 @@ func seedCodeStore(t *testing.T, p *Plugin, vec vectorJSON, warmInstrumented boo
 	case vec.InputKind == 4 || vec.InputKind == 5:
 		// The pending record and the chunks prepareModule assembles from. A kind-4 finalize halts
 		// when the record's deployer differs from its sender, so the row's own l1_sender is seeded.
-		seedDeployment(t, p, raw, mustAddress(t, vec.L1Sender), mustHex(t, *vec.PendingMetadataHex))
+		// The record is staged under the input's own code hash, which differs from sha3(module) on
+		// an assembly-hash rejection.
+		stagedHash := vec.Input.CodeHash
+		if vec.InputKind == 5 {
+			stagedHash = vec.Input.NewCodeHash
+		}
+		stageDeployment(t, p, raw, mustHash(t, stagedHash), mustAddress(t, vec.L1Sender), mustHex(t, *vec.PendingMetadataHex))
 	case vec.Shape == "call":
 		// The key loadInstrumented looks the assembled tier up by: the row's pre_state carries
 		// pre_code_hash as this same value.

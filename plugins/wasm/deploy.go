@@ -275,6 +275,12 @@ func (p *Plugin) applyUpgrade(state domain.StateAccess, ctx domain.InputContext,
 	if !ok {
 		return domain.Effects{Status: codec.StatusValidationFailed, ContractID: args.ContractID, CodeHash: oldCodeHash}, nil
 	}
+	// An upgrade must produce a new CodeHash, so a match is a pipeline
+	// failure. The comparison is on the post-instrumentation CodeHash,
+	// because distinct source modules can instrument to the same one.
+	if codeHash == oldCodeHash {
+		return domain.Effects{Status: codec.StatusValidationFailed, ContractID: args.ContractID, CodeHash: oldCodeHash}, nil
+	}
 
 	diff := sortStateDiff([]domain.StateDiffEntry{
 		{Path: derive(args.ContractID, keyCodeHash), Value: codeHash[:]},

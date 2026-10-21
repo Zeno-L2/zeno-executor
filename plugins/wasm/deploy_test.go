@@ -60,6 +60,15 @@ var immutableMetadata = codec.ContractMetadata{Version: codec.ContractMetadataVe
 func seedDeployment(t *testing.T, p *Plugin, raw []byte, sender types.Address, metadata []byte) types.Hash {
 	t.Helper()
 	codeHash := CodeHash(raw)
+	stageDeployment(t, p, raw, codeHash, sender, metadata)
+	return codeHash
+}
+
+// stageDeployment drives a complete DeployStart + DeployChunk* sequence
+// for raw through DecodeInput, staging it under codeHash, which need not
+// be CodeHash(raw). metadata is passed in the DeployStartArgs it decodes.
+func stageDeployment(t *testing.T, p *Plugin, raw []byte, codeHash types.Hash, sender types.Address, metadata []byte) {
+	t.Helper()
 	chunks := splitChunks(raw)
 	decodeStart(t, p, codec.DeployStartArgs{
 		CodeHash:     codeHash,
@@ -71,7 +80,6 @@ func seedDeployment(t *testing.T, p *Plugin, raw []byte, sender types.Address, m
 	for i, c := range chunks {
 		decodeChunk(t, p, sender, codeHash, uint32(i), c)
 	}
-	return codeHash
 }
 
 // upgradeState builds a mapState seeding a deployed contract's keyCodeHash leaf plus an
@@ -1046,6 +1054,69 @@ func TestApplyUpgradeAssemblyVerificationFailure(t *testing.T) {
 	assertUpgradeReads(t, state, id)
 }
 
+func TestApplyUpgradeSameCodeHashValidationFailed(t *testing.T) {
+	currentSpec := runModuleSpec(nil, 1, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, nil)
+	maxSpec := currentSpec
+	maxSpec.MemoryMax = MaxMemoryPages
+	current := buildWasmModule(currentSpec)
+
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"IdenticalModule", current},
+		{"DistinctSourceSameCodeHash", buildWasmModule(maxSpec)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPlugin(t)
+			sender := types.Address{1, 2, 3}
+			id := types.Hash{0x31}
+			owner := callerHash(sender)
+
+			_, currentHash, err := deriveModuleErr(current)
+			if err != nil {
+				t.Fatalf("instrument current: %v", err)
+			}
+			_, stagedHash, err := deriveModuleErr(tc.raw)
+			if err != nil {
+				t.Fatalf("instrument staged: %v", err)
+			}
+			if stagedHash != currentHash {
+				t.Fatalf("instrumented CodeHash = %x, want %x (equal)", stagedHash, currentHash)
+			}
+			preCurrent := CodeHash(current)
+			if tc.name == "DistinctSourceSameCodeHash" && CodeHash(tc.raw) == preCurrent {
+				t.Fatalf("raw CodeHash = %x, want it to differ from the current module's", CodeHash(tc.raw))
+			}
+
+			newCodeHash := seedDeployment(t, p, tc.raw, sender, immutableMetadata)
+			state := upgradeState(id, currentHash, true, []byte{policyOwnerUpgradeable}, true, owner[:])
+			state.values[derive(id, keyPreCodeHash)] = preCurrent[:]
+			eff, err := p.Apply(state, Input{Ctx: domain.InputContext{L1Sender: sender}, Args: codec.UpgradeArgs{ContractID: id, NewCodeHash: newCodeHash}})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if eff.Status != codec.StatusValidationFailed {
+				t.Fatalf("Status = %v, want StatusValidationFailed", eff.Status)
+			}
+			if eff.ContractID != id {
+				t.Fatalf("ContractID = %x, want %x", eff.ContractID, id)
+			}
+			if eff.CodeHash != currentHash {
+				t.Fatalf("CodeHash = %x, want %x (unchanged)", eff.CodeHash, currentHash)
+			}
+			if len(eff.StateDiff) != 0 {
+				t.Fatalf("StateDiff = %+v, want empty", eff.StateDiff)
+			}
+			if eff.ReturnData != nil {
+				t.Fatalf("ReturnData = %x, want nil", eff.ReturnData)
+			}
+			assertUpgradeReads(t, state, id)
+		})
+	}
+}
+
 func TestApplyUpgradeNoPendingRecordHalts(t *testing.T) {
 	p := newTestPlugin(t)
 	id := types.Hash{0x40}
@@ -1275,4 +1346,53 @@ func TestApplyUpgradeWarmVsColdCodeStore(t *testing.T) {
 	if !reflect.DeepEqual(coldReads, warmReads) {
 		t.Fatalf("read sequences differ between cold and warm code store: %v vs %v", coldReads, warmReads)
 	}
+}
+
+// A well-formed module staged under a code hash it does not hash to must fail
+// assembly verification on both paths. The module itself would instrument and
+// deploy, so only the hash comparison can reject it.
+func TestAssemblyHashMismatchOfValidModuleValidationFailed(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	wrongHash := types.Hash{0x77}
+	if CodeHash(raw) == wrongHash {
+		t.Fatal("test hash equals the module's CodeHash")
+	}
+	sender := types.Address{1, 2, 3}
+
+	t.Run("DeployFinalize", func(t *testing.T) {
+		p := newTestPlugin(t)
+		stageDeployment(t, p, raw, wrongHash, sender, immutableMetadata)
+		eff, err := p.Apply(nil, Input{Ctx: domain.InputContext{L1Sender: sender}, Args: codec.DeployFinalizeArgs{CodeHash: wrongHash}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusValidationFailed {
+			t.Fatalf("Status = %v, want StatusValidationFailed", eff.Status)
+		}
+		if len(eff.StateDiff) != 0 {
+			t.Fatalf("StateDiff = %+v, want empty", eff.StateDiff)
+		}
+	})
+
+	t.Run("Upgrade", func(t *testing.T) {
+		p := newTestPlugin(t)
+		id := types.Hash{0x32}
+		owner := callerHash(sender)
+		current := types.Hash{0xCC}
+		stageDeployment(t, p, raw, wrongHash, sender, immutableMetadata)
+		state := upgradeState(id, current, true, []byte{policyOwnerUpgradeable}, true, owner[:])
+		eff, err := p.Apply(state, Input{Ctx: domain.InputContext{L1Sender: sender}, Args: codec.UpgradeArgs{ContractID: id, NewCodeHash: wrongHash}})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if eff.Status != codec.StatusValidationFailed {
+			t.Fatalf("Status = %v, want StatusValidationFailed", eff.Status)
+		}
+		if eff.CodeHash != current {
+			t.Fatalf("CodeHash = %x, want %x (unchanged)", eff.CodeHash, current)
+		}
+		if len(eff.StateDiff) != 0 {
+			t.Fatalf("StateDiff = %+v, want empty", eff.StateDiff)
+		}
+	})
 }

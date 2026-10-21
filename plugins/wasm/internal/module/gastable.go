@@ -207,9 +207,9 @@ func LocalsEntryCost(declared uint64) uint64 {
 // charged by the enclosing segment. Unlike BrTableCost, this is charged at run time rather
 // than folded into a static segment sum, because a grow delta is dynamic.
 //
-// Call it only for a growth that actually succeeds. A grow that would exceed MaxMemory
-// returns -1, grows nothing, and charges the base only -- no per-page charge for the
-// rejected pages.
+// Call it only for a growth that actually succeeds. A grow that would exceed the module's
+// memory limit returns -1, grows nothing, and charges the base only -- no per-page charge
+// for the rejected pages.
 //
 // Instrumentation emits the per-page charge inside the instrumented
 // WASM and needs the raw per-page constant as an i64.const; it obtains

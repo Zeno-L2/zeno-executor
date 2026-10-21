@@ -417,11 +417,14 @@ func decodeExports(payload []byte) ([]exportRecord, error) {
 
 func TestInstrumentMemoryNormalized(t *testing.T) {
 	cases := []struct {
-		name string
-		mem  limits
+		name    string
+		mem     limits
+		wantMax uint32
 	}{
-		{"no declared max", limits{flags: 0x00, min: 1}},
-		{"declared max 100", limits{flags: 0x01, min: 1, max: 100}},
+		{"no declared max", limits{flags: 0x00, min: 1}, 64},
+		{"declared max 100", limits{flags: 0x01, min: 1, max: 100}, 64},
+		{"declared max 64", limits{flags: 0x01, min: 1, max: 64}, 64},
+		{"declared max 1", limits{flags: 0x01, min: 1, max: 1}, 1},
 	}
 	for _, c := range cases {
 		c := c
@@ -438,9 +441,15 @@ func TestInstrumentMemoryNormalized(t *testing.T) {
 			secs := sectionMap(t, got)
 			want := []byte{0x01, 0x01}
 			want = appendVarU32(want, c.mem.min)
-			want = appendVarU32(want, instrumentLimits.MaxMemoryPages)
+			want = appendVarU32(want, c.wantMax)
 			if !bytes.Equal(secs[5], want) {
 				t.Errorf("memory section = % X, want % X", secs[5], want)
+			}
+			// __zenon_grow bounds growth by the same limit: i32.const <limit>; memory.size; i32.sub.
+			guard := append([]byte{0x41}, appendVarS32(nil, int32(c.wantMax))...)
+			guard = append(guard, 0x3F, 0x00, 0x6B)
+			if !bytes.Contains(secs[10], guard) {
+				t.Errorf("code section lacks the grow bound % X", guard)
 			}
 		})
 	}
@@ -685,6 +694,14 @@ func TestInstrumentPreconditions(t *testing.T) {
 		_, err := Instrument(b.bytes(), instrumentLimits)
 		if !errors.Is(err, ErrNotValidated) {
 			t.Errorf("Instrument(memory min too large) = %v, want ErrNotValidated", err)
+		}
+	})
+	t.Run("memory max below min", func(t *testing.T) {
+		b := newBuilder()
+		b.memories = []limits{{flags: 0x01, min: 2, max: 1}}
+		_, err := Instrument(b.bytes(), instrumentLimits)
+		if !errors.Is(err, ErrNotValidated) {
+			t.Errorf("Instrument(memory max below min) = %v, want ErrNotValidated", err)
 		}
 	})
 	t.Run("function type with more than one result", func(t *testing.T) {

@@ -27,7 +27,8 @@ var ErrInstrumentedTooLarge = errors.New("module: instrumented module too large"
 
 // ErrNotValidated is returned for a precondition Instrument itself relies on and can check for
 // free while parsing (no memory section, a memory count other than 1, a declared memory
-// minimum above lim.MaxMemoryPages, a code/function section count mismatch, a function type
+// minimum above lim.MaxMemoryPages, a declared memory maximum below its minimum, a code/function
+// section count mismatch, a function type
 // with more than one result, or a decode desync this package's total decoder detects), and
 // generally for any input shape Instrument cannot safely proceed on without re-implementing
 // Validate's full rule set.
@@ -63,7 +64,7 @@ func Instrument(original []byte, lim Limits) ([]byte, error) {
 		tablePayload []byte
 
 		haveMem bool
-		memMin  uint32
+		mem     limitsRaw
 
 		globalsPayload []byte
 		globalCount    uint32
@@ -118,11 +119,11 @@ func Instrument(original []byte, lim Limits) ([]byte, error) {
 			haveTable = true
 			tablePayload = s.payload
 		case 5:
-			min, err := parseMemoryLoose(s.payload)
+			lr, err := parseMemoryLoose(s.payload)
 			if err != nil {
 				return nil, fmt.Errorf("memory section: %w", err)
 			}
-			memMin = min
+			mem = lr
 			haveMem = true
 		case 6:
 			globalsPayload = s.payload
@@ -158,8 +159,15 @@ func Instrument(original []byte, lim Limits) ([]byte, error) {
 	if !haveMem {
 		return nil, fmt.Errorf("no memory section: %w", ErrNotValidated)
 	}
-	if memMin > lim.MaxMemoryPages {
-		return nil, fmt.Errorf("memory min %d exceeds MaxMemoryPages %d: %w", memMin, lim.MaxMemoryPages, ErrNotValidated)
+	if mem.min > lim.MaxMemoryPages {
+		return nil, fmt.Errorf("memory min %d exceeds MaxMemoryPages %d: %w", mem.min, lim.MaxMemoryPages, ErrNotValidated)
+	}
+	if mem.hasMax && mem.max < mem.min {
+		return nil, fmt.Errorf("memory max %d below min %d: %w", mem.max, mem.min, ErrNotValidated)
+	}
+	memLimit := lim.MaxMemoryPages
+	if mem.hasMax && mem.max < memLimit {
+		memLimit = mem.max
 	}
 	if codeCount != uint32(len(funcs)) {
 		return nil, fmt.Errorf("code section: %d bodies, function section has %d: %w", codeCount, len(funcs), ErrNotValidated)
@@ -216,12 +224,12 @@ func Instrument(original []byte, lim Limits) ([]byte, error) {
 		out = writeSection(out, 4, tablePayload)
 	}
 
-	// Section 5: memory, rewritten: count 1, flags 0x01, min = declared min, max =
-	// lim.MaxMemoryPages.
+	// Section 5: memory, rewritten: count 1, flags 0x01, min = declared min, max = memLimit, the
+	// smaller of the declared max and lim.MaxMemoryPages.
 	{
 		payload := []byte{0x01, 0x01}
-		payload = appendVarU32(payload, memMin)
-		payload = appendVarU32(payload, lim.MaxMemoryPages)
+		payload = appendVarU32(payload, mem.min)
+		payload = appendVarU32(payload, memLimit)
 		out = writeSection(out, 5, payload)
 	}
 
@@ -299,7 +307,7 @@ func Instrument(original []byte, lim Limits) ([]byte, error) {
 				return nil, fmt.Errorf("code section: %w", ErrSectionSizeMismatch)
 			}
 		}
-		for _, h := range buildHelperBodies(base, G+0, G+1, lim) {
+		for _, h := range buildHelperBodies(base, G+0, G+1, memLimit) {
 			codeBodies = appendVarU32(codeBodies, uint32(len(h)))
 			codeBodies = append(codeBodies, h...)
 		}
@@ -432,26 +440,24 @@ func parseFuncsLoose(payload []byte) ([]uint32, error) {
 }
 
 // parseMemoryLoose decodes a memory section payload, requiring exactly one memory (a validated
-// module always declares exactly one), and returns its declared minimum. The maximum is
-// not returned: the output memory's maximum is always lim.MaxMemoryPages, never the declared
-// one.
-func parseMemoryLoose(payload []byte) (min uint32, err error) {
+// module always declares exactly one), and returns its limits.
+func parseMemoryLoose(payload []byte) (limitsRaw, error) {
 	r := newReader(payload)
 	count, err := r.readVecCount()
 	if err != nil {
-		return 0, err
+		return limitsRaw{}, err
 	}
 	if count != 1 {
-		return 0, fmt.Errorf("%d memories: %w", count, ErrNotValidated)
+		return limitsRaw{}, fmt.Errorf("%d memories: %w", count, ErrNotValidated)
 	}
 	lr, err := readLimitsRaw(r)
 	if err != nil {
-		return 0, err
+		return limitsRaw{}, err
 	}
 	if r.remaining() != 0 {
-		return 0, ErrSectionSizeMismatch
+		return limitsRaw{}, ErrSectionSizeMismatch
 	}
-	return lr.min, nil
+	return lr, nil
 }
 
 // InitialPages returns the declared minimum of the module's one memory.
@@ -468,7 +474,8 @@ func InitialPages(validated []byte) (uint32, error) {
 	}
 	for _, s := range secs {
 		if s.id == 5 {
-			return parseMemoryLoose(s.payload)
+			lr, err := parseMemoryLoose(s.payload)
+			return lr.min, err
 		}
 	}
 	return 0, fmt.Errorf("no memory section: %w", ErrNotValidated)
@@ -783,12 +790,12 @@ func rewriteBody(body []byte, sig funcSig, base uint32) ([]byte, error) {
 
 // buildHelperBodies returns the 6 injected functions' bodies, each preceded by its own empty
 // (0x00) locals vector, in the fixed order base+0..base+5.
-func buildHelperBodies(base, gasGlobal, depthGlobal uint32, lim Limits) [][]byte {
+func buildHelperBodies(base, gasGlobal, depthGlobal, memLimit uint32) [][]byte {
 	return [][]byte{
 		buildCharge(gasGlobal),
 		buildEnter(depthGlobal),
 		buildExit(depthGlobal),
-		buildGrow(base, lim.MaxMemoryPages),
+		buildGrow(base, memLimit),
 		buildGasGet(gasGlobal),
 		buildGasSet(gasGlobal),
 	}
@@ -854,23 +861,23 @@ func buildExit(depthGlobal uint32) []byte {
 }
 
 // buildGrow builds __zenon_grow(param i32 delta) -> i32's body. The unsigned framing makes an
-// i32 wrap impossible, and memory.size <= MaxMemoryPages is guaranteed by the normalized
-// memory maximum, so the subtraction cannot underflow. Over-limit growth returns -1, grows
+// i32 wrap impossible, and memory.size <= memLimit holds because memLimit is the instantiated
+// memory's maximum, so the subtraction cannot underflow. Over-limit growth returns -1, grows
 // nothing, and pays only the base cost the calling segment already charged.
-func buildGrow(base, maxMemoryPages uint32) []byte {
+func buildGrow(base, memLimit uint32) []byte {
 	b := []byte{0x00}
 	b = append(b, 0x20, 0x00) // local.get 0
 	b = append(b, 0x41)
-	b = appendVarS32(b, int32(maxMemoryPages)) // i32.const <MaxMemoryPages>
-	b = append(b, 0x3F, 0x00)                  // memory.size
-	b = append(b, 0x6B)                        // i32.sub
-	b = append(b, 0x4B)                        // i32.gt_u
-	b = append(b, 0x04, 0x40)                  // if
-	b = append(b, 0x41, 0x7F)                  //   i32.const -1
-	b = append(b, 0x0F)                        //   return
-	b = append(b, 0x0B)                        // end
-	b = append(b, 0x20, 0x00)                  // local.get 0
-	b = append(b, 0xAD)                        // i64.extend_i32_u
+	b = appendVarS32(b, int32(memLimit)) // i32.const <memLimit>
+	b = append(b, 0x3F, 0x00)            // memory.size
+	b = append(b, 0x6B)                  // i32.sub
+	b = append(b, 0x4B)                  // i32.gt_u
+	b = append(b, 0x04, 0x40)            // if
+	b = append(b, 0x41, 0x7F)            //   i32.const -1
+	b = append(b, 0x0F)                  //   return
+	b = append(b, 0x0B)                  // end
+	b = append(b, 0x20, 0x00)            // local.get 0
+	b = append(b, 0xAD)                  // i64.extend_i32_u
 	b = append(b, 0x42)
 	b = appendVarS64(b, int64(MemoryGrowPageCost(1))) // i64.const <MemoryGrowPageCost(1)>
 	b = append(b, 0x7E)                               // i64.mul
