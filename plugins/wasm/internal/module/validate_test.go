@@ -1090,6 +1090,16 @@ func TestAcceptanceCases(t *testing.T) {
 			}(),
 		},
 		{
+			name: "total locals across functions exactly at MaxTotalLocals",
+			wasm: func() []byte {
+				b := newBuilder() // run: 2 params
+				b.types = append(b.types, funcType{form: 0x60})
+				b.funcs = append(b.funcs, uint32(1))
+				b.bodies = append(b.bodies, body{locals: []localDecl{{count: 8, valType: 0x7F}}, code: []byte{0x0B}}) // 2 + 8 = 10
+				return b.bytes()
+			}(),
+		},
+		{
 			name: "type section exactly at MaxTypeCount",
 			wasm: func() []byte {
 				b := newBuilder() // base type: 2 params

@@ -4,12 +4,12 @@
 
 The repo-owned source copy of the WASM domain's execution conformance artifact, produced by
 driving `Plugin.DecodeInput`/`Plugin.Apply` over real modules through the real engine. The copy
-in the `zeno` documentation repository under `phase-1/WASM Spec/` was written from this one and
-is byte-identical to it **as of this snapshot**. The two are kept in sync by hand and no
-automated check enforces the equality, because the two copies now live in different
-repositories. The pattern such a check would follow is `../internal/module/gastable_test.go`
-`TestArtifactDrift`, which compares the embedded gas table against a vendored copy checked into
-this repository's own `testdata/`, not against the zeno documentation tree.
+in `zeno-docs` under `wasm-vm/` was written from this one and is byte-identical to it **as of
+this snapshot**. The two are kept in sync by hand and no automated check enforces the equality,
+because the two copies now live in different repositories. The pattern such a check would follow
+is `../internal/module/gastable_test.go` `TestArtifactDrift`, which compares the embedded gas
+table against a vendored copy checked into this repository's own `testdata/`, not against
+`zeno-docs`.
 
 ## Provenance
 
@@ -26,10 +26,10 @@ vectors.
    cap set is normative rather than open. It re-dates no vector in this file: the `CV-REJECT-*`
    vectors freeze §7.2's prohibited *capabilities* — WASI, floats, threads/atomics, SIMD,
    sign-extension operators, saturating conversions — which the structural caps do not reach.
-   Every module here is hand-built and small: at most two declared types, two functions and two
-   data segments, each far below `MaxTypeCount = 1024`, `MaxFunctions = 8192` and
-   `MaxDataSegments = 1024`; the largest module is ~64 KiB against a 256 KiB `MaxCodeSize`
-   (`../limits.go`).
+   Every module here is hand-built. The `CV-STRUCT-*` modules sit at or one above a §25.1 cap,
+   and `CV-INSTR-SIZE-1`'s module, about 148 KiB, is the largest, against a 256 KiB
+   `MaxCodeSize` (`../limits.go`). Every other module has at most two declared types, two
+   functions and two data segments.
 4. §15 states the `state_diff_hash`/`return_hash` preimages and §14.3 states the non-`SUCCESS`
    `ReturnData` discard normatively, except `REVERT`'s revert data.
 5. The §15 preimage corroboration outcome: the derived rule was checked against the four
@@ -61,15 +61,16 @@ vectors.
 Declared as Go structs (`vectorFile`, `vectorJSON`, `vectorInput`, `vectorReceipt`) in
 `../vectors_test.go`.
 
-Six vector shapes, distinguished by `shape`:
+Seven vector shapes, distinguished by `shape`:
 
 | Shape | `input_frame_hex` | `module_wasm_hex` | `source_data_hex` | `input` | notes |
 |---|---|---|---|---|---|
 | `call` (kinds 0/1) | present | present | absent | present | full pipeline |
-| `deploy` (kinds 2-5) | absent | present | present iff kind 3 | present | code-store seeding, §15 identity; ReturnData = code_hash ‖ CodeHash (§11.3, §12) on a SUCCESS finalize or upgrade only — a rejected upgrade carries no ReturnData and no state diff, and an UNAUTHORIZED one carries the target's unchanged receipt.code_hash; `pending_metadata_hex` for kinds 4/5 |
+| `deploy` (kinds 2-5) | absent | present | present iff kind 3 | present | code-store seeding, §15 identity; ReturnData = code_hash ‖ CodeHash (§11.3, §12) on a SUCCESS finalize or upgrade only — a rejected upgrade carries no ReturnData and no state diff, and an UNAUTHORIZED one, or a VALIDATION_FAILED one against a deployed contract, carries the target's unchanged receipt.code_hash; `pending_metadata_hex` for kinds 4/5 |
 | `ownership` (kind 6) | absent | absent | absent | present | frame absent, module absent, source data absent, input present |
-| `validation_rejection` | absent | present | absent | present | module never runs; `VALIDATION_FAILED` |
+| `validation_rejection` | absent | present | absent | present | kind 4; module never runs; `VALIDATION_FAILED` with exactly one cause: the module's validation, its instrumentation, the pending metadata, or the assembly hash (`code_hash` ≠ `input.code_hash`) |
 | `buy_storage` (kind 7) | absent | absent | absent | present | frame absent, module absent, source data absent, input present; witness set is the `0x0001` and `0x0005` leaves on every outcome |
+| `undeployed_target` (kinds 0/1) | absent | absent | absent | present | the target has no `0x0001` leaf, so no module or frame exists and nothing runs; `VALIDATION_FAILED` at `gas_used` 0 with a zero `receipt.code_hash`; the full deposit is refunded; witness set is exactly the target's `0x0001` and `0x0002` leaves, both absent |
 | `unsupported_kind` (kind 8) | absent | absent | absent | absent | `canonical_input_hex` is §27.5's 33-byte prefix |
 
 Encoding rules:
@@ -271,12 +272,100 @@ Vector IDs are stable names; gaps in numbering are intentional.
 | `CV-QUOTA-6` | `BuyStorage` adds `bytes` to `purchased` and leaves `used` unchanged |
 | `CV-QUOTA-7` | `BuyStorage` naming a `contract_id` with no code-hash leaf is `VALIDATION_FAILED` |
 | `CV-QUOTA-8` | `BuyStorage` whose `purchased + bytes` is `2^64` is `VALIDATION_FAILED`, and its receipt carries the unchanged `CodeHash` |
+| `CV-DEPLOY-3` | a deploy finalize of a module longer than `MaxDeployChunkData`: its two chunks assemble in ascending `chunk_index` and the deploy succeeds |
+| `CV-DEPLOY-HASH-1` | a deploy finalize whose staged chunks pass every per-chunk check but assemble to bytes that do not hash to `code_hash` is `VALIDATION_FAILED` and creates no contract |
+| `CV-UPGRADE-UNAUTH-2` | an upgrade of an `OWNER_UPGRADEABLE` contract by a caller other than its owner is `UNAUTHORIZED` and its receipt carries the unchanged `CodeHash` |
+| `CV-UPGRADE-ORDER-1` | an upgrade by a non-owner whose new module also fails validation is `UNAUTHORIZED`, not `VALIDATION_FAILED`: authorization precedes the §11.3 pipeline |
+| `CV-UPGRADE-INVALID-1` | an authorized upgrade whose new module fails validation is `VALIDATION_FAILED`, with no code change and the unchanged `CodeHash` in its receipt |
+| `CV-UPGRADE-HASH-1` | an authorized upgrade whose staged chunks assemble to bytes that do not hash to `new_code_hash` is `VALIDATION_FAILED`, with no code change and the unchanged `CodeHash` in its receipt |
+| `CV-UPGRADE-SAMEHASH-1` | an authorized upgrade that re-stages the contract's current module is `VALIDATION_FAILED`: an upgrade must produce a new `CodeHash` |
+| `CV-UPGRADE-SAMEHASH-2` | an authorized upgrade to a different module that instruments to the contract's current `CodeHash` is `VALIDATION_FAILED`: the comparison is on `CodeHash`, not `code_hash` |
 | `EXEC-FAIL-OUTBOX-1` | a failed input carrying a deposit, proving §14.3's discard |
 | `CV-FRAME-1` | the contract returns the frame's `momentum_hash` as its `ReturnData` and takes its `input_index` from the frame: `SUCCESS`, and `return_hash` commits the momentum hash |
 | `CV-LOCALS-1` | a function declaring `MaxLocalsPerFunction` (8,192) `i64` locals pays `ceil(8192 / locals_per_gas)` once at entry: `SUCCESS` at the metered gas |
 | `CV-LOCALS-2` | the same call one gas short of that function's entry segment: `OUT_OF_GAS` before its first instruction runs |
+| `CV-TRAP-DIV-1` | integer division by zero (`i32.div_u`) traps: `RUNTIME_FAULT` at the metered gas |
+| `CV-TRAP-OVF-1` | `i32.div_s` of `-2^31` by `-1` overflows and traps: `RUNTIME_FAULT` at the metered gas |
+| `CV-TRAP-MEM-1` | an `i32.load` whose four bytes cross the end of memory traps, though its first three bytes are in bounds: `RUNTIME_FAULT` at the metered gas |
+| `CV-TRAP-TABLE-1` | a `call_indirect` past the end of the table traps: `RUNTIME_FAULT` at the metered gas |
+| `CV-TRAP-NULL-1` | a `call_indirect` to an uninitialized table element traps: `RUNTIME_FAULT` at the metered gas |
+| `CV-TRAP-SIG-1` | a `call_indirect` whose expected type differs from the function's type traps: `RUNTIME_FAULT` at the metered gas |
+| `CV-NEG-1` | `run` returns `-7`: `REVERT` with `abort_code` 7, empty revert data and a zero `return_hash` |
+| `CV-NEG-2` | `run` returns `-2^63`: `(-r)` truncated to `i32` is 0, so `REVERT` with `abort_code` 0 |
+| `CV-FRAME-2` | the input frame is written after the data segments: a segment over bytes 0 to 265 keeps only its bytes past the 258-byte frame, and memory past the segment is zero |
+| `CV-FRAME-3` | a module declaring 0 initial pages cannot hold the frame: `RUNTIME_FAULT`, `run` is never called, and `gas_used` is the initial-memory charge, 0 |
+| `CV-GROW-2` | a module declaring a memory maximum of 1 page: `memory.grow` by 1 returns `-1` and pays no per-page surcharge |
+| `CV-GROW-3` | a module declaring no memory maximum grows from 1 page to exactly `MaxMemory` (64 pages), and one more page returns `-1` |
+| `CV-GROW-4` | a module declaring a memory maximum of 65 pages is capped at `MaxMemory`: it grows to 64 pages, and one more page returns `-1` |
+| `CV-GROW-5` | a module declaring a memory maximum of 2 pages grows to exactly 2: `memory.grow` returns the old size 1, and `memory.size` is then 2 |
+| `CV-READ-3` | `storage_read` of an absent key returns `-1` though its out buffer crosses the end of memory: the absent check precedes the out-buffer check |
+| `CV-READ-4` | `storage_read` returns `-2` when `out_len` is below the value's length, though its out buffer crosses the end of memory: that path never checks the buffer |
+| `CV-READ-5` | `storage_read` traps when its out buffer crosses the end of memory, though the value's 8 bytes at `out_ptr` would fit: `RUNTIME_FAULT` at the metered gas, including the read charge |
+| `CV-READ-6` | `storage_read` into a 16-byte out buffer writes exactly the value's 8 bytes at `out_ptr` and returns 8: the buffer's other 8 bytes keep their contents |
+| `CV-READ-7` | `storage_read` traps when its key range crosses the end of memory, though the key is absent: `RUNTIME_FAULT` at the metered gas, because the key-range check precedes the absent check |
+| `CV-EVENTS-1` | three distinct events: `SUCCESS`, the result lists them in `event_index` order, and the per-input `event_root` promotes the odd third leaf unchanged |
+| `EXEC-DEP-12` | a `Deposit` of 1000 whose contract claims 0 and emits nothing: `SUCCESS`, and the full refund is the only outbox message, at `outbox_index` 0 |
+| `CV-MEM-MIN-1` | a deploy of a module declaring 65 initial pages, one above `MaxMemory`, is `VALIDATION_FAILED` |
+| `CV-STRUCT-TYPES-1` | a deploy of a module declaring `MaxTypeCount` + 1 (1,025) function types is `VALIDATION_FAILED` |
+| `CV-STRUCT-TYPEPARAMS-1` | a deploy of a module declaring an unused function type with `MaxLocalsPerFunction` + 1 (8,193) parameters is `VALIDATION_FAILED`, though the type section's total stays under `MaxTotalParams` |
+| `CV-STRUCT-PARAMS-1` | a deploy of a module whose function types declare `MaxTotalParams` + 1 (65,537) parameters in total, none above `MaxLocalsPerFunction`, is `VALIDATION_FAILED` |
+| `CV-STRUCT-FUNCS-1` | a deploy of a module defining `MaxFunctions` + 1 (8,193) functions is `VALIDATION_FAILED` |
+| `CV-STRUCT-TABLE-1` | a deploy of a module whose table declares a minimum of `MaxTableEntries` + 1 (10,001) entries is `VALIDATION_FAILED` |
+| `CV-STRUCT-GLOBALS-1` | a deploy of a module declaring `MaxGlobals` + 1 (1,025) globals is `VALIDATION_FAILED` |
+| `CV-STRUCT-ELEMS-1` | a deploy of a module whose two element segments hold `MaxTotalElementEntries` + 1 (16,385) entries in total, each within the table, is `VALIDATION_FAILED` |
+| `CV-STRUCT-DATA-1` | a deploy of a module declaring `MaxDataSegments` + 1 (1,025) data segments is `VALIDATION_FAILED` |
+| `CV-STRUCT-LOCALS-1` | a deploy of a module whose `run` has 2 parameters and 8,191 declared locals, `MaxLocalsPerFunction` + 1 in total, is `VALIDATION_FAILED`: parameters count toward the cap |
+| `CV-STRUCT-TOTALLOCALS-1` | a deploy of a module whose parameters and declared locals sum to `MaxTotalLocals` + 1 across its functions, with the declared locals alone one below the cap, is `VALIDATION_FAILED`: parameters count toward the cap |
+| `CV-STRUCT-ATCAP-1` | a deploy of a module exactly at `MaxTypeCount`, `MaxTotalParams`, `MaxFunctions`, `MaxLocalsPerFunction`, `MaxGlobals`, `MaxDataSegments`, `MaxTableEntries` and `MaxTotalElementEntries`, with an element segment ending exactly at the table minimum and a data segment ending exactly at the end of initial memory, succeeds |
+| `CV-FIT-DATA-1` | a deploy of a module whose active data segment at offset 65,535 holds 2 bytes, one past its 1-page initial memory, is `VALIDATION_FAILED` at deploy, not at its first call |
+| `CV-FIT-ELEM-1` | a deploy of a module whose active element segment at offset 1 holds 2 entries, one past its table minimum of 2, is `VALIDATION_FAILED` at deploy, not at its first call |
+| `CV-IMPORT-MODULE-1` | a deploy of a module importing `storage_len`, with its signature, from module `zenon` rather than `env` is `VALIDATION_FAILED` |
+| `CV-IMPORT-NAME-1` | a deploy of a module importing `env.storage_write`, a name outside the three host functions, is `VALIDATION_FAILED` |
+| `CV-IMPORT-DUP-1` | a deploy of a module importing `env.storage_len` twice is `VALIDATION_FAILED` |
+| `CV-IMPORT-SIG-1` | a deploy of a module importing `env.abort` with the one-parameter signature `(i32) -> ()` is `VALIDATION_FAILED` |
+| `CV-IMPORT-KIND-1` | a deploy of a module importing `env.storage_len` as an `i32` global rather than a function is `VALIDATION_FAILED` |
+| `CV-SECTION-START-1` | a deploy of a module with a start section naming a `() -> ()` function is `VALIDATION_FAILED` |
+| `CV-SECTION-CUSTOM-1` | a deploy of a module whose only defect is a trailing `name` custom section is `VALIDATION_FAILED` |
+| `CV-SECTION-CUSTOM-2` | a deploy of a module whose only defect is a trailing empty custom section named `zeno` is `VALIDATION_FAILED` |
+| `CV-EXPORT-MUTGLOBAL-1` | a deploy of a module exporting a mutable `i32` global is `VALIDATION_FAILED` |
+| `CV-EXPORT-START-1` | a deploy of a module that also exports `run` under the name `_start` is `VALIDATION_FAILED` |
+| `CV-EXPORT-ZENON-1` | a deploy of a module that also exports `run` under the name `__zenon_gas`, which the instrumenter never injects, is `VALIDATION_FAILED`: every name beginning `__zenon_` is reserved |
+| `CV-EXPORT-NORUN-1` | a deploy of a module exporting `memory` but no `run` is `VALIDATION_FAILED` |
+| `CV-EXPORT-NOMEMORY-1` | a deploy of a module that declares a memory but exports only `run` is `VALIDATION_FAILED` |
+| `CV-EXPORT-RUNSIG-1` | a deploy of a module whose `run` is `(i32, i32) -> i32` is `VALIDATION_FAILED` |
+| `CV-EXPORT-RUNIMPORT-1` | a deploy of a module whose `run` export names its `env.storage_len` import, which has `run`'s signature, is `VALIDATION_FAILED`: `run` must be a function the module defines |
+| `CV-INSTR-SIZE-1` | a deploy of a module under `MaxCodeSize` whose `run` is `i64.const 0` then 151,000 `return`s: each `return` instruments to 7 bytes, so the instrumented module exceeds `MaxInstrumentedCodeSize` (1 MiB) and the deploy is `VALIDATION_FAILED` |
+| `CV-LEB-PADDED-1` | a deploy of a module whose only defect is `run`'s locals vector count 0 encoded in two bytes (`80 00`), within Core 1.0's five-byte limit, is `VALIDATION_FAILED`: every LEB128 integer must use its shortest encoding |
+| `CV-DEPOSIT-UNDEPLOYED-1` | a `Deposit` of 1000 naming a `target_contract` with no code-hash leaf is `VALIDATION_FAILED` at `gas_used` 0 with a zero receipt `code_hash`; the full deposit is refunded as the only outbox message, and the witness set is exactly the target's absent `0x0001` and `0x0002` leaves |
+| `CV-CALL-UNDEPLOYED-1` | a payable `CallL2` with a payload and a deposit of 1000 naming a `target_contract` with no code-hash leaf has the same outcome as a `Deposit`: `VALIDATION_FAILED` at `gas_used` 0, the full deposit refunded, and a witness set of exactly the target's absent `0x0001` and `0x0002` leaves |
 
 `CV-DEPLOY-1` and `CV-DEPLOY-2` together are the single-chunk sizing case: the kind-2 record
 declaring `chunk_count == 1` and the kind-3 chunk that carries the whole module.
 
-`env.abort` takes three parameters: `code`, `data_ptr` and `data_len`. Deploy validation rejects a module that imports the one-parameter form. A module with that import that is already in a store fails instantiation with an import type mismatch, and the call path returns that error to the driver, which halts the batch. A network with such state needs a fresh genesis or a devnet wipe.
+A kind-4 or kind-5 vector's pending record is staged by `l1_sender` under `input.code_hash`
+(kind 4) or `input.new_code_hash` (kind 5). Its `total_size` is the length of `module_wasm_hex`,
+its `chunk_count` is `ceil(total_size / MaxDeployChunkData)` and its metadata is
+`pending_metadata_hex`. Chunk `i` is the bytes of `module_wasm_hex` from `i ×
+MaxDeployChunkData` up to the next multiple of `MaxDeployChunkData` or the end. The top-level
+`code_hash` is `SHA3-256(module_wasm_hex)`. Only `CV-DEPLOY-HASH-1` and `CV-UPGRADE-HASH-1`
+stage bytes whose `code_hash` differs from the one their input names.
+
+Two §11.3 assembly checks have no vector, because no input sequence Settlement accepts can fail
+them. A length mismatch cannot arise: §11.2 fixes every chunk's size, so the accepted chunks
+always total `total_size`. A `total_size` or `chunk_count` out of bounds cannot arise: §11.1
+rejects that start at its receive. go-executor still checks both
+(`TestApplyDeployFinalizeAssemblyVerification` and `TestApplyDeployFinalizeRecordBounds` in
+`../deploy_test.go`).
+
+`MaxCodeSize` has no rejection vector for the same reason: §11.1 rejects a start whose
+`total_size` exceeds it, so no finalize assembles a larger module. `MaxTotalLocals` has a vector
+one above the cap and none at it: a module at the cap drives about 55 MB of allocation per
+engine compile (`../limits.go`), and the generator and the determinism matrix derive every
+deploy vector 13 times, compiling its module twice each time. No vector deploys a module
+declaring a function type with exactly `MaxLocalsPerFunction` parameters successfully: one such
+type costs about an eighth of the 808 MB of compile allocation that `../limits.go` measures for
+eight of them, on each of those 26 compiles. §8.1's fourth-import rule has no vector of its
+own: a fourth import repeats a name or names a symbol outside the three, which
+`CV-IMPORT-DUP-1` and `CV-IMPORT-NAME-1` pin.
+
+`env.abort` takes three parameters: `code`, `data_ptr` and `data_len`. Deploy validation rejects a module that imports the one-parameter form (`CV-IMPORT-SIG-1`). A module with that import that is already in a store fails instantiation with an import type mismatch, and the call path returns that error to the driver, which halts the batch. A network with such state needs a fresh genesis or a devnet wipe.

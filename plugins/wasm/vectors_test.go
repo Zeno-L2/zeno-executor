@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"os"
 	"sort"
@@ -41,7 +42,7 @@ type vectorFile struct {
 type vectorJSON struct {
 	ID                     string            `json:"id"`
 	Purpose                string            `json:"purpose"`
-	Shape                  string            `json:"shape"` // "call" | "deploy" | "buy_storage" | "validation_rejection" | "unsupported_kind"
+	Shape                  string            `json:"shape"` // "call" | "deploy" | "buy_storage" | "validation_rejection" | "unsupported_kind" | "undeployed_target"
 	BatchID                uint64            `json:"batch_id"`
 	GlobalInputIndex       uint64            `json:"global_input_index"`
 	MomentumHeight         uint64            `json:"momentum_height"`
@@ -706,9 +707,10 @@ func generateUnsupportedVector(t *testing.T, spec vectorSpec, kind uint8, chainI
 	}
 }
 
-// generateDeployVector runs one deploy-, buy_storage- or validation_rejection-shape vector through the
-// real Plugin.DecodeInput/Plugin.Apply seam. No frame is built and no module is run: kinds 2-5 and 7
-// invoke no contract.
+// generateDeployVector runs one deploy-, ownership-, buy_storage-, validation_rejection- or
+// undeployed_target-shape vector through the real Plugin.DecodeInput/Plugin.Apply seam. No frame is
+// built and no module is run: kinds 2-7 invoke no contract, and an undeployed_target row's kind-0/1
+// target has no code.
 func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 	t.Helper()
 
@@ -719,8 +721,8 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 	t.Cleanup(func() { _ = p.Close() })
 
 	kind := spec.Args.Kind()
+	assemblyHash := rejectionReasons[spec.ID] == errAssemblyHash
 	if kind == codec.DeployFinalize || kind == codec.Upgrade {
-		gotCodeHash := seedDeployment(t, p, spec.Module, spec.Ctx.L1Sender, spec.PendingMetadata)
 		var wantCodeHash types.Hash
 		switch a := spec.Args.(type) {
 		case codec.DeployFinalizeArgs:
@@ -728,9 +730,10 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		case codec.UpgradeArgs:
 			wantCodeHash = a.NewCodeHash
 		}
-		if gotCodeHash != wantCodeHash {
-			t.Fatalf("%s: seedDeployment code_hash = %x, want %x", spec.ID, gotCodeHash, wantCodeHash)
+		if (CodeHash(spec.Module) != wantCodeHash) != assemblyHash {
+			t.Fatalf("%s: CodeHash(module) = %x, input code hash = %x, assemblyHash = %v: the staged bytes must hash to the input's code hash exactly when the row's cause is not the assembly hash", spec.ID, CodeHash(spec.Module), wantCodeHash, assemblyHash)
 		}
+		stageDeployment(t, p, spec.Module, wantCodeHash, spec.Ctx.L1Sender, spec.PendingMetadata)
 	}
 
 	var codeHash types.Hash
@@ -754,23 +757,34 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		instrumentedCodeHash = CodeHash(instrumented)
 		haveInstrumented = true
 	case spec.Shape == "validation_rejection":
-		// Exactly one of module.Validate and codec.DecodeContractMetadata must fail; a rejected
+		// Exactly one of module.Validate, module.Instrument (run only on a module Validate
+		// accepts), codec.DecodeContractMetadata and the assembly hash must fail; a rejected
 		// vector must have exactly one cause.
 		validateErr := module.Validate(spec.Module, moduleLimits())
+		var instrumentErr error
+		if validateErr == nil {
+			_, instrumentErr = module.Instrument(spec.Module, moduleLimits())
+		}
 		_, metadataErr := codec.DecodeContractMetadata(spec.PendingMetadata)
 		failures := 0
 		if validateErr != nil {
 			failures++
 		}
+		if instrumentErr != nil {
+			failures++
+		}
 		if metadataErr != nil {
 			failures++
 		}
+		if assemblyHash {
+			failures++
+		}
 		if failures != 1 {
-			t.Fatalf("%s: validation_rejection: got %d failure causes (Validate=%v, DecodeContractMetadata=%v), want exactly 1", spec.ID, failures, validateErr, metadataErr)
+			t.Fatalf("%s: validation_rejection: got %d failure causes (Validate=%v, Instrument=%v, DecodeContractMetadata=%v, assemblyHash=%v), want exactly 1", spec.ID, failures, validateErr, instrumentErr, metadataErr, assemblyHash)
 		}
 	case kind == codec.Upgrade && spec.WantStatus != codec.StatusSuccess:
-		if err := module.Validate(spec.Module, moduleLimits()); err != nil {
-			t.Fatalf("%s: Validate: %v, want nil", spec.ID, err)
+		if err := module.Validate(spec.Module, moduleLimits()); !errors.Is(err, wantValidateErr(spec.ID)) {
+			t.Fatalf("%s: Validate: %v, want %v", spec.ID, err, wantValidateErr(spec.ID))
 		}
 	}
 
@@ -796,7 +810,9 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 	}
 	inputHash := hashOf(crypto.Hash(canonical))
 
-	in, err := p.DecodeInput(spec.Ctx, canonical)
+	ctx := spec.Ctx
+	ctx.Caps = spec.WithdrawalCaps
+	in, err := p.DecodeInput(ctx, canonical)
 	if err != nil {
 		t.Fatalf("%s: DecodeInput: %v", spec.ID, err)
 	}
@@ -846,7 +862,7 @@ func generateDeployVector(t *testing.T, spec vectorSpec) vectorJSON {
 		Input:                  inputView(spec.Args),
 		CanonicalInputHex:      hex.EncodeToString(canonical),
 		SourceDataHex:          hex.EncodeToString(spec.Ctx.SourceData),
-		WithdrawalCaps:         capsHex(nil),
+		WithdrawalCaps:         capsHex(spec.WithdrawalCaps),
 		PreState:               preState,
 		PreStateRoot:           hex.EncodeToString(preStateRoot[:]),
 		WitnessKeys:            witnessKeys,
@@ -947,6 +963,12 @@ func TestGenerateVectors(t *testing.T) {
 		{"EXEC-TRANSFER-2", "EXEC-TRANSFER-1"},
 		{"CV-UPGRADE-RENOUNCED-1", "EXEC-TRANSFER-2"},
 		{"CV-TRANSFER-UNAUTH-1", "EXEC-UPGRADE-2"},
+		{"CV-UPGRADE-UNAUTH-2", "EXEC-UPGRADE-2"},
+		{"CV-UPGRADE-ORDER-1", "EXEC-UPGRADE-2"},
+		{"CV-UPGRADE-INVALID-1", "EXEC-UPGRADE-2"},
+		{"CV-UPGRADE-HASH-1", "EXEC-UPGRADE-2"},
+		{"CV-UPGRADE-SAMEHASH-1", "EXEC-UPGRADE-2"},
+		{"CV-UPGRADE-SAMEHASH-2", "EXEC-UPGRADE-2"},
 	})
 
 	file := vectorFile{
@@ -1017,7 +1039,7 @@ func assertChainedRoots(t *testing.T, vectors []vectorJSON, pairs [][2]string) {
 // module bytes, is what stops a hand-edited gas_used or receipt_hex being laundered through a
 // regeneration. Stdlib SHA-256, not the protocol's SHA3-256: this is a repository integrity
 // check, not a consensus value.
-const vectorFileDigest = "bcc5e4369dfa86030aa7d6749fde2938c76c1273c96d071ded733153edbf230d"
+const vectorFileDigest = "8d111b58b1fb2c5eb0b52c21c891024035165feeb9f16bd0b463fbb20bee5213"
 
 // TestVectorFileDigest fails loudly if the artifact's bytes changed.
 func TestVectorFileDigest(t *testing.T) {

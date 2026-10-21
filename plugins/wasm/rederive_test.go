@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"reflect"
@@ -522,6 +523,8 @@ func checkShape(t *testing.T, file vectorFile, vec vectorJSON) {
 		checkBuyStorage(t, vec)
 	case "validation_rejection":
 		checkValidationRejection(t, vec)
+	case "undeployed_target":
+		checkUndeployedTarget(t, vec)
 	default:
 		t.Fatalf("unhandled shape %q: add its branch with its first vector", vec.Shape)
 	}
@@ -1171,7 +1174,8 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 		if vec.Input.ContractID != vec.Receipt.ContractID {
 			t.Fatalf("deploy: kind 5: input.contract_id = %s, want receipt.contract_id %s", vec.Input.ContractID, vec.Receipt.ContractID)
 		}
-		if vec.Input.NewCodeHash != vec.CodeHash {
+		hashMismatch := vec.Input.NewCodeHash != vec.CodeHash
+		if hashMismatch && (vec.Status != "VALIDATION_FAILED" || vec.Receipt.CodeHash == zeroHashHex) {
 			t.Fatalf("deploy: kind 5: input.new_code_hash = %s, want code_hash %s", vec.Input.NewCodeHash, vec.CodeHash)
 		}
 		key1 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x01}))
@@ -1234,7 +1238,40 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 			}
 		case "VALIDATION_FAILED":
 			if vec.Receipt.CodeHash != zeroHashHex {
-				t.Fatalf("deploy: kind 5 VALIDATION_FAILED with a non-zero receipt.code_hash is deploy.go:245's authorized-but-refused outcome: add its branch with its first vector")
+				// The authorized refusal: the contract is deployed and the caller is its owner.
+				oldHashHex, present := vec.PreState[key1]
+				if !present || oldHashHex != vec.Receipt.CodeHash {
+					t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): pre_state[sha3(contract_id||0x0001)] = %q, want receipt.code_hash %s", oldHashHex, vec.Receipt.CodeHash)
+				}
+				l1Sender := mustHex(t, vec.L1Sender)
+				caller := hashOf(crypto.Hash([]byte("L1_CALLER:"), l1Sender))
+				if vec.PreState[key3] != "01" || vec.PreState[key4] != hex.EncodeToString(caller[:]) {
+					t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): pre_state's policy leaf is %q and owner leaf is %q, want 01 and the caller %x", vec.PreState[key3], vec.PreState[key4], caller)
+				}
+				if vec.InstrumentedCodeHash != "" {
+					t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): instrumented_code_hash = %q, want empty", vec.InstrumentedCodeHash)
+				}
+				reason := rejectionReasons[vec.ID]
+				validateErr := module.Validate(moduleRaw, moduleLimits())
+				switch {
+				case hashMismatch:
+					if reason != errAssemblyHash {
+						t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): new_code_hash differs from sha3(module_wasm_hex) but rejectionReasons[%s] = %v, want errAssemblyHash", vec.ID, reason)
+					}
+				case validateErr != nil:
+					if reason == nil || !errors.Is(validateErr, reason) {
+						t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): Validate err = %v, want errors.Is(..., %v)", validateErr, reason)
+					}
+				default:
+					instrumented, err := module.Instrument(moduleRaw, moduleLimits())
+					if err != nil {
+						t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): Instrument: %v", err)
+					}
+					if hex.EncodeToString(crypto.Hash(instrumented)) != vec.Receipt.CodeHash {
+						t.Fatalf("deploy: kind 5 VALIDATION_FAILED (authorized): no section 11.3 cause holds: an authorized upgrade of a valid module, staged under its own hash, with a new CodeHash must be SUCCESS")
+					}
+				}
+				break
 			}
 			if vec.InstrumentedCodeHash != "" {
 				t.Fatalf("deploy: kind 5 VALIDATION_FAILED (undeployed): instrumented_code_hash = %q, want empty", vec.InstrumentedCodeHash)
@@ -1265,8 +1302,8 @@ func checkDeploy(t *testing.T, file vectorFile, vec vectorJSON) {
 			if vec.InstrumentedCodeHash != "" {
 				t.Fatalf("deploy: kind 5 UNAUTHORIZED: instrumented_code_hash = %q, want empty", vec.InstrumentedCodeHash)
 			}
-			if err := module.Validate(moduleRaw, moduleLimits()); err != nil {
-				t.Fatalf("deploy: kind 5 UNAUTHORIZED: Validate: %v, want nil", err)
+			if err := module.Validate(moduleRaw, moduleLimits()); !errors.Is(err, wantValidateErr(vec.ID)) {
+				t.Fatalf("deploy: kind 5 UNAUTHORIZED: Validate: %v, want %v", err, wantValidateErr(vec.ID))
 			}
 		default:
 			t.Fatalf("deploy: kind 5 status %s has no branch: add one with its first vector", vec.Status)
@@ -1512,11 +1549,85 @@ func checkBuyStorage(t *testing.T, vec vectorJSON) {
 	}
 }
 
+// checkUndeployedTarget is the undeployed_target shape's whole check: a
+// kind-0/1 input whose target has no code-hash leaf is VALIDATION_FAILED
+// before any module or frame exists, refunds the full deposit, and
+// witnesses exactly the target's two code-hash leaves (§10.6, §15, §18.2).
+func checkUndeployedTarget(t *testing.T, vec vectorJSON) {
+	t.Helper()
+
+	if (vec.InputKind != 0 && vec.InputKind != 1) || vec.Input == nil {
+		t.Fatalf("undeployed_target: input_kind = %d, input present = %v, want kind 0 or 1 with an input", vec.InputKind, vec.Input != nil)
+	}
+	if vec.ModuleWasmHex != "" || vec.CodeHash != "" || vec.InstrumentedCodeHash != "" || vec.InputFrameHex != "" || vec.SourceDataHex != "" || vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("undeployed_target: module_wasm_hex/code_hash/instrumented_code_hash/input_frame_hex/source_data_hex/contract_effects_blob_hex must all be empty")
+	}
+	if vec.PendingMetadataHex != nil {
+		t.Fatalf("undeployed_target: pending_metadata_hex = %q, want absent", *vec.PendingMetadataHex)
+	}
+	if vec.Status != "VALIDATION_FAILED" || vec.GasUsed != 0 || vec.Receipt.AbortCode != 0 {
+		t.Fatalf("undeployed_target: status = %s, gas_used = %d, receipt.abort_code = %d, want VALIDATION_FAILED, 0, 0", vec.Status, vec.GasUsed, vec.Receipt.AbortCode)
+	}
+	if vec.Receipt.ContractID != vec.Input.TargetContract {
+		t.Fatalf("undeployed_target: receipt.contract_id = %s, want input.target_contract %s", vec.Receipt.ContractID, vec.Input.TargetContract)
+	}
+	if vec.Receipt.CodeHash != zeroHashHex {
+		t.Fatalf("undeployed_target: receipt.code_hash = %s, want zero", vec.Receipt.CodeHash)
+	}
+
+	target := mustHex(t, vec.Input.TargetContract)
+	key1 := hex.EncodeToString(crypto.Hash(target, []byte{0x00, 0x01}))
+	key2 := hex.EncodeToString(crypto.Hash(target, []byte{0x00, 0x02}))
+	for _, k := range []string{key1, key2} {
+		if _, ok := vec.PreState[k]; ok {
+			t.Fatalf("undeployed_target: pre_state holds the target's leaf %s, want it absent", k)
+		}
+	}
+	wantWitness := []string{key1, key2}
+	sort.Strings(wantWitness)
+	if !reflect.DeepEqual(vec.WitnessKeys, wantWitness) {
+		t.Fatalf("undeployed_target: witness_keys = %v, want the 0x0001 and 0x0002 keys ascending %v", vec.WitnessKeys, wantWitness)
+	}
+
+	if vec.Input.DepositAmount == "" || vec.Input.DepositAmount == zeroHashHex {
+		t.Fatalf("undeployed_target: input.deposit_amount = %q, want a non-zero deposit", vec.Input.DepositAmount)
+	}
+	checkCallRefund(t, vec)
+}
+
+// checkUndeployedRow is the named invariant of an undeployed_target row:
+// its input kind, a payload on a CallL2, a deposit of 1000 in an asset
+// withdrawal_caps caps above zero, and an empty pre_state.
+func checkUndeployedRow(t *testing.T, vec vectorJSON, kind uint8) {
+	t.Helper()
+
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	if vec.Input == nil {
+		t.Fatalf("%s: input is absent", vec.ID)
+	}
+	if vec.InputKind != kind {
+		t.Fatalf("%s: input_kind = %d, want %d", vec.ID, vec.InputKind, kind)
+	}
+	if kind == 0 && (vec.Input.PayloadHex == nil || *vec.Input.PayloadHex == "") {
+		t.Fatalf("%s: a CallL2 row needs a non-empty payload", vec.ID)
+	}
+	if new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Cmp(big.NewInt(1000)) != 0 {
+		t.Fatalf("%s: input.deposit_amount = %s, want 1000", vec.ID, vec.Input.DepositAmount)
+	}
+	if capOf(t, vec, vec.Input.DepositAsset).Sign() <= 0 {
+		t.Fatalf("%s: withdrawal_caps has no cap above zero for deposit_asset %s", vec.ID, vec.Input.DepositAsset)
+	}
+	if len(vec.PreState) != 0 {
+		t.Fatalf("%s: pre_state has %d entries, want none", vec.ID, len(vec.PreState))
+	}
+}
+
 // checkValidationRejection is the validation_rejection shape's whole
 // check: a kind-4 finalize rejected by a module the validator refuses,
-// or by pending metadata that DecodeContractMetadata rejects, exactly
-// one of the two, with the rule it refuses it by named in
-// rejectionReasons.
+// by a validated module that module.Instrument refuses, by pending
+// metadata that DecodeContractMetadata rejects, or by staged bytes
+// that do not hash to input.code_hash, exactly one of the four, with
+// the rule it refuses it by named in rejectionReasons.
 func checkValidationRejection(t *testing.T, vec vectorJSON) {
 	t.Helper()
 
@@ -1540,8 +1651,12 @@ func checkValidationRejection(t *testing.T, vec vectorJSON) {
 	if moduleHash != vec.CodeHash {
 		t.Fatalf("validation_rejection: sha3(module_wasm_hex) = %s, want code_hash %s", moduleHash, vec.CodeHash)
 	}
-	if vec.Input == nil || vec.Input.CodeHash != vec.CodeHash {
-		t.Fatalf("validation_rejection: input.code_hash disagrees with code_hash %s", vec.CodeHash)
+	if vec.Input == nil {
+		t.Fatalf("validation_rejection: input is absent")
+	}
+	var hashErr error
+	if vec.Input.CodeHash != vec.CodeHash {
+		hashErr = errAssemblyHash
 	}
 	if vec.Receipt.ContractID != zeroHashHex || vec.Receipt.CodeHash != zeroHashHex {
 		t.Fatalf("validation_rejection: receipt.contract_id = %s, receipt.code_hash = %s, want both zero", vec.Receipt.ContractID, vec.Receipt.CodeHash)
@@ -1562,19 +1677,25 @@ func checkValidationRejection(t *testing.T, vec vectorJSON) {
 	}
 
 	validateErr := module.Validate(moduleRaw, moduleLimits())
+	var instrumentErr error
+	if validateErr == nil {
+		_, instrumentErr = module.Instrument(moduleRaw, moduleLimits())
+	}
 	_, metadataErr := codec.DecodeContractMetadata(mustHex(t, *vec.PendingMetadataHex))
 
-	switch {
-	case validateErr != nil && metadataErr == nil:
-		if !errors.Is(validateErr, want) {
-			t.Fatalf("validation_rejection: %s: Validate err = %v, want errors.Is(..., %v)", vec.ID, validateErr, want)
+	var cause error
+	causes := 0
+	for _, err := range []error{validateErr, instrumentErr, metadataErr, hashErr} {
+		if err != nil {
+			cause = err
+			causes++
 		}
-	case validateErr == nil && metadataErr != nil:
-		if !errors.Is(metadataErr, want) {
-			t.Fatalf("validation_rejection: %s: DecodeContractMetadata err = %v, want errors.Is(..., %v)", vec.ID, metadataErr, want)
-		}
-	default:
-		t.Fatalf("validation_rejection: %s: got Validate=%v DecodeContractMetadata=%v, want exactly one non-nil", vec.ID, validateErr, metadataErr)
+	}
+	if causes != 1 {
+		t.Fatalf("validation_rejection: %s: got Validate=%v Instrument=%v DecodeContractMetadata=%v assemblyHash=%v, want exactly one non-nil", vec.ID, validateErr, instrumentErr, metadataErr, hashErr)
+	}
+	if !errors.Is(cause, want) {
+		t.Fatalf("validation_rejection: %s: cause = %v, want errors.Is(..., %v)", vec.ID, cause, want)
 	}
 }
 
@@ -3808,6 +3929,182 @@ func checkConditions(t *testing.T, vec vectorJSON, status string, want blobCondi
 	return eff
 }
 
+// checkUpgradeCaller asserts that vec's pre_state holds an
+// OWNER_UPGRADEABLE policy leaf and an owner leaf, and that the owner leaf
+// is the caller exactly when wantOwner is set.
+func checkUpgradeCaller(t *testing.T, vec vectorJSON, wantOwner bool) {
+	t.Helper()
+	contractID := mustHex(t, vec.Receipt.ContractID)
+	key3 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x03}))
+	key4 := hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x04}))
+	if vec.PreState[key3] != "01" {
+		t.Fatalf("%s: pre_state policy leaf = %q, want 01 (OWNER_UPGRADEABLE)", vec.ID, vec.PreState[key3])
+	}
+	ownerHex, ok := vec.PreState[key4]
+	if !ok {
+		t.Fatalf("%s: pre_state has no owner leaf", vec.ID)
+	}
+	caller := hashOf(crypto.Hash([]byte("L1_CALLER:"), mustHex(t, vec.L1Sender)))
+	if isOwner := ownerHex == hex.EncodeToString(caller[:]); isOwner != wantOwner {
+		t.Fatalf("%s: owner leaf is the caller = %v, want %v", vec.ID, isOwner, wantOwner)
+	}
+}
+
+// upgradeKeys returns the hex keys of the code-hash and pre-code-hash leaves of vec's contract.
+func upgradeKeys(t *testing.T, vec vectorJSON) (key1, key2 string) {
+	t.Helper()
+	contractID := mustHex(t, vec.Receipt.ContractID)
+	return hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x01})), hex.EncodeToString(crypto.Hash(contractID, []byte{0x00, 0x02}))
+}
+
+func requireStatus(t *testing.T, vec vectorJSON, want string) {
+	t.Helper()
+	if vec.Status != want {
+		t.Fatalf("%s: status = %s, want %s", vec.ID, vec.Status, want)
+	}
+}
+
+func requireValid(t *testing.T, vec vectorJSON, moduleRaw []byte) {
+	t.Helper()
+	if err := module.Validate(moduleRaw, moduleLimits()); err != nil {
+		t.Fatalf("%s: Validate: %v, want nil", vec.ID, err)
+	}
+}
+
+func instrumentedHashOf(t *testing.T, vec vectorJSON, moduleRaw []byte) string {
+	t.Helper()
+	instrumented, err := module.Instrument(moduleRaw, moduleLimits())
+	if err != nil {
+		t.Fatalf("%s: Instrument: %v", vec.ID, err)
+	}
+	return hex.EncodeToString(crypto.Hash(instrumented))
+}
+
+// checkCVDEPLOY3 is the CV-DEPLOY-3 invariant: the module spans exactly two chunks, and
+// assembling them in descending chunk_index order would not hash to input.code_hash.
+func checkCVDEPLOY3(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "SUCCESS")
+	if vec.InputKind != 4 {
+		t.Fatalf("CV-DEPLOY-3: input_kind = %d, want 4", vec.InputKind)
+	}
+	raw := mustHex(t, vec.ModuleWasmHex)
+	if len(raw) <= MaxDeployChunkData || len(raw) > 2*MaxDeployChunkData {
+		t.Fatalf("CV-DEPLOY-3: len(module) = %d, want in (%d, %d]", len(raw), MaxDeployChunkData, 2*MaxDeployChunkData)
+	}
+	swapped := append(append([]byte{}, raw[MaxDeployChunkData:]...), raw[:MaxDeployChunkData]...)
+	if hex.EncodeToString(crypto.Hash(swapped)) == vec.Input.CodeHash {
+		t.Fatalf("CV-DEPLOY-3: descending-order assembly hashes to input.code_hash, want a different hash")
+	}
+}
+
+// checkCVDEPLOYHASH1 is the CV-DEPLOY-HASH-1 invariant: the assembly hash is the only
+// failing check.
+func checkCVDEPLOYHASH1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	if vec.InputKind != 4 {
+		t.Fatalf("CV-DEPLOY-HASH-1: input_kind = %d, want 4", vec.InputKind)
+	}
+	raw := mustHex(t, vec.ModuleWasmHex)
+	if hex.EncodeToString(crypto.Hash(raw)) == vec.Input.CodeHash {
+		t.Fatalf("CV-DEPLOY-HASH-1: sha3(module) equals input.code_hash, want a mismatch")
+	}
+	requireValid(t, vec, raw)
+	if _, err := codec.DecodeContractMetadata(mustHex(t, *vec.PendingMetadataHex)); err != nil {
+		t.Fatalf("CV-DEPLOY-HASH-1: DecodeContractMetadata: %v, want nil", err)
+	}
+}
+
+// checkCVUPGRADEUNAUTH2 is the CV-UPGRADE-UNAUTH-2 invariant: the owner leaf is not the
+// caller and the module is valid.
+func checkCVUPGRADEUNAUTH2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "UNAUTHORIZED")
+	checkUpgradeCaller(t, vec, false)
+	requireValid(t, vec, mustHex(t, vec.ModuleWasmHex))
+}
+
+// checkCVUPGRADEORDER1 is the CV-UPGRADE-ORDER-1 invariant: the module fails validation, so
+// the UNAUTHORIZED status shows authorization ran first.
+func checkCVUPGRADEORDER1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "UNAUTHORIZED")
+	checkUpgradeCaller(t, vec, false)
+	if module.Validate(mustHex(t, vec.ModuleWasmHex), moduleLimits()) == nil {
+		t.Fatalf("CV-UPGRADE-ORDER-1: Validate = nil, want an error")
+	}
+}
+
+// checkCVUPGRADEINVALID1 is the CV-UPGRADE-INVALID-1 invariant: the caller is the owner, the
+// module fails validation and the receipt keeps the current CodeHash.
+func checkCVUPGRADEINVALID1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkUpgradeCaller(t, vec, true)
+	if module.Validate(mustHex(t, vec.ModuleWasmHex), moduleLimits()) == nil {
+		t.Fatalf("CV-UPGRADE-INVALID-1: Validate = nil, want an error")
+	}
+	key1, _ := upgradeKeys(t, vec)
+	if vec.Receipt.CodeHash != vec.PreState[key1] {
+		t.Fatalf("CV-UPGRADE-INVALID-1: receipt.code_hash = %s, want pre_state's %s", vec.Receipt.CodeHash, vec.PreState[key1])
+	}
+}
+
+// checkCVUPGRADEHASH1 is the CV-UPGRADE-HASH-1 invariant: the module is valid and
+// instruments to a new CodeHash, so the assembly hash is the only cause of the refusal.
+func checkCVUPGRADEHASH1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkUpgradeCaller(t, vec, true)
+	raw := mustHex(t, vec.ModuleWasmHex)
+	if hex.EncodeToString(crypto.Hash(raw)) == vec.Input.NewCodeHash {
+		t.Fatalf("CV-UPGRADE-HASH-1: sha3(module) equals input.new_code_hash, want a mismatch")
+	}
+	requireValid(t, vec, raw)
+	key1, _ := upgradeKeys(t, vec)
+	if instrumentedHashOf(t, vec, raw) == vec.PreState[key1] {
+		t.Fatalf("CV-UPGRADE-HASH-1: the module instruments to the current CodeHash, want a new one")
+	}
+	if vec.Receipt.CodeHash != vec.PreState[key1] {
+		t.Fatalf("CV-UPGRADE-HASH-1: receipt.code_hash = %s, want pre_state's %s", vec.Receipt.CodeHash, vec.PreState[key1])
+	}
+}
+
+// checkCVUPGRADESAMEHASH1 is the CV-UPGRADE-SAMEHASH-1 invariant: the staged module is the
+// contract's current module.
+func checkCVUPGRADESAMEHASH1(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkUpgradeCaller(t, vec, true)
+	raw := mustHex(t, vec.ModuleWasmHex)
+	requireValid(t, vec, raw)
+	key1, key2 := upgradeKeys(t, vec)
+	if hex.EncodeToString(crypto.Hash(raw)) != vec.PreState[key2] {
+		t.Fatalf("CV-UPGRADE-SAMEHASH-1: sha3(module) differs from pre_state's current module hash %s", vec.PreState[key2])
+	}
+	if got := instrumentedHashOf(t, vec, raw); got != vec.PreState[key1] || got != vec.Receipt.CodeHash {
+		t.Fatalf("CV-UPGRADE-SAMEHASH-1: instrumented hash = %s, want pre_state's %s and receipt.code_hash %s", got, vec.PreState[key1], vec.Receipt.CodeHash)
+	}
+}
+
+// checkCVUPGRADESAMEHASH2 is the CV-UPGRADE-SAMEHASH-2 invariant: the staged module differs
+// from the current one in its source bytes but instruments to the current CodeHash.
+func checkCVUPGRADESAMEHASH2(t *testing.T, vec vectorJSON) {
+	t.Helper()
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkUpgradeCaller(t, vec, true)
+	raw := mustHex(t, vec.ModuleWasmHex)
+	requireValid(t, vec, raw)
+	key1, key2 := upgradeKeys(t, vec)
+	if hex.EncodeToString(crypto.Hash(raw)) == vec.PreState[key2] {
+		t.Fatalf("CV-UPGRADE-SAMEHASH-2: sha3(module) equals pre_state's current module hash, want a distinct source")
+	}
+	if got := instrumentedHashOf(t, vec, raw); got != vec.PreState[key1] || got != vec.Receipt.CodeHash {
+		t.Fatalf("CV-UPGRADE-SAMEHASH-2: instrumented hash = %s, want pre_state's %s and receipt.code_hash %s", got, vec.PreState[key1], vec.Receipt.CodeHash)
+	}
+}
+
 var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"EXEC-002":           checkN1WitnessBackendTripwire,
 	"CV-FRAME-1":         checkCVFRAME1,
@@ -3839,84 +4136,92 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 	"CV-QUOTA-2": func(t *testing.T, vec vectorJSON) {
 		checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
 	},
-	"CV-QUOTA-4":    checkCVQUOTA4ZeroDelta,
-	"CV-QUOTA-5":    checkCVQUOTA5ReservedQuotaKey,
-	"CV-CAP-1":      checkCVCAP1,
-	"CV-CAP-2":      checkCVCAP2,
-	"CV-CAP-3":      checkCVCAP3,
-	"CV-CAP-4":      checkCVCAP4,
-	"CV-CAP-5":      checkCVCAP5,
-	"CV-CAP-6":      checkCVCAP6,
-	"CV-CAP-7":      checkCVCAP7,
-	"CV-CAP-8":      checkCVCAP8,
-	"CV-CAP-9":      checkCVCAP9,
-	"CV-CAP-10":     checkCVCAP10,
-	"CV-CAP-11":     checkCVCAP11,
-	"CV-CAP-12":     checkCVCAP12,
-	"CV-ASSETS-3":   checkCVASSETS3,
-	"CV-ASSETS-4":   checkCVASSETS4,
-	"CV-ASSETS-5":   checkCVASSETS5,
-	"CV-ORDER-1":    checkCVORDER1,
-	"CV-ORDER-2":    checkCVORDER2,
-	"CV-ORDER-3":    checkCVORDER3,
-	"CV-ORDER-4":    checkCVORDER4,
-	"CV-ORDER-5":    checkCVORDER5,
-	"CV-ORDER-6":    checkCVORDER6,
-	"CV-ORDER-7":    checkCVORDER7,
-	"CV-ORDER-8":    checkCVORDER8,
-	"CV-ORDER-9":    checkCVORDER9,
-	"CV-ORDER-10":   checkCVORDER10,
-	"CV-ORDER-11":   checkCVORDER11,
-	"CV-ORDER-12":   checkCVORDER12,
-	"CV-ORDER-13":   checkCVORDER13,
-	"CV-ORDER-14":   checkCVORDER14,
-	"CV-ORDER-15":   checkCVORDER15,
-	"CV-ORDER-16":   checkCVORDER16,
-	"CV-ATTR-1":     checkCVATTR1,
-	"CV-ATTR-2":     checkCVATTR2,
-	"CV-ATTR-3":     checkCVATTR3,
-	"CV-DECODE-1":   checkCVDECODE1,
-	"CV-DECODE-2":   checkCVDECODE2,
-	"CV-DECODE-3":   checkCVDECODE3,
-	"CV-DECODE-4":   checkCVDECODE4,
-	"CV-DECODE-5":   checkCVDECODE5,
-	"CV-DECODE-6":   checkCVDECODE6,
-	"CV-DECODE-7":   checkCVDECODE7,
-	"CV-DECODE-8":   checkCVDECODE8,
-	"CV-DECODE-9":   checkCVDECODE9,
-	"CV-DECODE-10":  checkCVDECODE10,
-	"CV-DECODE-11":  checkCVDECODE11,
-	"CV-LIMIT-1":    checkCVLIMIT1,
-	"CV-LIMIT-2":    checkCVLIMIT2,
-	"CV-LIMIT-3":    checkCVLIMIT3,
-	"CV-LIMIT-4":    checkCVLIMIT4,
-	"CV-LIMIT-5":    checkCVLIMIT5,
-	"CV-LIMIT-6":    checkCVLIMIT6,
-	"CV-LIMIT-7":    checkCVLIMIT7,
-	"CV-LIMIT-8":    checkCVLIMIT8,
-	"CV-LIMIT-9":    checkCVLIMIT9,
-	"CV-LIMIT-10":   checkCVLIMIT10,
-	"CV-LIMIT-11":   checkCVLIMIT11,
-	"CV-LIMIT-12":   checkCVLIMIT12,
-	"CV-LIMIT-13":   checkCVLIMIT13,
-	"CV-DECODE-12":  checkCVDECODE12,
-	"CV-DECODE-13":  checkCVDECODE13,
-	"CV-DECODE-14":  checkCVDECODE14,
-	"CV-DECODE-15":  checkCVDECODE15,
-	"CV-DECODE-16":  checkCVDECODE16,
-	"CV-DECODE-17":  checkCVDECODE17,
-	"CV-DECODE-18":  checkCVDECODE18,
-	"CV-DECODE-19":  checkCVDECODE19,
-	"CV-STATE-1":    checkCVSTATE1,
-	"CV-STATE-2":    checkCVSTATE2,
-	"CV-STATE-3":    checkCVSTATE3,
-	"CV-RESERVED-1": checkCVRESERVED1,
-	"CV-QUOTA-9":    checkCVQUOTA9,
-	"EXEC-DEP-6":    checkEXECDEP6,
-	"EXEC-DEP-7":    checkEXECDEP7,
-	"EXEC-DEP-8":    checkEXECDEP8,
-	"EXEC-DEP-9":    checkEXECDEP9,
-	"EXEC-DEP-10":   checkEXECDEP10,
+	"CV-QUOTA-4":            checkCVQUOTA4ZeroDelta,
+	"CV-DEPLOY-3":           checkCVDEPLOY3,
+	"CV-DEPLOY-HASH-1":      checkCVDEPLOYHASH1,
+	"CV-UPGRADE-UNAUTH-2":   checkCVUPGRADEUNAUTH2,
+	"CV-UPGRADE-ORDER-1":    checkCVUPGRADEORDER1,
+	"CV-UPGRADE-INVALID-1":  checkCVUPGRADEINVALID1,
+	"CV-UPGRADE-HASH-1":     checkCVUPGRADEHASH1,
+	"CV-UPGRADE-SAMEHASH-1": checkCVUPGRADESAMEHASH1,
+	"CV-UPGRADE-SAMEHASH-2": checkCVUPGRADESAMEHASH2,
+	"CV-QUOTA-5":            checkCVQUOTA5ReservedQuotaKey,
+	"CV-CAP-1":              checkCVCAP1,
+	"CV-CAP-2":              checkCVCAP2,
+	"CV-CAP-3":              checkCVCAP3,
+	"CV-CAP-4":              checkCVCAP4,
+	"CV-CAP-5":              checkCVCAP5,
+	"CV-CAP-6":              checkCVCAP6,
+	"CV-CAP-7":              checkCVCAP7,
+	"CV-CAP-8":              checkCVCAP8,
+	"CV-CAP-9":              checkCVCAP9,
+	"CV-CAP-10":             checkCVCAP10,
+	"CV-CAP-11":             checkCVCAP11,
+	"CV-CAP-12":             checkCVCAP12,
+	"CV-ASSETS-3":           checkCVASSETS3,
+	"CV-ASSETS-4":           checkCVASSETS4,
+	"CV-ASSETS-5":           checkCVASSETS5,
+	"CV-ORDER-1":            checkCVORDER1,
+	"CV-ORDER-2":            checkCVORDER2,
+	"CV-ORDER-3":            checkCVORDER3,
+	"CV-ORDER-4":            checkCVORDER4,
+	"CV-ORDER-5":            checkCVORDER5,
+	"CV-ORDER-6":            checkCVORDER6,
+	"CV-ORDER-7":            checkCVORDER7,
+	"CV-ORDER-8":            checkCVORDER8,
+	"CV-ORDER-9":            checkCVORDER9,
+	"CV-ORDER-10":           checkCVORDER10,
+	"CV-ORDER-11":           checkCVORDER11,
+	"CV-ORDER-12":           checkCVORDER12,
+	"CV-ORDER-13":           checkCVORDER13,
+	"CV-ORDER-14":           checkCVORDER14,
+	"CV-ORDER-15":           checkCVORDER15,
+	"CV-ORDER-16":           checkCVORDER16,
+	"CV-ATTR-1":             checkCVATTR1,
+	"CV-ATTR-2":             checkCVATTR2,
+	"CV-ATTR-3":             checkCVATTR3,
+	"CV-DECODE-1":           checkCVDECODE1,
+	"CV-DECODE-2":           checkCVDECODE2,
+	"CV-DECODE-3":           checkCVDECODE3,
+	"CV-DECODE-4":           checkCVDECODE4,
+	"CV-DECODE-5":           checkCVDECODE5,
+	"CV-DECODE-6":           checkCVDECODE6,
+	"CV-DECODE-7":           checkCVDECODE7,
+	"CV-DECODE-8":           checkCVDECODE8,
+	"CV-DECODE-9":           checkCVDECODE9,
+	"CV-DECODE-10":          checkCVDECODE10,
+	"CV-DECODE-11":          checkCVDECODE11,
+	"CV-LIMIT-1":            checkCVLIMIT1,
+	"CV-LIMIT-2":            checkCVLIMIT2,
+	"CV-LIMIT-3":            checkCVLIMIT3,
+	"CV-LIMIT-4":            checkCVLIMIT4,
+	"CV-LIMIT-5":            checkCVLIMIT5,
+	"CV-LIMIT-6":            checkCVLIMIT6,
+	"CV-LIMIT-7":            checkCVLIMIT7,
+	"CV-LIMIT-8":            checkCVLIMIT8,
+	"CV-LIMIT-9":            checkCVLIMIT9,
+	"CV-LIMIT-10":           checkCVLIMIT10,
+	"CV-LIMIT-11":           checkCVLIMIT11,
+	"CV-LIMIT-12":           checkCVLIMIT12,
+	"CV-LIMIT-13":           checkCVLIMIT13,
+	"CV-DECODE-12":          checkCVDECODE12,
+	"CV-DECODE-13":          checkCVDECODE13,
+	"CV-DECODE-14":          checkCVDECODE14,
+	"CV-DECODE-15":          checkCVDECODE15,
+	"CV-DECODE-16":          checkCVDECODE16,
+	"CV-DECODE-17":          checkCVDECODE17,
+	"CV-DECODE-18":          checkCVDECODE18,
+	"CV-DECODE-19":          checkCVDECODE19,
+	"CV-STATE-1":            checkCVSTATE1,
+	"CV-STATE-2":            checkCVSTATE2,
+	"CV-STATE-3":            checkCVSTATE3,
+	"CV-RESERVED-1":         checkCVRESERVED1,
+	"CV-QUOTA-9":            checkCVQUOTA9,
+	"EXEC-DEP-6":            checkEXECDEP6,
+	"EXEC-DEP-7":            checkEXECDEP7,
+	"EXEC-DEP-8":            checkEXECDEP8,
+	"EXEC-DEP-9":            checkEXECDEP9,
+	"EXEC-DEP-10":           checkEXECDEP10,
 	"CV-ABORT-1": func(t *testing.T, vec vectorJSON) {
 		checkAbortRow(t, vec, "REVERT", 7, abortGas(t, 40))
 		checkRevertData(t, vec, 40)
@@ -3952,6 +4257,63 @@ var namedInvariants = map[string]func(t *testing.T, vec vectorJSON){
 		checkAbortRow(t, vec, "REVERT", 7, abortGas(t, 40))
 		checkRevertData(t, vec, 40)
 	},
+
+	"CV-TRAP-DIV-1":   checkCVTRAPDIV1,
+	"CV-TRAP-OVF-1":   checkCVTRAPOVF1,
+	"CV-TRAP-MEM-1":   checkCVTRAPMEM1,
+	"CV-TRAP-TABLE-1": checkCVTRAPTABLE1,
+	"CV-TRAP-NULL-1":  checkCVTRAPNULL1,
+	"CV-TRAP-SIG-1":   checkCVTRAPSIG1,
+	"CV-NEG-1":        checkCVNEG1,
+	"CV-NEG-2":        checkCVNEG2,
+	"CV-FRAME-2":      checkCVFRAME2,
+	"CV-FRAME-3":      checkCVFRAME3,
+	"CV-GROW-2":       checkCVGROW2,
+	"CV-GROW-3":       checkCVGROW3,
+	"CV-GROW-4":       checkCVGROW4,
+	"CV-GROW-5":       checkCVGROW5,
+	"CV-READ-3":       checkCVREAD3,
+	"CV-READ-4":       checkCVREAD4,
+	"CV-READ-5":       checkCVREAD5,
+	"CV-READ-6":       checkCVREAD6,
+	"CV-READ-7":       checkCVREAD7,
+	"CV-EVENTS-1":     checkCVEVENTS1,
+	"EXEC-DEP-12":     checkEXECDEP12,
+	"CV-MEM-MIN-1":    checkCVMEMMIN1,
+
+	"CV-STRUCT-TYPES-1":       checkCVSTRUCTTYPES1,
+	"CV-STRUCT-TYPEPARAMS-1":  checkCVSTRUCTTYPEPARAMS1,
+	"CV-STRUCT-PARAMS-1":      checkCVSTRUCTPARAMS1,
+	"CV-STRUCT-FUNCS-1":       checkCVSTRUCTFUNCS1,
+	"CV-STRUCT-TABLE-1":       checkCVSTRUCTTABLE1,
+	"CV-STRUCT-GLOBALS-1":     checkCVSTRUCTGLOBALS1,
+	"CV-STRUCT-ELEMS-1":       checkCVSTRUCTELEMS1,
+	"CV-STRUCT-DATA-1":        checkCVSTRUCTDATA1,
+	"CV-STRUCT-LOCALS-1":      checkCVSTRUCTLOCALS1,
+	"CV-STRUCT-TOTALLOCALS-1": checkCVSTRUCTTOTALLOCALS1,
+	"CV-STRUCT-ATCAP-1":       checkCVSTRUCTATCAP1,
+	"CV-FIT-DATA-1":           checkCVFITDATA1,
+	"CV-FIT-ELEM-1":           checkCVFITELEM1,
+	"CV-IMPORT-MODULE-1":      checkCVIMPORTMODULE1,
+	"CV-IMPORT-NAME-1":        checkCVIMPORTNAME1,
+	"CV-IMPORT-DUP-1":         checkCVIMPORTDUP1,
+	"CV-IMPORT-SIG-1":         checkCVIMPORTSIG1,
+	"CV-IMPORT-KIND-1":        checkCVIMPORTKIND1,
+	"CV-SECTION-START-1":      checkCVSECTIONSTART1,
+	"CV-SECTION-CUSTOM-1":     checkCVSECTIONCUSTOM1,
+	"CV-SECTION-CUSTOM-2":     checkCVSECTIONCUSTOM2,
+	"CV-EXPORT-MUTGLOBAL-1":   checkCVEXPORTMUTGLOBAL1,
+	"CV-EXPORT-START-1":       checkCVEXPORTSTART1,
+	"CV-EXPORT-ZENON-1":       checkCVEXPORTZENON1,
+	"CV-EXPORT-NORUN-1":       checkCVEXPORTNORUN1,
+	"CV-EXPORT-NOMEMORY-1":    checkCVEXPORTNOMEMORY1,
+	"CV-EXPORT-RUNSIG-1":      checkCVEXPORTRUNSIG1,
+	"CV-EXPORT-RUNIMPORT-1":   checkCVEXPORTRUNIMPORT1,
+	"CV-INSTR-SIZE-1":         checkCVINSTRSIZE1,
+	"CV-LEB-PADDED-1":         checkCVLEBPADDED1,
+
+	"CV-DEPOSIT-UNDEPLOYED-1": func(t *testing.T, vec vectorJSON) { checkUndeployedRow(t, vec, 1) },
+	"CV-CALL-UNDEPLOYED-1":    func(t *testing.T, vec vectorJSON) { checkUndeployedRow(t, vec, 0) },
 }
 
 // TestConformanceVectors re-derives every committed value in the
@@ -4405,4 +4767,792 @@ func TestCapVectorsRejectWrongImplementations(t *testing.T) {
 			t.Errorf("wrong implementation %q gets every CV-CAP vector's status right", name)
 		}
 	}
+}
+
+// hx decodes whitespace-separated hex bytes.
+func hx(t *testing.T, s string) []byte {
+	t.Helper()
+	return mustHex(t, strings.Join(strings.Fields(s), ""))
+}
+
+// checkModuleHas fails unless vec's module_wasm_hex contains the hex of want.
+func checkModuleHas(t *testing.T, vec vectorJSON, want []byte) {
+	t.Helper()
+	if !strings.Contains(vec.ModuleWasmHex, hex.EncodeToString(want)) {
+		t.Fatalf("%s: module_wasm_hex does not contain %x", vec.ID, want)
+	}
+}
+
+// checkTrapRow asserts a run-time trap: status RUNTIME_FAULT, abort_code 0, no returned blob,
+// a module containing prefix (the trapping code), and gas_used equal to InitialMemoryCost(1)
+// plus the table cost of each opcode in ops plus hostGas. ops lists every opcode of the
+// segment the trap interrupts and of the segments before it: each segment is charged in full
+// at its entry.
+func checkTrapRow(t *testing.T, vec vectorJSON, prefix, ops []byte, hostGas uint64) {
+	t.Helper()
+	requireStatus(t, vec, "RUNTIME_FAULT")
+	if vec.Receipt.AbortCode != 0 {
+		t.Fatalf("%s: receipt.abort_code = %d, want 0", vec.ID, vec.Receipt.AbortCode)
+	}
+	if vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("%s: contract_effects_blob_hex is present, want absent", vec.ID)
+	}
+	checkModuleHas(t, vec, prefix)
+	want := module.InitialMemoryCost(1) + hostGas
+	for _, op := range ops {
+		cost, ok := module.OpcodeCost(module.Opcode(op))
+		if !ok {
+			t.Fatalf("%s: no gas-table cost for opcode 0x%02X", vec.ID, op)
+		}
+		want += cost
+	}
+	if vec.GasUsed != want {
+		t.Fatalf("%s: gas_used = %d, want %d", vec.ID, vec.GasUsed, want)
+	}
+}
+
+// readCallPrefix is the storage_read call a fixture body starts with: i32.const keyPtr,
+// keyLen, outPtr and outLen, then call 0.
+func readCallPrefix(keyPtr, keyLen, outPtr, outLen uint32) []byte {
+	return cat(constI32(int64(keyPtr)), constI32(int64(keyLen)), constI32(int64(outPtr)), constI32(int64(outLen)), []byte{0x10, 0x00})
+}
+
+// readPath is the executed opcodes of a hostResultGuardBody fixture that returns normally.
+var readPath = []byte{0x41, 0x41, 0x41, 0x41, 0x10, 0x42, 0x52, 0x04, 0x42, 0x0B}
+
+// readTrapOps is readPath up to the guard's `if`: the segments a storage_read trap interrupts.
+var readTrapOps = []byte{0x41, 0x41, 0x41, 0x41, 0x10, 0x42, 0x52, 0x04}
+
+// requireLeaf asserts sha3(contract_id || key) is in witness_keys and returns its pre_state
+// value and whether it is present.
+func requireLeaf(t *testing.T, vec vectorJSON, key string) ([]byte, bool) {
+	t.Helper()
+	leaf := hex.EncodeToString(crypto.Hash(mustHex(t, vec.Receipt.ContractID), []byte(key)))
+	if !slices.Contains(vec.WitnessKeys, leaf) {
+		t.Fatalf("%s: witness_keys is missing sha3(contract_id || %q) = %s", vec.ID, key, leaf)
+	}
+	v, ok := vec.PreState[leaf]
+	return mustHex(t, v), ok
+}
+
+// requireValue8 asserts the "value8" leaf is witnessed and present with an 8-byte value, and
+// returns the value.
+func requireValue8(t *testing.T, vec vectorJSON) []byte {
+	t.Helper()
+	v, ok := requireLeaf(t, vec, "value8")
+	if !ok || len(v) != 8 {
+		t.Fatalf("%s: pre_state value8 present = %v, length %d, want present with 8 bytes", vec.ID, ok, len(v))
+	}
+	return v
+}
+
+func checkCVTRAPDIV1(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, cat(constI32(1), constI32(0), []byte{0x6E, 0x1A}), hx(t, "41 41 6E 1A 42 0B"), 0)
+}
+
+func checkCVTRAPOVF1(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, cat(constI32(-2147483648), constI32(-1), []byte{0x6D, 0x1A}), hx(t, "41 41 6D 1A 42 0B"), 0)
+}
+
+func checkCVTRAPMEM1(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, cat(constI32(65533), []byte{0x28, 0x02, 0x00, 0x1A}), hx(t, "41 28 1A 42 0B"), 0)
+	// One page, no maximum: byte 65536 is outside memory.
+	checkModuleHas(t, vec, hx(t, "05 03 01 00 01"))
+}
+
+func checkCVTRAPTABLE1(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, cat(constI32(2), []byte{0x11, 0x01, 0x00}), hx(t, "41 11 42 0B"), 0)
+	checkModuleHas(t, vec, hx(t, "04 04 01 70 00 02")) // two table slots
+}
+
+func checkCVTRAPNULL1(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, cat(constI32(1), []byte{0x11, 0x01, 0x00}), hx(t, "41 11 42 0B"), 0)
+	checkModuleHas(t, vec, hx(t, "04 04 01 70 00 02"))
+	checkModuleHas(t, vec, hx(t, "09 07 01 00 41 00 0B 01 01")) // only slot 0 initialized
+}
+
+func checkCVTRAPSIG1(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, cat(constI32(0), constI32(0), constI32(0), []byte{0x11, 0x00, 0x00, 0x1A}), hx(t, "41 41 41 11 1A 42 0B"), 0)
+	// Types (i32,i32)->i64 and ()->(); run is type 0 and f is type 1.
+	checkModuleHas(t, vec, hx(t, "02 60 02 7F 7F 01 7E 60 00 00"))
+	checkModuleHas(t, vec, hx(t, "03 03 02 00 01"))
+	// Slot 0 holds function 1, the ()->() function, and the call expects type 0.
+	checkModuleHas(t, vec, hx(t, "09 07 01 00 41 00 0B 01 01"))
+}
+
+func checkNegRow(t *testing.T, vec vectorJSON, abortCode int32, r int64) {
+	t.Helper()
+	checkAbortRow(t, vec, "REVERT", abortCode, module.InitialMemoryCost(1)+costOf(t, 0x42, 0x0B))
+	checkRevertData(t, vec, 0)
+	if vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("%s: contract_effects_blob_hex is present, want absent", vec.ID)
+	}
+	if vec.Receipt.ReturnHash != zeroHashHex {
+		t.Fatalf("%s: return_hash = %s, want zero", vec.ID, vec.Receipt.ReturnHash)
+	}
+	checkModuleHas(t, vec, cat(constI64(r), []byte{0x0B}))
+}
+
+func checkCVNEG1(t *testing.T, vec vectorJSON) { checkNegRow(t, vec, 7, -7) }
+
+func checkCVNEG2(t *testing.T, vec vectorJSON) { checkNegRow(t, vec, 0, math.MinInt64) }
+
+func checkCVFRAME2(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	frame := mustHex(t, vec.InputFrameHex)
+	if len(frame) != 258 {
+		t.Fatalf("CV-FRAME-2: input frame has %d bytes, want 258", len(frame))
+	}
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("CV-FRAME-2: DecodeExecutionResult: %v", err)
+	}
+	want := cat(frame[250:258], bytes.Repeat([]byte{0xAA}, 8), make([]byte, 8))
+	if !bytes.Equal(er.ReturnData, want) {
+		t.Fatalf("CV-FRAME-2: ReturnData %x, want %x", er.ReturnData, want)
+	}
+	checkModuleHas(t, vec, bytes.Repeat([]byte{0xAA}, 266))
+	checkPathGas(t, vec, 1, 0, cat(bytes.Repeat([]byte{0x41, 0x41, 0x29, 0x37}, 3), []byte{0x42, 0x0B}))
+}
+
+func checkCVFRAME3(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "RUNTIME_FAULT")
+	if want := module.InitialMemoryCost(0); vec.GasUsed != want {
+		t.Fatalf("CV-FRAME-3: gas_used = %d, want %d", vec.GasUsed, want)
+	}
+	if vec.ContractEffectsBlobHex != "" {
+		t.Fatalf("CV-FRAME-3: contract_effects_blob_hex is present, want absent")
+	}
+	if vec.InputFrameHex == "" {
+		t.Fatalf("CV-FRAME-3: input_frame_hex is empty")
+	}
+	checkModuleHas(t, vec, hx(t, "05 03 01 00 00")) // 0 pages
+}
+
+// growPath is the executed opcodes of one growExpectBody that does not trap.
+var growPath = []byte{0x41, 0x40, 0x41, 0x47, 0x04}
+
+func checkCVGROW2(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	checkModuleHas(t, vec, hx(t, "05 04 01 01 01 01"))
+	checkModuleHas(t, vec, growExpectBody(1, -1))
+	checkPathGas(t, vec, 1, 0, cat(growPath, []byte{0x42, 0x0B}))
+}
+
+func checkGrow64(t *testing.T, vec vectorJSON, memSection string) {
+	t.Helper()
+	requireStatus(t, vec, "SUCCESS")
+	checkModuleHas(t, vec, hx(t, memSection))
+	checkModuleHas(t, vec, cat(growExpectBody(63, 1), growExpectBody(1, -1)))
+	checkPathGas(t, vec, 1, module.MemoryGrowPageCost(63), cat(growPath, growPath, []byte{0x42, 0x0B}))
+}
+
+func checkCVGROW3(t *testing.T, vec vectorJSON) { checkGrow64(t, vec, "05 03 01 00 01") }
+
+func checkCVGROW4(t *testing.T, vec vectorJSON) { checkGrow64(t, vec, "05 04 01 01 01 41") }
+
+func checkCVGROW5(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	checkModuleHas(t, vec, hx(t, "05 04 01 01 01 02"))
+	checkModuleHas(t, vec, cat(growExpectBody(1, 1), []byte{0x3F, 0x00}, constI32(2), []byte{0x47, 0x04, 0x40, 0x00, 0x0B}))
+	checkPathGas(t, vec, 1, module.MemoryGrowPageCost(1), hx(t, "41 40 41 47 04 3F 41 47 04 42 0B"))
+}
+
+func checkCVREAD3(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	if _, present := requireLeaf(t, vec, "missing"); present {
+		t.Fatalf("CV-READ-3: pre_state has an entry for the key, want absent")
+	}
+	checkModuleHas(t, vec, readCallPrefix(1024, 7, 65532, 8))
+	checkPathGas(t, vec, 1, module.HostCost(module.HostStorageRead, 0), readPath)
+}
+
+func checkCVREAD4(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	requireValue8(t, vec)
+	checkModuleHas(t, vec, readCallPrefix(1024, 6, 65534, 4))
+	checkPathGas(t, vec, 1, module.HostCost(module.HostStorageRead, 8), readPath)
+}
+
+func checkCVREAD5(t *testing.T, vec vectorJSON) {
+	requireValue8(t, vec)
+	checkTrapRow(t, vec, readCallPrefix(1024, 6, 65528, 16), readTrapOps, module.HostCost(module.HostStorageRead, 8))
+}
+
+func checkCVREAD6(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	v := requireValue8(t, vec)
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("CV-READ-6: DecodeExecutionResult: %v", err)
+	}
+	if want := cat(v, bytes.Repeat([]byte{0xEE}, 8)); !bytes.Equal(er.ReturnData, want) {
+		t.Fatalf("CV-READ-6: ReturnData %x, want %x", er.ReturnData, want)
+	}
+	checkModuleHas(t, vec, bytes.Repeat([]byte{0xEE}, 16))
+	// The contract returns its effects blob from 1032, so the read's out_ptr is 1032 plus the
+	// offset of the return data in that blob. The call reads key (1024, 6) into 16 bytes there.
+	blob := mustHex(t, vec.ContractEffectsBlobHex)
+	if n := bytes.Count(blob, er.ReturnData); n != 1 {
+		t.Fatalf("CV-READ-6: the return data occurs %d times in the effects blob, want 1", n)
+	}
+	at := uint32(bytes.Index(blob, er.ReturnData))
+	checkModuleHas(t, vec, readCallPrefix(1024, 6, 1032+at, 16))
+	checkPathGas(t, vec, 1, module.HostCost(module.HostStorageRead, 8), readPath)
+}
+
+func checkCVREAD7(t *testing.T, vec vectorJSON) {
+	checkTrapRow(t, vec, readCallPrefix(65532, 8, 2048, 8), readTrapOps, module.HostCost(module.HostStorageRead, 0))
+}
+
+func checkCVEVENTS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	er, err := codec.DecodeExecutionResult(mustHex(t, vec.ExecutionResultBlobHex))
+	if err != nil {
+		t.Fatalf("CV-EVENTS-1: DecodeExecutionResult: %v", err)
+	}
+	if len(er.Events) != 3 {
+		t.Fatalf("CV-EVENTS-1: %d events, want 3", len(er.Events))
+	}
+	enc := make([][]byte, 3)
+	leaf := make([]types.Hash, 3)
+	for i, e := range er.Events {
+		if e.EventIndex != uint32(i) {
+			t.Fatalf("CV-EVENTS-1: event %d has event_index %d", i, e.EventIndex)
+		}
+		b, err := e.Encode()
+		if err != nil {
+			t.Fatalf("CV-EVENTS-1: Encode event %d: %v", i, err)
+		}
+		for j := 0; j < i; j++ {
+			if bytes.Equal(enc[j], b) {
+				t.Fatalf("CV-EVENTS-1: events %d and %d have the same encoding", j, i)
+			}
+		}
+		enc[i] = b
+		leaf[i] = hashOf(crypto.Hash(append([]byte{0x00}, b...)))
+	}
+	node := func(l, r types.Hash) types.Hash { return hashOf(crypto.Hash([]byte{0x01}, l[:], r[:])) }
+	duplicated := node(node(leaf[0], leaf[1]), node(leaf[2], leaf[2]))
+	reversed := inlineMerkleRoot([][]byte{enc[2], enc[1], enc[0]})
+	got := vec.Receipt.EventRoot
+	if got == hex.EncodeToString(duplicated[:]) {
+		t.Fatalf("CV-EVENTS-1: event_root equals the root that duplicates the odd leaf")
+	}
+	if got == hex.EncodeToString(reversed[:]) {
+		t.Fatalf("CV-EVENTS-1: event_root equals the root of the reversed order")
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+func checkEXECDEP12(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	if vec.InputKind != 1 {
+		t.Fatalf("EXEC-DEP-12: input_kind %d, want 1", vec.InputKind)
+	}
+	if vec.Input == nil || new(big.Int).SetBytes(mustHex(t, vec.Input.DepositAmount)).Cmp(big.NewInt(1000)) != 0 {
+		t.Fatalf("EXEC-DEP-12: input.deposit_amount is not 1000")
+	}
+	eff, err := codec.DecodeContractEffects(mustHex(t, vec.ContractEffectsBlobHex))
+	if err != nil {
+		t.Fatalf("EXEC-DEP-12: DecodeContractEffects: %v", err)
+	}
+	if len(eff.StateDiff) != 0 || len(eff.Events) != 0 || len(eff.Outbox) != 0 || len(eff.ReturnData) != 0 || eff.ClaimedDeposit != (codec.U256{}) {
+		t.Fatalf("EXEC-DEP-12: the returned blob is not empty with a zero claim")
+	}
+	if vec.Receipt.OutboxCount != 1 || vec.Receipt.EventCount != 0 {
+		t.Fatalf("EXEC-DEP-12: outbox_count %d, event_count %d, want 1 and 0", vec.Receipt.OutboxCount, vec.Receipt.EventCount)
+	}
+	checkPathGas(t, vec, 1, 0, []byte{0x42, 0x0B})
+}
+
+func checkCVMEMMIN1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkModuleHas(t, vec, hx(t, "05 03 01 00 41")) // 65 pages
+}
+
+// moduleSection is one section of a module: its id and its payload. A custom section's
+// payload starts with its length-prefixed name.
+type moduleSection struct {
+	id      byte
+	payload []byte
+}
+
+// moduleSections splits vec's module_wasm_hex into its sections, in order, after checking the
+// 8-byte preamble 00 61 73 6D 01 00 00 00 and that every section's size fits the bytes left.
+func moduleSections(t *testing.T, vec vectorJSON) []moduleSection {
+	t.Helper()
+	raw := mustHex(t, vec.ModuleWasmHex)
+	if len(raw) < 8 || !bytes.Equal(raw[:8], []byte{0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00}) {
+		t.Fatalf("%s: module preamble is not 00 61 73 6D 01 00 00 00", vec.ID)
+	}
+	var out []moduleSection
+	pos := 8
+	for pos < len(raw) {
+		id := raw[pos]
+		pos++
+		size := int(readULEB(t, raw, &pos))
+		if size > len(raw)-pos {
+			t.Fatalf("%s: section %d declares %d bytes, %d remain", vec.ID, id, size, len(raw)-pos)
+		}
+		out = append(out, moduleSection{id: id, payload: raw[pos : pos+size]})
+		pos += size
+	}
+	return out
+}
+
+// sectionOf returns the payload of vec's only section with the given non-zero id, failing
+// when the module has none or more than one.
+func sectionOf(t *testing.T, vec vectorJSON, id byte) []byte {
+	t.Helper()
+	var found []byte
+	n := 0
+	for _, s := range moduleSections(t, vec) {
+		if s.id == id {
+			found = s.payload
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%s: module has %d sections with id %d, want 1", vec.ID, n, id)
+	}
+	return found
+}
+
+// readULEB decodes the unsigned LEB128 at b[*pos] and advances *pos past it.
+func readULEB(t *testing.T, b []byte, pos *int) uint64 {
+	t.Helper()
+	var v uint64
+	for shift := uint(0); shift < 64; shift += 7 {
+		if *pos >= len(b) {
+			t.Fatalf("LEB128 at offset %d runs past the end of %d bytes", *pos, len(b))
+		}
+		c := b[*pos]
+		*pos++
+		v |= uint64(c&0x7F) << shift
+		if c&0x80 == 0 {
+			return v
+		}
+	}
+	t.Fatalf("LEB128 longer than 10 bytes")
+	return 0
+}
+
+// vecCount returns the leading vector count of vec's section id.
+func vecCount(t *testing.T, vec vectorJSON, id byte) uint64 {
+	t.Helper()
+	payload := sectionOf(t, vec, id)
+	pos := 0
+	return readULEB(t, payload, &pos)
+}
+
+// typeParams returns each declared function type's parameter count, from the type section.
+// It fails on a form byte other than 0x60.
+func typeParams(t *testing.T, vec vectorJSON) []uint64 {
+	t.Helper()
+	payload := sectionOf(t, vec, 1)
+	pos := 0
+	n := readULEB(t, payload, &pos)
+	out := make([]uint64, 0, n)
+	for i := uint64(0); i < n; i++ {
+		if pos >= len(payload) || payload[pos] != 0x60 {
+			t.Fatalf("%s: type %d: form byte is not 0x60", vec.ID, i)
+		}
+		pos++
+		params := readULEB(t, payload, &pos)
+		pos += int(params)
+		results := readULEB(t, payload, &pos)
+		pos += int(results)
+		if pos > len(payload) {
+			t.Fatalf("%s: type %d runs past the type section", vec.ID, i)
+		}
+		out = append(out, params)
+	}
+	return out
+}
+
+// funcTypes returns each locally defined function's type index, from the function section.
+func funcTypes(t *testing.T, vec vectorJSON) []uint64 {
+	t.Helper()
+	payload := sectionOf(t, vec, 3)
+	pos := 0
+	n := readULEB(t, payload, &pos)
+	out := make([]uint64, 0, n)
+	for i := uint64(0); i < n; i++ {
+		out = append(out, readULEB(t, payload, &pos))
+	}
+	return out
+}
+
+// funcLocals returns, for each locally defined function, its type's parameter count plus its
+// declared locals (total) and its declared locals alone (declared), read from the type,
+// function and code sections.
+func funcLocals(t *testing.T, vec vectorJSON) (total, declared []uint64) {
+	t.Helper()
+	params := typeParams(t, vec)
+	types := funcTypes(t, vec)
+	code := sectionOf(t, vec, 10)
+	pos := 0
+	n := readULEB(t, code, &pos)
+	if n != uint64(len(types)) {
+		t.Fatalf("%s: %d function bodies for %d functions", vec.ID, n, len(types))
+	}
+	for i := uint64(0); i < n; i++ {
+		size := int(readULEB(t, code, &pos))
+		end := pos + size
+		if end > len(code) {
+			t.Fatalf("%s: function body %d runs past the code section", vec.ID, i)
+		}
+		groups := readULEB(t, code, &pos)
+		var d uint64
+		for g := uint64(0); g < groups; g++ {
+			d += readULEB(t, code, &pos)
+			pos++ // the value type
+		}
+		pos = end
+		if types[i] >= uint64(len(params)) {
+			t.Fatalf("%s: function %d names type %d of %d", vec.ID, i, types[i], len(params))
+		}
+		declared = append(declared, d)
+		total = append(total, params[types[i]]+d)
+	}
+	return total, declared
+}
+
+// elemSegmentSizes returns each element segment's entry count. It fails unless every segment
+// starts 00 41 00 0B (active, at i32.const 0).
+func elemSegmentSizes(t *testing.T, vec vectorJSON) []uint64 {
+	t.Helper()
+	payload := sectionOf(t, vec, 9)
+	pos := 0
+	n := readULEB(t, payload, &pos)
+	out := make([]uint64, 0, n)
+	for i := uint64(0); i < n; i++ {
+		if pos+4 > len(payload) || !bytes.Equal(payload[pos:pos+4], []byte{0x00, 0x41, 0x00, 0x0B}) {
+			t.Fatalf("%s: element segment %d does not start 00 41 00 0B", vec.ID, i)
+		}
+		pos += 4
+		entries := readULEB(t, payload, &pos)
+		for e := uint64(0); e < entries; e++ {
+			readULEB(t, payload, &pos)
+		}
+		out = append(out, entries)
+	}
+	return out
+}
+
+// wasmName is s with its one-byte length prefix; len(s) must be below 128.
+func wasmName(s string) []byte {
+	if len(s) >= 128 {
+		panic("wasmName: name too long")
+	}
+	return append([]byte{byte(len(s))}, s...)
+}
+
+// checkTrailingCustom asserts that vec's last section is a custom section whose payload is
+// want (shorter than 128 bytes), and that the module without that section validates.
+func checkTrailingCustom(t *testing.T, vec vectorJSON, want []byte) {
+	t.Helper()
+	sections := moduleSections(t, vec)
+	last := sections[len(sections)-1]
+	if last.id != 0 || !bytes.Equal(last.payload, want) {
+		t.Fatalf("%s: last section is id %d payload %x, want custom payload %x", vec.ID, last.id, last.payload, want)
+	}
+	raw := mustHex(t, vec.ModuleWasmHex)
+	requireValid(t, vec, raw[:len(raw)-(2+len(want))])
+}
+
+// memRunAt is the export payload of runModuleSpec with run at function index i (below 128).
+func memRunAt(t *testing.T, i byte) []byte {
+	return cat(hx(t, "02"), wasmName("memory"), hx(t, "02 00"), wasmName("run"), []byte{0x00, i})
+}
+
+// memRunTail is the export payload of runModuleSpec with run at index 0 and one more export x.
+func memRunTail(t *testing.T, x []byte) []byte {
+	return cat(hx(t, "03"), wasmName("memory"), hx(t, "02 00"), wasmName("run"), hx(t, "00 00"), x)
+}
+
+// requireSection fails unless vec's only section with the given id has the payload want.
+func requireSection(t *testing.T, vec vectorJSON, id byte, want []byte) {
+	t.Helper()
+	if got := sectionOf(t, vec, id); !bytes.Equal(got, want) {
+		t.Fatalf("%s: section %d = %x, want %x", vec.ID, id, got, want)
+	}
+}
+
+func sumU64(xs []uint64) uint64 {
+	var s uint64
+	for _, x := range xs {
+		s += x
+	}
+	return s
+}
+
+func maxU64(xs []uint64) uint64 {
+	var m uint64
+	for _, x := range xs {
+		m = max(m, x)
+	}
+	return m
+}
+
+func requireCount(t *testing.T, vec vectorJSON, id byte, want uint64) {
+	t.Helper()
+	if got := vecCount(t, vec, id); got != want {
+		t.Fatalf("%s: section %d vector count = %d, want %d", vec.ID, id, got, want)
+	}
+}
+
+func checkCVSTRUCTTYPES1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireCount(t, vec, 1, MaxTypeCount+1)
+}
+
+func checkCVSTRUCTTYPEPARAMS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	params := typeParams(t, vec)
+	at := -1
+	for i, p := range params {
+		if p == MaxLocalsPerFunction+1 {
+			if at != -1 {
+				t.Fatalf("%s: more than one type declares %d parameters", vec.ID, MaxLocalsPerFunction+1)
+			}
+			at = i
+		}
+	}
+	if at == -1 {
+		t.Fatalf("%s: no type declares %d parameters", vec.ID, MaxLocalsPerFunction+1)
+	}
+	if sumU64(params) > MaxTotalParams {
+		t.Fatalf("%s: type parameters sum to %d, want at most %d", vec.ID, sumU64(params), MaxTotalParams)
+	}
+	for _, ft := range funcTypes(t, vec) {
+		if ft == uint64(at) {
+			t.Fatalf("%s: a function uses type %d, want it unused", vec.ID, at)
+		}
+	}
+}
+
+func checkCVSTRUCTPARAMS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	params := typeParams(t, vec)
+	if sumU64(params) != MaxTotalParams+1 {
+		t.Fatalf("%s: type parameters sum to %d, want %d", vec.ID, sumU64(params), MaxTotalParams+1)
+	}
+	if maxU64(params) > MaxLocalsPerFunction {
+		t.Fatalf("%s: a type declares %d parameters, want at most %d", vec.ID, maxU64(params), MaxLocalsPerFunction)
+	}
+}
+
+func checkCVSTRUCTFUNCS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireCount(t, vec, 3, MaxFunctions+1)
+	requireCount(t, vec, 10, MaxFunctions+1)
+}
+
+func checkCVSTRUCTTABLE1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 4, hx(t, "01 70 00 91 4E")) // minimum 10,001
+}
+
+func checkCVSTRUCTGLOBALS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireCount(t, vec, 6, MaxGlobals+1)
+}
+
+func checkCVSTRUCTELEMS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 4, hx(t, "01 70 00 90 4E")) // minimum 10,000
+	sizes := elemSegmentSizes(t, vec)
+	if sumU64(sizes) != MaxTotalElementEntries+1 {
+		t.Fatalf("%s: element segments hold %d entries, want %d", vec.ID, sumU64(sizes), MaxTotalElementEntries+1)
+	}
+	if maxU64(sizes) > MaxTableEntries {
+		t.Fatalf("%s: an element segment holds %d entries, want at most %d so each fits the table", vec.ID, maxU64(sizes), MaxTableEntries)
+	}
+}
+
+func checkCVSTRUCTDATA1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireCount(t, vec, 11, MaxDataSegments+1)
+}
+
+func checkCVSTRUCTLOCALS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	total, declared := funcLocals(t, vec)
+	if len(total) != 1 {
+		t.Fatalf("%s: %d functions, want 1", vec.ID, len(total))
+	}
+	if total[0] != MaxLocalsPerFunction+1 {
+		t.Fatalf("%s: run has %d parameters plus locals, want %d", vec.ID, total[0], MaxLocalsPerFunction+1)
+	}
+	if declared[0] > MaxLocalsPerFunction {
+		t.Fatalf("%s: run declares %d locals, want at most %d", vec.ID, declared[0], MaxLocalsPerFunction)
+	}
+}
+
+func checkCVSTRUCTTOTALLOCALS1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	total, declared := funcLocals(t, vec)
+	if sumU64(total) != MaxTotalLocals+1 {
+		t.Fatalf("%s: parameters plus locals sum to %d, want %d", vec.ID, sumU64(total), MaxTotalLocals+1)
+	}
+	if sumU64(declared) > MaxTotalLocals {
+		t.Fatalf("%s: declared locals sum to %d, want at most %d", vec.ID, sumU64(declared), MaxTotalLocals)
+	}
+	if maxU64(total) > MaxLocalsPerFunction {
+		t.Fatalf("%s: a function has %d parameters plus locals, want at most %d", vec.ID, maxU64(total), MaxLocalsPerFunction)
+	}
+}
+
+func checkCVSTRUCTATCAP1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "SUCCESS")
+	if vec.InputKind != 4 {
+		t.Fatalf("%s: input_kind = %d, want 4", vec.ID, vec.InputKind)
+	}
+	requireCount(t, vec, 1, MaxTypeCount)
+	requireCount(t, vec, 3, MaxFunctions)
+	requireCount(t, vec, 6, MaxGlobals)
+	requireCount(t, vec, 11, MaxDataSegments)
+	requireSection(t, vec, 4, hx(t, "01 70 00 90 4E")) // minimum 10,000
+	sizes := elemSegmentSizes(t, vec)
+	if sumU64(sizes) != MaxTotalElementEntries || sizes[0] != MaxTableEntries {
+		t.Fatalf("%s: element segments %v, want first %d and total %d", vec.ID, sizes, MaxTableEntries, MaxTotalElementEntries)
+	}
+	requireSection(t, vec, 5, hx(t, "01 00 01")) // one page, no maximum
+	if !bytes.Contains(sectionOf(t, vec, 11), hx(t, "00 41 FF FF 03 0B 01 AA")) {
+		t.Fatalf("%s: no data segment of one byte at offset 65,535", vec.ID)
+	}
+	total, _ := funcLocals(t, vec)
+	if maxU64(total) != MaxLocalsPerFunction {
+		t.Fatalf("%s: largest parameters plus locals = %d, want %d", vec.ID, maxU64(total), MaxLocalsPerFunction)
+	}
+	params := typeParams(t, vec)
+	if sumU64(params) != MaxTotalParams || maxU64(params) > MaxLocalsPerFunction {
+		t.Fatalf("%s: type parameters sum to %d with largest %d, want %d and at most %d", vec.ID, sumU64(params), maxU64(params), MaxTotalParams, MaxLocalsPerFunction)
+	}
+}
+
+func checkCVFITDATA1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 5, hx(t, "01 00 01"))
+	requireSection(t, vec, 11, hx(t, "01 00 41 FF FF 03 0B 02 AA BB"))
+}
+
+func checkCVFITELEM1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 4, hx(t, "01 70 00 02"))
+	requireSection(t, vec, 9, hx(t, "01 00 41 01 0B 02 00 00"))
+}
+
+func checkCVIMPORTMODULE1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 1, hx(t, "01 60 02 7F 7F 01 7E"))
+	requireSection(t, vec, 2, cat(hx(t, "01"), wasmName("zenon"), wasmName("storage_len"), hx(t, "00 00")))
+	requireSection(t, vec, 7, memRunAt(t, 1))
+}
+
+func checkCVIMPORTNAME1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 2, cat(hx(t, "01"), wasmName("env"), wasmName("storage_write"), hx(t, "00 00")))
+	requireSection(t, vec, 7, memRunAt(t, 1))
+}
+
+func checkCVIMPORTDUP1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 2, cat(hx(t, "02"), wasmName("env"), wasmName("storage_len"), hx(t, "00 00"), wasmName("env"), wasmName("storage_len"), hx(t, "00 00")))
+	requireSection(t, vec, 7, memRunAt(t, 2))
+}
+
+func checkCVIMPORTSIG1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 1, hx(t, "02 60 02 7F 7F 01 7E 60 01 7F 00"))
+	requireSection(t, vec, 2, cat(hx(t, "01"), wasmName("env"), wasmName("abort"), hx(t, "00 01")))
+	requireSection(t, vec, 7, memRunAt(t, 1))
+}
+
+func checkCVIMPORTKIND1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 2, cat(hx(t, "01"), wasmName("env"), wasmName("storage_len"), hx(t, "03 7F 00")))
+	requireSection(t, vec, 7, memRunAt(t, 0)) // a global import adds no function index
+}
+
+func checkCVSECTIONSTART1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 8, hx(t, "01"))
+	requireSection(t, vec, 3, hx(t, "02 00 01"))
+	requireSection(t, vec, 1, hx(t, "02 60 02 7F 7F 01 7E 60 00 00"))
+}
+
+func checkCVSECTIONCUSTOM1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkTrailingCustom(t, vec, cat(wasmName("name"), hx(t, "00 02 01 6D")))
+}
+
+func checkCVSECTIONCUSTOM2(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	checkTrailingCustom(t, vec, wasmName("zeno"))
+}
+
+func checkCVEXPORTMUTGLOBAL1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 6, hx(t, "01 7F 01 41 00 0B"))
+	requireSection(t, vec, 7, memRunTail(t, cat(wasmName("g"), hx(t, "03 00"))))
+}
+
+func checkCVEXPORTSTART1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 7, memRunTail(t, cat(wasmName("_start"), hx(t, "00 00"))))
+}
+
+func checkCVEXPORTZENON1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 7, memRunTail(t, cat(wasmName("__zenon_gas"), hx(t, "00 00"))))
+}
+
+func checkCVEXPORTNORUN1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 7, cat(hx(t, "01"), wasmName("memory"), hx(t, "02 00")))
+}
+
+func checkCVEXPORTNOMEMORY1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 5, hx(t, "01 00 01"))
+	requireSection(t, vec, 7, cat(hx(t, "01"), wasmName("run"), hx(t, "00 00")))
+}
+
+func checkCVEXPORTRUNSIG1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 1, hx(t, "01 60 02 7F 7F 01 7F"))
+	requireSection(t, vec, 7, memRunAt(t, 0))
+}
+
+func checkCVEXPORTRUNIMPORT1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 1, hx(t, "01 60 02 7F 7F 01 7E"))
+	requireSection(t, vec, 2, cat(hx(t, "01"), wasmName("env"), wasmName("storage_len"), hx(t, "00 00")))
+	requireSection(t, vec, 7, memRunAt(t, 0)) // run is function 0, the import
+}
+
+func checkCVINSTRSIZE1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	if n := len(mustHex(t, vec.ModuleWasmHex)); n > MaxCodeSize {
+		t.Fatalf("%s: module is %d bytes, want at most %d", vec.ID, n, MaxCodeSize)
+	}
+	requireCount(t, vec, 10, 1)
+	want := cat(hx(t, "00 42 00"), bytes.Repeat(hx(t, "0F"), instrSizeReturns), hx(t, "0B"))
+	if !bytes.HasSuffix(sectionOf(t, vec, 10), want) {
+		t.Fatalf("%s: run's body is not i64.const 0 then %d returns", vec.ID, instrSizeReturns)
+	}
+}
+
+func checkCVLEBPADDED1(t *testing.T, vec vectorJSON) {
+	requireStatus(t, vec, "VALIDATION_FAILED")
+	requireSection(t, vec, 10, hx(t, "01 05 80 00 42 00 0B"))
+	raw := mustHex(t, vec.ModuleWasmHex)
+	padded := hx(t, "0A 07 01 05 80 00 42 00 0B")
+	if !bytes.HasSuffix(raw, padded) {
+		t.Fatalf("%s: module does not end with the padded code section %x", vec.ID, padded)
+	}
+	requireValid(t, vec, append(append([]byte{}, raw[:len(raw)-len(padded)]...), hx(t, "0A 06 01 04 00 42 00 0B")...))
 }
