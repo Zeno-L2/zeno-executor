@@ -17,15 +17,15 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/internal/batch"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/workerproc"
-	"github.com/digitalSloth/go-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/batch"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc/ipctest"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
 )
 
 // --- fake sources: structs of funcs, one goroutine at a time per internal/ipc/client_test.go:16-33 ---
@@ -442,9 +442,8 @@ func TestServeMomentaRange(t *testing.T) {
 			t.Fatalf("momentum %d height = %d, want %d", i, dm.Momentum.Height, i+2)
 		}
 	}
-	if sh := servedHeightOf(st); sh != 4 {
-		t.Fatalf("servedHeight = %d, want 4", sh)
-	}
+	// serveMomenta raises servedHeight just after it writes RangeEnd.
+	waitFor(t, 5*time.Second, "servedHeight 4", func() bool { return servedHeightOf(st) == 4 })
 
 	// A later, lower-height request (a reorg rollback) leaves servedHeight where it was.
 	if _, count := requestMomenta(t, wEnd, 1, 1); count != 1 {
@@ -527,9 +526,7 @@ func TestServeMomentaHalvesOversizedRange(t *testing.T) {
 		done := runServe(t, sEnd, WorkerConfig{DomainID: 1}, types.Address{}, src, st)
 
 		checkMomentaRead(t, "read", lm, wEnd, 1, 5, []uint64{1, 2}, []uint64{5, 2})
-		if sh := servedHeightOf(st); sh != 2 {
-			t.Fatalf("servedHeight = %d, want 2", sh)
-		}
+		waitFor(t, 5*time.Second, "servedHeight 2", func() bool { return servedHeightOf(st) == 2 })
 		wEnd.Close()
 		if err := waitServe(t, done); err != nil {
 			t.Fatalf("serve = %v, want nil", err)

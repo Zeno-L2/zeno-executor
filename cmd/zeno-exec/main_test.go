@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
 )
 
 // validModule is a module exporting memory and run, a function of type

@@ -10,7 +10,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // Path is the 32-byte, already-derived SMT position — the same type the shared path-native
@@ -154,6 +154,21 @@ type Domain interface {
 	// hash-verified before use, exactly as the read rule requires. Apply MUST NOT read from, or
 	// write to, anything else in the environment.
 	Apply(state StateAccess, in Input) (Effects, error)
+}
+
+// Pruner is implemented by a domain whose local store keeps entries
+// that only inputs up to some globalInputIndex read.
+type Pruner interface {
+	// Rewind runs each time the runtime restores a position, before
+	// the domain decodes any input there. It deletes the bookkeeping
+	// that decodes of inputs above lastInputSeq wrote, or all of it
+	// when fresh, because those inputs are decoded again or were
+	// retracted. An error halts the domain.
+	Rewind(lastInputSeq uint64, fresh bool) error
+	// Prune runs after a commit. The runtime never applies an input
+	// at or below throughSeq again, and Prune deletes the entries
+	// only such inputs read. An error is a local I/O fault.
+	Prune(throughSeq uint64) error
 }
 
 // RelayPayload is one datum a Source watches on an external chain, destined to be posted to

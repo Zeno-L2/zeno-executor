@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // failsCheck runs check on its own goroutine with a throwaway

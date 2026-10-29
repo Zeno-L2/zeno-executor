@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 func TestUnreachableIsTrapped(t *testing.T) {

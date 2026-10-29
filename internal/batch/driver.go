@@ -11,10 +11,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // MaxBatchInputs is the per-batch input count cap.
@@ -190,9 +190,12 @@ type applied struct {
 //     effects a discarded record produced that it owns: the cursor and
 //     the state trie; and Domain.DecodeInput (called before any
 //     admission or cap decision) can mutate a domain plugin's own
-//     local, non-consensus store outside the state trie. Replay
-//     rewrites every chunk a canonical finalize assembles, because
-//     Settlement accepts a finalize only once every chunk is present.
+//     local, non-consensus store outside the state trie. The loop's
+//     call of domain.Pruner's Rewind after the rollback drops the
+//     prune bookkeeping such a decode wrote; chunks and pending
+//     records stay. Replay rewrites every chunk a canonical finalize
+//     assembles, because Settlement accepts a finalize only once every
+//     chunk is present.
 //     The unrepaired path: the retracted branch saw a pending record
 //     expire and accepted a second DeployContractStart from the same
 //     deployer for the same code_hash; that second record survives the

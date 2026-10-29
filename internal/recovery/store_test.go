@@ -14,9 +14,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // --- fixtures ---
@@ -834,5 +834,28 @@ func TestStorePathsMatchHelpers(t *testing.T) {
 	}
 	if _, err := os.Stat(ReceiptsPath(l.Receipts, h)); err != nil {
 		t.Fatalf("receipt file: %v", err)
+	}
+}
+
+func TestOldestSnapshotSeq(t *testing.T) {
+	cfg := testConfig(t, 2)
+	if _, ok, err := OldestSnapshotSeq(cfg.Layout); err != nil || ok {
+		t.Fatalf("OldestSnapshotSeq on a fresh layout = ok %v, err %v, want ok false", ok, err)
+	}
+
+	c := newCommitter(t, cfg, 1)
+	c.seqMul = 3
+	c.commitEach(1, 1, 12)
+
+	heights := snapshotHeights(t, cfg.Layout)
+	if len(heights) < 2 || heights[0] <= 1 {
+		t.Fatalf("snapshot heights %v: the ladder kept no pruned history to test", heights)
+	}
+	got, ok, err := OldestSnapshotSeq(cfg.Layout)
+	if err != nil || !ok {
+		t.Fatalf("OldestSnapshotSeq = ok %v, err %v, want ok true", ok, err)
+	}
+	if want := heights[0] * 3; got != want {
+		t.Fatalf("OldestSnapshotSeq = %d, want %d (oldest snapshot height %d)", got, want, heights[0])
 	}
 }

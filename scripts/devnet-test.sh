@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the devnet integration test against a freshly wiped go-zenon devnet built from ../go-zenon,
+# Runs the devnet integration test against a freshly wiped go-zenon devnet built from ../../zenon-network/go-zenon,
 # the checkout go.mod's replace directive names. The devnet runs as its own Docker Compose project,
 # so a wipe removes only that project's containers, network and volumes. The devnet is wiped again
 # when the test passes and left running for inspection when it fails. The devnet runs under its own
@@ -7,8 +7,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-zenon=$root/../go-zenon
-project=go-executor-devnet
+zenon=$root/../../zenon-network/go-zenon
+project=zeno-executor-devnet
 
 compose() {
   docker compose -f "$zenon/docker-compose.yml" -f "$root/docker/devnet.override.yml" -p "$project" "$@"

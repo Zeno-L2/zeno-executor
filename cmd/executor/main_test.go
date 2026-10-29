@@ -22,10 +22,10 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/supervisor"
-	"github.com/digitalSloth/go-executor/internal/znnd/znndtest"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/supervisor"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd/znndtest"
 )
 
 // validHash is a well-formed stfSpecHash: 63 zeros then "1" (internal/supervisor/config_test.go:36).
@@ -94,7 +94,7 @@ func TestMain(m *testing.M) {
 	probeKeyPath = filepath.Join(keyDir, "key")
 
 	executorBin = filepath.Join(binDir, "executor")
-	buildExecutor := exec.Command("go", "build", "-o", executorBin, "github.com/digitalSloth/go-executor/cmd/executor")
+	buildExecutor := exec.Command("go", "build", "-o", executorBin, "github.com/Zeno-L2/zeno-executor/cmd/executor")
 	buildExecutor.Stdout = os.Stderr
 	buildExecutor.Stderr = os.Stderr
 	if err := buildExecutor.Run(); err != nil {
@@ -105,7 +105,7 @@ func TestMain(m *testing.M) {
 	}
 
 	probeBin = filepath.Join(binDir, "keyprobe")
-	buildProbe := exec.Command("go", "build", "-ldflags", "-X main.keyPath="+probeKeyPath, "-o", probeBin, "github.com/digitalSloth/go-executor/internal/testbin/keyprobe")
+	buildProbe := exec.Command("go", "build", "-ldflags", "-X main.keyPath="+probeKeyPath, "-o", probeBin, "github.com/Zeno-L2/zeno-executor/internal/testbin/keyprobe")
 	buildProbe.Stdout = os.Stderr
 	buildProbe.Stderr = os.Stderr
 	if err := buildProbe.Run(); err != nil {

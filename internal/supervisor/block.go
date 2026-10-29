@@ -11,7 +11,7 @@ import (
 	"github.com/zenon-network/go-zenon/dp"
 	"github.com/zenon-network/go-zenon/wallet"
 
-	"github.com/digitalSloth/go-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
 )
 
 // blockNode is what buildSend reads from the node. *znnd.Client implements it.

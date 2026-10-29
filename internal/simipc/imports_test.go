@@ -7,10 +7,13 @@ import (
 )
 
 func TestImportDenyList(t *testing.T) {
-	const mod = "github.com/digitalSloth/go-executor/"
-	out, err := exec.Command("go", "list", "-deps", mod+"internal/simipc").CombinedOutput()
+	const mod = "github.com/Zeno-L2/zeno-executor/"
+	cmd := exec.Command("go", "list", "-deps", mod+"internal/simipc")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("go list -deps: %v\n%s", err, out)
+		t.Fatalf("go list -deps: %v\n%s", err, stderr.String())
 	}
 	denied := map[string]bool{"github.com/zenon-network/go-zenon/wallet": true}
 	for _, p := range []string{"internal/supervisor", "internal/ipc", "internal/batch", "runtime", "worker", "plugins/wasm", "plugins/wasm/internal/engine", "plugins/wasm/internal/module"} {

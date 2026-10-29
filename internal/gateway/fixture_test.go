@@ -20,12 +20,12 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/batch"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/batch"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 var (
@@ -479,7 +479,9 @@ func newTestChain(t *testing.T, storage string, s *fakeSettlement) *rig {
 	final := state.OpenEmpty()
 	t.Cleanup(func() { _ = final.Close() })
 	sink := &logSink{}
-	snaps := t.TempDir()
+	// The production layout, <storagePath>/<id>/snapshots, so the cache
+	// guard checks a storage path the test owns.
+	snaps := cachePathsFor(t.TempDir(), 1).snapshots
 	c := NewChain(ChainConfig{
 		DomainID:   1,
 		Source:     NewLocalSource(storage, 1),

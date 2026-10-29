@@ -4,7 +4,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/domain"
 )
 
 // Version is one immutable state: a copy of a CompactTree struct.

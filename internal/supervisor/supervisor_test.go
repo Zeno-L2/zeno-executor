@@ -22,13 +22,13 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
-	"github.com/digitalSloth/go-executor/internal/lease"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc/ipctest"
+	"github.com/Zeno-L2/zeno-executor/internal/lease"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger/ledgertest"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
 )
 
 // --- test worker binary ---
@@ -47,7 +47,7 @@ func TestMain(m *testing.M) {
 	}
 
 	workerBinary = filepath.Join(dir, "worker")
-	build := exec.Command("go", "build", "-o", workerBinary, "github.com/digitalSloth/go-executor/internal/testbin/worker")
+	build := exec.Command("go", "build", "-o", workerBinary, "github.com/Zeno-L2/zeno-executor/internal/testbin/worker")
 	build.Stdout = os.Stderr
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {

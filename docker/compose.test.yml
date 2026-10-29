@@ -4,7 +4,7 @@ services:
       context: ..
       target: build
       additional_contexts:
-        go-zenon: ../../go-zenon
+        go-zenon: ../../../zenon-network/go-zenon
     privileged: true
     cgroup: private
     user: "0:0"

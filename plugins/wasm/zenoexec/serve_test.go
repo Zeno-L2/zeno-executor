@@ -13,7 +13,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/keys"
 )
 
 const testPort = 8547

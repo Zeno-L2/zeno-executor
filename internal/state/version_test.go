@@ -6,7 +6,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/trie"
 
-	"github.com/digitalSloth/go-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/domain"
 )
 
 func TestVersionMatchesStore(t *testing.T) {

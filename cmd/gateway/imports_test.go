@@ -16,12 +16,25 @@ import (
 	"testing"
 )
 
-const mod = "github.com/digitalSloth/go-executor/"
+const mod = "github.com/Zeno-L2/zeno-executor/"
+
+// goList runs go with args and returns its stdout. Stderr, where go
+// reports module downloads, goes into the error only.
+func goList(args ...string) ([]byte, error) {
+	cmd := exec.Command("go", args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("%w\n%s", err, stderr.String())
+	}
+	return out, nil
+}
 
 func TestImportDenyList(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", mod+"cmd/gateway").CombinedOutput()
+	out, err := goList("list", "-deps", mod+"cmd/gateway")
 	if err != nil {
-		t.Fatalf("go list -deps: %v\n%s", err, out)
+		t.Fatalf("go list -deps: %v", err)
 	}
 	denied := map[string]bool{"github.com/zenon-network/go-zenon/wallet": true}
 	for _, p := range []string{"internal/supervisor", "internal/ipc", "internal/batch", "runtime", "worker", "plugins/wasm", "plugins/wasm/internal/engine", "plugins/wasm/internal/module"} {
@@ -108,9 +121,11 @@ func listGraph(t *testing.T, goos string) graph {
 	t.Helper()
 	cmd := exec.Command("go", "list", "-deps", "-f", "{{.ImportPath}}\t{{.Dir}}\t{{join .Imports \",\"}}", gatewayPkg)
 	cmd.Env = append(os.Environ(), "GOOS="+goos, "CGO_ENABLED=0")
-	out, err := cmd.CombinedOutput()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("GOOS=%s go list -deps: %v\n%s", goos, err, out)
+		t.Fatalf("GOOS=%s go list -deps: %v\n%s", goos, err, stderr.String())
 	}
 	g := graph{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {

@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm"
-	"github.com/digitalSloth/go-executor/plugins/wasm/zenoexec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/zenoexec"
 )
 
 // version is set by -ldflags "-X main.version=<v>".

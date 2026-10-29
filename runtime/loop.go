@@ -10,13 +10,13 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/batch"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/batch"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // pollInterval is how long the loop waits when the follower has nothing further: it advances
@@ -128,6 +128,11 @@ func sleep(ctx context.Context, d time.Duration) bool {
 
 // build wires the follower, commit boundary and driver at a ready position.
 func (l *loop) build(rdy recovery.Ready) error {
+	if pr, ok := l.dom.(domain.Pruner); ok {
+		if err := pr.Rewind(rdy.Position.LastInputSeq, rdy.Fresh); err != nil {
+			return fmt.Errorf("runtime: rewind domain store: %w", err)
+		}
+	}
 	startHeight, startOrdinal := uint64(1), uint64(0)
 	if !rdy.Fresh {
 		startHeight, startOrdinal = rdy.Position.MomentumHeight+1, rdy.Position.NextOrdinal
@@ -418,6 +423,40 @@ func (l *loop) commitStep() error {
 		if err := l.cfg.OnCommit(committed, l.withdrawals); err != nil {
 			return fmt.Errorf("runtime: report committed batches: %w", err)
 		}
+	}
+	return l.prune()
+}
+
+// prune hands a domain.Pruner the highest input index this process
+// never applies again: the lower of the finalized anchor's LastInputSeq
+// and OldestSnapshotSeq. Rollback restores only a retained snapshot or
+// genesis, and a replay from genesis rewrites what the domain pruned,
+// so the snapshot bound alone keeps every replayed input readable; the
+// anchor bound defers deletion until the batch is finalized. The anchor
+// is read fresh and never stored in l.anchor, which boot verification
+// owns.
+func (l *loop) prune() error {
+	pr, ok := l.dom.(domain.Pruner)
+	if !ok {
+		return nil
+	}
+	anchor, have, err := l.cfg.Anchors.FinalizedAnchor(l.cfg.DomainID)
+	if err != nil {
+		log.Printf("runtime: prune skipped: read finalized anchor: %v", err)
+		return nil
+	}
+	if !have {
+		return nil
+	}
+	oldest, ok, err := recovery.OldestSnapshotSeq(l.rcfg.Layout)
+	if err != nil {
+		return fmt.Errorf("runtime: prune domain store: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	if err := pr.Prune(min(anchor.LastInputSeq, oldest)); err != nil {
+		return fmt.Errorf("runtime: prune domain store: %w", err)
 	}
 	return nil
 }

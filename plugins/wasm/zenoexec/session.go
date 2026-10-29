@@ -9,11 +9,11 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/batch"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/batch"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/keys"
 )
 
 // mapState is a map-backed domain.StateAccess.

@@ -1,8 +1,8 @@
 package wasm
 
 import (
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // Input is the WASM domain's typed, decoded input: the runtime-observed

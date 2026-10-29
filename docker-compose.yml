@@ -6,7 +6,7 @@ services:
       context: .
       target: runtime
       additional_contexts:
-        go-zenon: ../go-zenon
+        go-zenon: ../../zenon-network/go-zenon
     command: ["-config", "/etc/executor/executor.json"]
     # The image defaults to the gateway's uid. The supervisor needs root
     # to separate worker uids.
@@ -39,7 +39,7 @@ services:
       context: .
       target: runtime
       additional_contexts:
-        go-zenon: ../go-zenon
+        go-zenon: ../../zenon-network/go-zenon
     entrypoint: ["gateway"]
     command: ["-config", "/etc/gateway/gateway.json"]
     user: "9999:9999"

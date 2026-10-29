@@ -23,8 +23,8 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/gateway"
-	"github.com/digitalSloth/go-executor/internal/lease"
+	"github.com/Zeno-L2/zeno-executor/internal/gateway"
+	"github.com/Zeno-L2/zeno-executor/internal/lease"
 )
 
 func TestExitStatus(t *testing.T) {
@@ -498,7 +498,7 @@ func TestRunStartsSimulators(t *testing.T) {
 	if err := os.Chmod(filepath.Dir(bin), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("go", "build", "-o", bin, "github.com/digitalSloth/go-executor/internal/testbin/worker").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/Zeno-L2/zeno-executor/internal/testbin/worker").CombinedOutput(); err != nil {
 		t.Fatalf("build the testbin worker: %v\n%s", err, out)
 	}
 	tree, err := filepath.EvalSymlinks(t.TempDir())

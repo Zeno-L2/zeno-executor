@@ -17,7 +17,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // The index's keys. All integers are big-endian: id is a batch id

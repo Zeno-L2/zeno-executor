@@ -19,7 +19,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/supervisor"
+	"github.com/Zeno-L2/zeno-executor/internal/supervisor"
 )
 
 // listenMarker precedes the address in the gateway's listen line.

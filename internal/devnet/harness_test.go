@@ -29,11 +29,11 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"github.com/zenon-network/go-zenon/wallet"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/supervisor"
-	"github.com/digitalSloth/go-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/supervisor"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
 )
 
 const (
@@ -42,7 +42,7 @@ const (
 	confirmationDepth  = 3
 	domainID           = uint32(1)
 	pillarName         = "dev1"
-	settlementHeight   = uint64(50) // the offchain-execution spork's enforcement height in go-zenon's docker/devnet/genesis.json
+	libp2pHeight       = uint64(10) // go-zenon's docker/devnet/genesis.json enforces offchain-execution at height 0 and switches to libp2p here; a block published before the switch can be lost
 	momentum           = 10 * time.Second
 	poll               = 500 * time.Millisecond
 	depositAmount      = 100  // ZNN base units per deposit
@@ -109,7 +109,7 @@ func newDevnet(t *testing.T) *devnet {
 		t.Fatalf("the node at %s has chain identifier %d, not the devnet's %d", endpoint, m.ChainIdentifier, chainIdentifier)
 	}
 
-	dir, err := os.MkdirTemp("", "go-executor-devnet-")
+	dir, err := os.MkdirTemp("", "zeno-executor-devnet-")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
@@ -338,14 +338,14 @@ func domainParams(status uint8) []any {
 	}
 }
 
-// setup waits for Settlement to activate, then registers domain 1, the executor and the asset
+// setup waits for the libp2p switch, then registers domain 1, the executor and the asset
 // as the network admin, and fuses plasma to the executor address.
 func (d *devnet) setup() {
 	d.t.Helper()
-	d.t.Logf("waiting for the Settlement spork at momentum %d", settlementHeight)
-	d.waitHeight(settlementHeight + 1)
+	d.t.Logf("waiting for momentum %d, after the libp2p switch", libp2pHeight+1)
+	d.waitHeight(libp2pHeight + 1)
 
-	d.view(settlementHeight+1, "fresh devnet", func(v *settlement.View) (bool, string, error) {
+	d.view(libp2pHeight+1, "fresh devnet", func(v *settlement.View) (bool, string, error) {
 		_, ok, err := v.DomainRecord(domainID)
 		return err == nil && !ok, fmt.Sprintf("domain %d registered: %v", domainID, ok), err
 	})
@@ -550,7 +550,7 @@ type executor struct {
 func buildBinaries(t *testing.T, dir string) (executorBin, workerBin, gatewayBin string) {
 	t.Helper()
 	bin := filepath.Join(dir, "bin") + string(filepath.Separator)
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/digitalSloth/go-executor/cmd/executor", "github.com/digitalSloth/go-executor/cmd/worker-wasm", "github.com/digitalSloth/go-executor/cmd/gateway")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/Zeno-L2/zeno-executor/cmd/executor", "github.com/Zeno-L2/zeno-executor/cmd/worker-wasm", "github.com/Zeno-L2/zeno-executor/cmd/gateway")
 	cmd.Env = append(os.Environ(), "GOFLAGS=")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build the executor, worker and gateway: %v\n%s", err, out)

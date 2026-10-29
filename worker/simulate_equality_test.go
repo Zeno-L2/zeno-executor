@@ -17,13 +17,13 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/batch"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/simipc"
-	"github.com/digitalSloth/go-executor/internal/state"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/batch"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/simipc"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
 )
 
 // equalityVector is the subset of an execution-conformance vector the

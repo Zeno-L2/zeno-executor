@@ -353,7 +353,7 @@ stage bytes whose `code_hash` differs from the one their input names.
 Two §11.3 assembly checks have no vector, because no input sequence Settlement accepts can fail
 them. A length mismatch cannot arise: §11.2 fixes every chunk's size, so the accepted chunks
 always total `total_size`. A `total_size` or `chunk_count` out of bounds cannot arise: §11.1
-rejects that start at its receive. go-executor still checks both
+rejects that start at its receive. zeno-executor still checks both
 (`TestApplyDeployFinalizeAssemblyVerification` and `TestApplyDeployFinalizeRecordBounds` in
 `../deploy_test.go`).
 

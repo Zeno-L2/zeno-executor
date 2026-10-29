@@ -17,8 +17,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 const (
@@ -394,6 +394,22 @@ func listPositioned(l Layout) ([]positioned, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return newer(out[j], out[i]) })
 	return out, nil
+}
+
+// OldestSnapshotSeq returns the smallest LastInputSeq among the stored
+// snapshots, which bounds every position Rollback can restore other
+// than genesis. ok is false when no snapshot is stored.
+func OldestSnapshotSeq(l Layout) (seq uint64, ok bool, err error) {
+	snaps, err := listPositioned(l)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, s := range snaps {
+		if !ok || s.pos.LastInputSeq < seq {
+			seq, ok = s.pos.LastInputSeq, true
+		}
+	}
+	return seq, ok, nil
 }
 
 // newer reports whether a is newer than b: it orders by MomentumHeight, then LastInputSeq,

@@ -7,15 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 func TestCodeStorePutGetRoundTrip(t *testing.T) {
@@ -505,5 +506,204 @@ func TestSimulateModeRefusals(t *testing.T) {
 
 	if _, err := New(Config{NetworkName: "testnet", FetchModule: noFetch, CodeStorePath: t.TempDir()}); err == nil {
 		t.Error("New accepted FetchModule with CodeStorePath")
+	}
+}
+
+func TestCodeStoreList(t *testing.T) {
+	store, err := newCodeStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("newCodeStore: %v", err)
+	}
+	if got, err := store.list(entryConsumedDeploy); err != nil || len(got) != 0 {
+		t.Fatalf("list of an empty kind = %q, err %v, want none", got, err)
+	}
+
+	for _, v := range []string{"one", "two", "corrupt"} {
+		if err := store.put(entryConsumedDeploy, []byte(v), []byte(v)); err != nil {
+			t.Fatalf("put %s: %v", v, err)
+		}
+	}
+	corrupt := store.path(entryConsumedDeploy, []byte("corrupt"))
+	b, err := os.ReadFile(corrupt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xFF
+	if err := os.WriteFile(corrupt, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(store.root, entryConsumedDeploy.dirName(), ".tmp-123")
+	if err := os.WriteFile(tmp, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.list(entryConsumedDeploy)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var values []string
+	for _, v := range got {
+		values = append(values, string(v))
+	}
+	sort.Strings(values)
+	if want := []string{"one", "two"}; !reflect.DeepEqual(values, want) {
+		t.Fatalf("list = %q, want %q", values, want)
+	}
+}
+
+func TestCodeStoreSyncsDirectoryOnPutAndDelete(t *testing.T) {
+	s, err := newCodeStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	orig := syncDir
+	syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return orig(dir)
+	}
+	t.Cleanup(func() { syncDir = orig })
+
+	want := filepath.Dir(s.path(entryConsumedDeploy, []byte("k")))
+	if err := s.put(entryConsumedDeploy, []byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != want {
+		t.Fatalf("put synced %v, want [%s]", synced, want)
+	}
+	if err := s.delete(entryConsumedDeploy, []byte("k")); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 2 || synced[1] != want {
+		t.Fatalf("delete synced %v, want a second sync of %s", synced, want)
+	}
+}
+
+func TestCodeStoreDeleteOfAbsentEntrySyncsDirectory(t *testing.T) {
+	s, err := newCodeStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	orig := syncDir
+	syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return orig(dir)
+	}
+	t.Cleanup(func() { syncDir = orig })
+
+	want := filepath.Dir(s.path(entryConsumedDeploy, []byte("absent")))
+	if err := s.delete(entryConsumedDeploy, []byte("absent")); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != want {
+		t.Fatalf("delete of an absent entry synced %v, want [%s]", synced, want)
+	}
+}
+
+func TestClearDeployStagingSyncsEachDirectoryOnce(t *testing.T) {
+	s, err := newCodeStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	var markPath string
+	var clearing bool
+	orig := syncDir
+	syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		if clearing && dir != filepath.Join(s.root, entryConsumedDeploy.dirName()) {
+			if _, err := os.Stat(markPath); err != nil {
+				t.Errorf("mark already unlinked when %s was synced: %v", dir, err)
+			}
+		}
+		return orig(dir)
+	}
+	t.Cleanup(func() { syncDir = orig })
+
+	var deployer types.Address
+	var codeHash types.Hash
+	deployer[0], codeHash[0] = 1, 2
+	markPath = s.path(entryConsumedDeploy, pendingRecordKey(deployer, codeHash))
+	if err := s.put(entryDeployChunk, deployChunkKey(deployer, codeHash, 0), []byte("c")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.put(entryConsumedDeploy, pendingRecordKey(deployer, codeHash), []byte("m")); err != nil {
+		t.Fatal(err)
+	}
+	synced = nil
+	clearing = true
+	if err := clearDeployStaging(s, deployer, codeHash); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{}
+	for _, k := range []entryKind{entryDeployChunk, entryPendingRecord, entryConsumedDeploy} {
+		want[filepath.Join(s.root, k.dirName())] = true
+	}
+	if len(synced) != len(want) {
+		t.Fatalf("clear synced %d times (%v), want once per directory (%d)", len(synced), synced, len(want))
+	}
+	for _, d := range synced {
+		if !want[d] {
+			t.Fatalf("clear synced unexpected directory %s", d)
+		}
+		delete(want, d)
+	}
+	if last := synced[len(synced)-1]; last != filepath.Join(s.root, entryConsumedDeploy.dirName()) {
+		t.Fatalf("clear synced %v, want the consumed-deploy directory last", synced)
+	}
+	if _, ok, _ := s.get(entryDeployChunk, deployChunkKey(deployer, codeHash, 0)); ok {
+		t.Fatal("chunk survived the clear")
+	}
+}
+
+func TestNewCodeStoreSyncsCreatedDirectories(t *testing.T) {
+	var synced []string
+	orig := syncDir
+	syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return orig(dir)
+	}
+	t.Cleanup(func() { syncDir = orig })
+
+	parent := t.TempDir()
+	root := filepath.Join(parent, "wasm-code")
+	if _, err := newCodeStore(root); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, d := range synced {
+		got[d] = true
+	}
+	want := []string{root, parent}
+	for _, k := range allEntryKinds {
+		want = append(want, filepath.Join(root, k.dirName()))
+	}
+	for _, d := range want {
+		if !got[d] {
+			t.Errorf("newCodeStore did not sync %s (synced %v)", d, synced)
+		}
+	}
+}
+
+func TestCodeStoreReturnsSyncErrors(t *testing.T) {
+	root := t.TempDir()
+	s, err := newCodeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := syncDir
+	syncErr := errors.New("sync failed")
+	syncDir = func(string) error { return syncErr }
+	t.Cleanup(func() { syncDir = orig })
+
+	if err := s.put(entryConsumedDeploy, []byte("k"), []byte("v")); !errors.Is(err, syncErr) {
+		t.Fatalf("put error = %v, want %v", err, syncErr)
+	}
+	if err := s.delete(entryConsumedDeploy, []byte("k")); !errors.Is(err, syncErr) {
+		t.Fatalf("delete error = %v, want %v", err, syncErr)
+	}
+	if _, err := newCodeStore(root); !errors.Is(err, syncErr) {
+		t.Fatalf("newCodeStore error = %v, want %v", err, syncErr)
 	}
 }

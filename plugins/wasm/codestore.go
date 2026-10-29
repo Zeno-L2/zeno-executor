@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 )
 
-// entryKind partitions the code store's flat key space into its four
+// entryKind partitions the code store's flat key space into its five
 // entry shapes. Kind and key together identify a stored value.
 type entryKind uint8
 
@@ -30,6 +31,11 @@ const (
 	// Written by Apply on kind 4/5 and, on re-derivation, by Apply on kinds 0/1; read by Apply
 	// on kinds 0/1.
 	entryInstrumentedModule
+	// entryConsumedDeploy marks a (deployer, code_hash) pair whose staged chunks and pending
+	// record a finalize or upgrade has consumed, keyed by (deployer, code_hash). The value
+	// is encodeConsumedDeploy's. Written by DecodeInput on kind 4/5 and deleted by the next
+	// kind 2 of the pair; read by Prune and Rewind.
+	entryConsumedDeploy
 )
 
 func (k entryKind) dirName() string {
@@ -42,6 +48,8 @@ func (k entryKind) dirName() string {
 		return "assembled"
 	case entryInstrumentedModule:
 		return "instrumented"
+	case entryConsumedDeploy:
+		return "consumed-deploy"
 	default:
 		panic(fmt.Sprintf("wasm: code store: unknown entry kind %d", k))
 	}
@@ -54,6 +62,13 @@ type codeTier interface {
 	get(kind entryKind, key []byte) (value []byte, ok bool, err error)
 	put(kind entryKind, key, value []byte) error
 	delete(kind entryKind, key []byte) error
+	deleteMany(refs []entryRef) error
+}
+
+// entryRef names one code-store entry.
+type entryRef struct {
+	kind entryKind
+	key  []byte
 }
 
 var (
@@ -61,7 +76,7 @@ var (
 	_ codeTier = (*memTier)(nil)
 )
 
-var allEntryKinds = []entryKind{entryDeployChunk, entryPendingRecord, entryAssembledModule, entryInstrumentedModule}
+var allEntryKinds = []entryKind{entryDeployChunk, entryPendingRecord, entryAssembledModule, entryInstrumentedModule, entryConsumedDeploy}
 
 // codeStore is the local, non-consensus, checksummed disk tier that
 // Apply and DecodeInput read and memoize into. There is no in-memory
@@ -81,6 +96,18 @@ func newCodeStore(root string) (*codeStore, error) {
 	}
 	for _, k := range allEntryKinds {
 		if err := os.MkdirAll(filepath.Join(root, k.dirName()), 0o755); err != nil {
+			return nil, fmt.Errorf("wasm: code store: %w", err)
+		}
+	}
+	// Sync every kind directory (flushing any unlink or rename an earlier process left
+	// unsynced), then the root and its parent so the created directories themselves persist.
+	dirs := make([]string, 0, len(allEntryKinds)+2)
+	for _, k := range allEntryKinds {
+		dirs = append(dirs, filepath.Join(root, k.dirName()))
+	}
+	dirs = append(dirs, root, filepath.Dir(root))
+	for _, d := range dirs {
+		if err := syncDir(d); err != nil {
 			return nil, fmt.Errorf("wasm: code store: %w", err)
 		}
 	}
@@ -126,18 +153,50 @@ func (s *codeStore) put(kind entryKind, key, value []byte) error {
 	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("wasm: code store: put: %w", err)
 	}
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return fmt.Errorf("wasm: code store: put: %w", err)
+	}
 	return nil
 }
 
-// delete removes the entry at (kind, key), treating absence as success: the caller's contract is
-// "this entry must not exist afterwards", and a missing file already satisfies it. A non-nil
-// error means a genuine I/O fault, which the caller turns into a halt.
+// syncDir fsyncs dir itself, which is what makes a rename or removal inside it durable. It is
+// a variable so a test can record the calls.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// delete removes the entry at (kind, key) and makes the removal durable.
 func (s *codeStore) delete(kind entryKind, key []byte) error {
-	if err := os.Remove(s.path(kind, key)); err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	return s.deleteMany([]entryRef{{kind, key}})
+}
+
+// deleteMany removes every entry in refs, treating absence as success: the caller's contract is
+// "these entries must not exist afterwards", and a missing file already satisfies it. Each
+// affected directory is synced once after all removals, including a directory whose entries were
+// all absent, so an unlink an earlier attempt left unsynced becomes durable. A non-nil error
+// means a genuine I/O fault, which the caller turns into a halt.
+func (s *codeStore) deleteMany(refs []entryRef) error {
+	var dirs []string
+	seen := make(map[string]bool)
+	for _, r := range refs {
+		path := s.path(r.kind, r.key)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("wasm: code store: delete: %w", err)
 		}
-		return fmt.Errorf("wasm: code store: delete: %w", err)
+		if dir := filepath.Dir(path); !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	for _, dir := range dirs {
+		if err := syncDir(dir); err != nil {
+			return fmt.Errorf("wasm: code store: delete: %w", err)
+		}
 	}
 	return nil
 }
@@ -147,7 +206,37 @@ func (s *codeStore) delete(kind entryKind, key []byte) error {
 // mean corruption or an incomplete write, either of which is exactly "I do not have this
 // entry." A non-nil error means a genuine I/O fault distinct from absence.
 func (s *codeStore) get(kind entryKind, key []byte) (value []byte, ok bool, err error) {
-	b, err := os.ReadFile(s.path(kind, key))
+	return readEntry(s.path(kind, key))
+}
+
+// list returns the value of every entry of kind whose checksum
+// verifies, in no fixed order. It skips put's ".tmp-" files and treats
+// a file removed during the listing as absent.
+func (s *codeStore) list(kind entryKind) ([][]byte, error) {
+	dir := filepath.Join(s.root, kind.dirName())
+	names, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("wasm: code store: list: %w", err)
+	}
+	var values [][]byte
+	for _, n := range names {
+		if strings.HasPrefix(n.Name(), ".tmp-") {
+			continue
+		}
+		value, ok, err := readEntry(filepath.Join(dir, n.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			values = append(values, value)
+		}
+	}
+	return values, nil
+}
+
+// readEntry reads and verifies the entry file at path, with get's absence rules.
+func readEntry(path string) (value []byte, ok bool, err error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
@@ -280,4 +369,11 @@ func (m *memTier) put(kind entryKind, key, value []byte) error {
 
 func (m *memTier) delete(kind entryKind, key []byte) error {
 	return refusedInSimulate("delete", kind)
+}
+
+func (m *memTier) deleteMany(refs []entryRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	return refusedInSimulate("delete", refs[0].kind)
 }

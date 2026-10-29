@@ -10,10 +10,10 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // MaxConfirmationDepth is the largest ConfirmationDepth this package accepts. The recorded
@@ -605,8 +605,10 @@ func momentumHashes(moms []*nom.DetailedMomentum) map[uint64]types.Hash {
 // The caller builds a fresh Follower at the returned Position, so the next expected ordinal
 // rolls back with the cursor.
 //
-// The plugin's local code store is not rolled back: domain.Domain
-// exposes no rollback hook. A replayed canonical DeployStartArgs
+// Rollback leaves the plugin's local code store alone. The loop then
+// calls domain.Pruner's Rewind at the returned position, which drops
+// the prune bookkeeping above it; chunks and pending records are not
+// rolled back. A replayed canonical DeployStartArgs
 // deletes every chunk slot and the pending record for its (deployer,
 // code_hash) before rewriting them, so a retracted start's slots are
 // rewritten idempotently, and a finalize or upgrade naming a code_hash

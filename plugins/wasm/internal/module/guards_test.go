@@ -128,7 +128,7 @@ func TestErrorCoverage(t *testing.T) {
 
 // TestImportBoundary parses every .go file in this package directory (including _test.go)
 // and asserts each import path is either standard library or begins with
-// github.com/digitalSloth/go-executor/: the mechanical form of "internal/module never
+// github.com/Zeno-L2/zeno-executor/: the mechanical form of "internal/module never
 // imports wazero", following the precedent of scripts/check-trie-imports.sh.
 func TestImportBoundary(t *testing.T) {
 	files, err := filepath.Glob("*.go")
@@ -152,13 +152,13 @@ func TestImportBoundary(t *testing.T) {
 			if allowedImport(path) {
 				continue
 			}
-			t.Errorf("%s imports %q, which is neither standard library nor github.com/digitalSloth/go-executor/...", f, path)
+			t.Errorf("%s imports %q, which is neither standard library nor github.com/Zeno-L2/zeno-executor/...", f, path)
 		}
 	}
 }
 
 func allowedImport(path string) bool {
-	if strings.HasPrefix(path, "github.com/digitalSloth/go-executor/") {
+	if strings.HasPrefix(path, "github.com/Zeno-L2/zeno-executor/") {
 		return true
 	}
 	first := path

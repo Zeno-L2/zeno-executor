@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
 )
 
 // frame builds a length-prefixed frame: a 4-byte big-endian length followed by a type byte and

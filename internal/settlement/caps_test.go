@@ -6,8 +6,8 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/znnd/znndtest"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd/znndtest"
 )
 
 func wantCap(t *testing.T, fx *znndtest.Fixture) codec.U256 {

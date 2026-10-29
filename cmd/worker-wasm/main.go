@@ -4,9 +4,9 @@ package main
 import (
 	"path/filepath"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
-	"github.com/digitalSloth/go-executor/worker"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/worker"
 )
 
 func main() {

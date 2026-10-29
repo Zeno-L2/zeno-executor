@@ -18,12 +18,12 @@ import (
 
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/gateway"
-	"github.com/digitalSloth/go-executor/internal/lease"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/znnd"
-	wasmreader "github.com/digitalSloth/go-executor/plugins/wasm/reader"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/gateway"
+	"github.com/Zeno-L2/zeno-executor/internal/lease"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
+	wasmreader "github.com/Zeno-L2/zeno-executor/plugins/wasm/reader"
 )
 
 // exitConfig is the exit status for an invalid configuration:

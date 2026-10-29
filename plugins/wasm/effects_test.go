@@ -11,10 +11,10 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/state"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/engine"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/engine"
 )
 
 // testContractID, testCodeHash and testL1Sender are the fixture identities every effects_test
