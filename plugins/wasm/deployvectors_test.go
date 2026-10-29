@@ -9,9 +9,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 // This file holds the deploy/upgrade and validator rejection

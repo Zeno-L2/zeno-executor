@@ -8,7 +8,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/trie"
 
-	"github.com/digitalSloth/go-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/domain"
 )
 
 // ErrAccessorReleased is returned by Read and Len on an accessor after Release.

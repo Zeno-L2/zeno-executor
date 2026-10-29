@@ -14,8 +14,8 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 // ErrConfig marks an invalid supervisor configuration file or submission key: a missing,

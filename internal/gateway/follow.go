@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 const (

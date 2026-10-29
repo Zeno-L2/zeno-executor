@@ -17,9 +17,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
 )
 
 // maxLineSize is the longest command line Run reads.

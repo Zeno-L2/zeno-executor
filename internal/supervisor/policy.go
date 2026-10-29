@@ -3,8 +3,8 @@ package supervisor
 import (
 	"time"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
 )
 
 // Policy is the restart schedule. A field <= 0 takes its default, so the zero Policy is the

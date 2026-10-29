@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # go.mod replaces go-zenon with ../../zenon-network/go-zenon, so CI checks out
+  # this repository and go-zenon in that layout, with go-zenon at this commit.
+  GO_ZENON_REPO: digitalSloth/go-zenon
+  GO_ZENON_REF: 938fca3b7787da86827a5eb63371509b36e14761
+
 jobs:
   test:
     strategy:
@@ -12,11 +18,24 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: zeno/zeno-executor
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: zeno/zeno-executor
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GO_ZENON_REPO }}
+          ref: ${{ env.GO_ZENON_REF }}
+          path: zenon-network/go-zenon
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
+          cache-dependency-path: zeno/zeno-executor/go.sum
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...

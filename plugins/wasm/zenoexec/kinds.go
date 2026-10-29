@@ -6,9 +6,9 @@ package zenoexec
 import (
 	"errors"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 // kindEntry names one module sentinel and the kind Kind reports for it.

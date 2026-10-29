@@ -20,8 +20,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/crypto/sha3"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 const (

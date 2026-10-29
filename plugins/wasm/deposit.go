@@ -3,7 +3,7 @@ package wasm
 import (
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // refund is the deposit settlement, run on every path: the remainder is

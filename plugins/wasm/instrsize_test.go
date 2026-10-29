@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 // TestInstrumentedSizeBoundary pins the instrumented-size limit that CV-INSTR-SIZE-1 relies on:

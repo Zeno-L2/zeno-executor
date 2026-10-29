@@ -13,9 +13,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/znnd"
-	"github.com/digitalSloth/go-executor/internal/znnd/znndtest"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd/znndtest"
 )
 
 func newAssignmentReader(t *testing.T, fx *znndtest.Fixture) (*znndtest.Server, *Reader) {

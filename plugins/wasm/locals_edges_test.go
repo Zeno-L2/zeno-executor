@@ -3,9 +3,9 @@ package wasm
 import (
 	"testing"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/engine"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/engine"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 
 	"github.com/zenon-network/go-zenon/common/types"
 )

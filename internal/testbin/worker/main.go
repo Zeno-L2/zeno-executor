@@ -16,9 +16,9 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/worker"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/worker"
 )
 
 // testDomain is a minimal, deterministic domain.Domain whose Apply can be told, through its

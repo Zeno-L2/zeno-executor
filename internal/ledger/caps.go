@@ -6,7 +6,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // CapSource returns, for each asset in assets and in that order, the

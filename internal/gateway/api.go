@@ -16,9 +16,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 // method is one JSON-RPC method. params are its positional

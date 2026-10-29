@@ -15,8 +15,8 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/znnd/znndtest"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd/znndtest"
 )
 
 func setup(t *testing.T) (*znndtest.Fixture, *znndtest.Server, *Client) {

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 // flakySettlement fails ConfirmedHeight on chosen calls.

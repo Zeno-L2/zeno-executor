@@ -11,10 +11,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/engine"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/keys"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/engine"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/keys"
 )
 
 // Config is the plugin's construction-time configuration.
@@ -142,22 +142,120 @@ func (p *Plugin) DecodeInput(ctx domain.InputContext, payload []byte) (domain.In
 		// decode i+1, ...), never batch-decoded ahead of Apply: a later DeployStart for the same
 		// deployer and code_hash deletes the chunks an already-decoded, not-yet-applied DeployFinalize for an
 		// earlier attempt still needs to read.
-		for i := uint32(0); i < MaxChunkCount; i++ {
-			if err := p.store.delete(entryDeployChunk, deployChunkKey(ctx.L1Sender, args.CodeHash, i)); err != nil {
-				return nil, fmt.Errorf("wasm: decode input: %w", err)
-			}
-		}
-		if err := p.store.delete(entryPendingRecord, pendingRecordKey(ctx.L1Sender, args.CodeHash)); err != nil {
+		if err := clearDeployStaging(p.store, ctx.L1Sender, args.CodeHash); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
 		record := encodePendingRecord(args.MetadataHash, args.TotalSize, args.ChunkCount, args.Metadata)
 		if err := p.store.put(entryPendingRecord, pendingRecordKey(ctx.L1Sender, args.CodeHash), record); err != nil {
 			return nil, fmt.Errorf("wasm: decode input: %w", err)
 		}
+	case codec.DeployFinalizeArgs:
+		if err := p.markConsumed(ctx, args.CodeHash); err != nil {
+			return nil, fmt.Errorf("wasm: decode input: %w", err)
+		}
+	case codec.UpgradeArgs:
+		if err := p.markConsumed(ctx, args.NewCodeHash); err != nil {
+			return nil, fmt.Errorf("wasm: decode input: %w", err)
+		}
 	}
 
 	return Input{Ctx: ctx, Args: in.Args}, nil
 }
+
+// markConsumed records that the input at ctx.GlobalInputIndex consumed
+// the staging of (ctx.L1Sender, codeHash). Settlement consumes the L1
+// record at every admitted finalize or upgrade whatever Apply returns,
+// so the mark does not depend on Apply's status. A simulate-mode store
+// keeps no staging, so it keeps no mark.
+func (p *Plugin) markConsumed(ctx domain.InputContext, codeHash types.Hash) error {
+	s, ok := p.store.(*codeStore)
+	if !ok {
+		return nil
+	}
+	return s.put(entryConsumedDeploy, pendingRecordKey(ctx.L1Sender, codeHash), encodeConsumedDeploy(ctx.GlobalInputIndex, ctx.L1Sender, codeHash))
+}
+
+// Prune implements domain.Pruner. It deletes the chunks and pending
+// record of every (deployer, code_hash) whose finalize or upgrade sits
+// at or below throughSeq, then the mark itself. The mark goes last and
+// absence counts as success, so a Prune that fails midway is repeated
+// by the next one.
+//
+// The staging is dead because the runtime never applies an input at or
+// below throughSeq again, and no later input reads it without a new
+// start, which deletes the mark first. Assembled and instrumented
+// modules stay: calls read them.
+func (p *Plugin) Prune(throughSeq uint64) error {
+	s, ok := p.store.(*codeStore)
+	if !ok {
+		return nil
+	}
+	marks, err := s.list(entryConsumedDeploy)
+	if err != nil {
+		return fmt.Errorf("wasm: prune: %w", err)
+	}
+	for _, m := range marks {
+		seq, deployer, codeHash, ok := decodeConsumedDeploy(m)
+		if !ok || seq > throughSeq {
+			continue
+		}
+		if err := clearDeployStaging(s, deployer, codeHash); err != nil {
+			return fmt.Errorf("wasm: prune: %w", err)
+		}
+	}
+	return nil
+}
+
+// Rewind implements domain.Pruner. It deletes the mark of every
+// finalize or upgrade above lastInputSeq, or every mark when fresh.
+// After a restore, every remaining mark was written by a decode on the
+// restored lineage: PruneAbove keeps only snapshots on that lineage,
+// and every retracted input's index is above the restored position. A
+// mark therefore means its pair's last start or finalize on the lineage
+// was that finalize, so the pair's staging belongs to the consumed
+// attempt. Chunks and records stay, because a canonical finalize above
+// the position may still read them.
+func (p *Plugin) Rewind(lastInputSeq uint64, fresh bool) error {
+	s, ok := p.store.(*codeStore)
+	if !ok {
+		return nil
+	}
+	marks, err := s.list(entryConsumedDeploy)
+	if err != nil {
+		return fmt.Errorf("wasm: rewind: %w", err)
+	}
+	var refs []entryRef
+	for _, m := range marks {
+		seq, deployer, codeHash, ok := decodeConsumedDeploy(m)
+		if !ok || !(fresh || seq > lastInputSeq) {
+			continue
+		}
+		refs = append(refs, entryRef{entryConsumedDeploy, pendingRecordKey(deployer, codeHash)})
+	}
+	if err := s.deleteMany(refs); err != nil {
+		return fmt.Errorf("wasm: rewind: %w", err)
+	}
+	return nil
+}
+
+// clearDeployStaging deletes every chunk, the pending record and the consumed mark of the
+// (deployer, codeHash) pair. The chunks and record are unlinked and synced before the mark, so a
+// power loss never leaves them without a mark. A new start owns the pair again, so a consumed-deploy
+// entry left by an earlier finalize must not let Prune reach it. It syncs each affected directory
+// once rather than once per entry.
+func clearDeployStaging(store codeTier, deployer types.Address, codeHash types.Hash) error {
+	refs := make([]entryRef, 0, MaxChunkCount+1)
+	for i := uint32(0); i < MaxChunkCount; i++ {
+		refs = append(refs, entryRef{entryDeployChunk, deployChunkKey(deployer, codeHash, i)})
+	}
+	refs = append(refs, entryRef{entryPendingRecord, pendingRecordKey(deployer, codeHash)})
+	if err := store.deleteMany(refs); err != nil {
+		return err
+	}
+	return store.delete(entryConsumedDeploy, pendingRecordKey(deployer, codeHash))
+}
+
+var _ domain.Pruner = (*Plugin)(nil)
 
 // Apply serves all eight input kinds: CallL2 and Deposit (0/1), the chunked-deployment
 // receipts and finalize (2-4), the upgrade (5), the ownership transfer (6), and the storage purchase (7).
@@ -201,6 +299,29 @@ func pendingRecordKey(deployer types.Address, codeHash types.Hash) []byte {
 	key := make([]byte, 0, len(deployer)+len(codeHash))
 	key = append(key, deployer[:]...)
 	return append(key, codeHash[:]...)
+}
+
+// encodeConsumedDeploy is seq(8, BE) ‖ deployer(20) ‖ code_hash(32),
+// the value of the consumed-deploy entry keyed by
+// pendingRecordKey(deployer, codeHash). The value carries the pair
+// because the store's listing returns values only.
+func encodeConsumedDeploy(seq uint64, deployer types.Address, codeHash types.Hash) []byte {
+	buf := make([]byte, 0, 8+len(deployer)+len(codeHash))
+	buf = binary.BigEndian.AppendUint64(buf, seq)
+	buf = append(buf, deployer[:]...)
+	return append(buf, codeHash[:]...)
+}
+
+// decodeConsumedDeploy is the inverse of encodeConsumedDeploy. ok is
+// false unless len(b) == 60.
+func decodeConsumedDeploy(b []byte) (seq uint64, deployer types.Address, codeHash types.Hash, ok bool) {
+	if len(b) != 8+len(deployer)+len(codeHash) {
+		return 0, deployer, codeHash, false
+	}
+	seq = binary.BigEndian.Uint64(b)
+	copy(deployer[:], b[8:])
+	copy(codeHash[:], b[8+len(deployer):])
+	return seq, deployer, codeHash, true
 }
 
 // deployChunkKey is the composite (deployer, code_hash, chunk_index) code-store key for one

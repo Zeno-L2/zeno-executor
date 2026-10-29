@@ -21,7 +21,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // honestUpstream is a LOCAL gateway over history A with every batch

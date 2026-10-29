@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // opcodeFor resolves a mnemonic to its opcode byte through the parsed artifact, failing the

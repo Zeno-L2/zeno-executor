@@ -13,9 +13,9 @@ import (
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 // --- seeding helpers: drive kinds 2 and 3 through DecodeInput with
@@ -1395,4 +1395,268 @@ func TestAssemblyHashMismatchOfValidModuleValidationFailed(t *testing.T) {
 			t.Fatalf("StateDiff = %+v, want empty", eff.StateDiff)
 		}
 	})
+}
+
+// --- pruning finalized deployments.
+
+// decodeFinalize decodes a DeployFinalize for codeHash from sender at input index idx, then
+// applies it.
+func decodeFinalize(t *testing.T, p *Plugin, sender types.Address, idx uint64, codeHash types.Hash) domain.Effects {
+	t.Helper()
+	ctx := domain.InputContext{GlobalInputIndex: idx, L1Sender: sender}
+	in, err := p.DecodeInput(ctx, encodeInput(t, codec.DeployFinalizeArgs{CodeHash: codeHash}))
+	if err != nil {
+		t.Fatalf("DecodeInput(finalize by %x at %d): %v", sender[:], idx, err)
+	}
+	eff, err := p.Apply(nil, in)
+	if err != nil {
+		t.Fatalf("Apply(finalize by %x at %d): %v", sender[:], idx, err)
+	}
+	if eff.Status != codec.StatusSuccess {
+		t.Fatalf("Status = %v, want StatusSuccess", eff.Status)
+	}
+	return eff
+}
+
+// deployEntries reports whether the pending record, chunk 0 and the consumed-deploy entry of
+// (deployer, codeHash) are stored.
+func deployEntries(t *testing.T, p *Plugin, deployer types.Address, codeHash types.Hash) (record, chunk, consumed bool) {
+	t.Helper()
+	has := func(kind entryKind, key []byte) bool {
+		_, ok, err := p.store.get(kind, key)
+		if err != nil {
+			t.Fatalf("store.get(%s): %v", kind.dirName(), err)
+		}
+		return ok
+	}
+	return has(entryPendingRecord, pendingRecordKey(deployer, codeHash)),
+		has(entryDeployChunk, deployChunkKey(deployer, codeHash, 0)),
+		has(entryConsumedDeploy, pendingRecordKey(deployer, codeHash))
+}
+
+func wantEntries(t *testing.T, p *Plugin, deployer types.Address, codeHash types.Hash, wantRecord, wantChunk, wantConsumed bool) {
+	t.Helper()
+	record, chunk, consumed := deployEntries(t, p, deployer, codeHash)
+	if record != wantRecord || chunk != wantChunk || consumed != wantConsumed {
+		t.Fatalf("record/chunk/consumed = %v/%v/%v, want %v/%v/%v", record, chunk, consumed, wantRecord, wantChunk, wantConsumed)
+	}
+}
+
+func TestPruneDeletesFinalizedDeployment(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, d, immutableMetadata)
+	eff := decodeFinalize(t, p, d, 5, codeHash)
+
+	if err := p.Prune(4); err != nil {
+		t.Fatalf("Prune(4): %v", err)
+	}
+	wantEntries(t, p, d, codeHash, true, true, true)
+
+	if err := p.Prune(5); err != nil {
+		t.Fatalf("Prune(5): %v", err)
+	}
+	wantEntries(t, p, d, codeHash, false, false, false)
+	for i := uint32(0); i < MaxChunkCount; i++ {
+		if _, ok, err := p.store.get(entryDeployChunk, deployChunkKey(d, codeHash, i)); err != nil || ok {
+			t.Fatalf("chunk %d after Prune(5): ok %v, err %v", i, ok, err)
+		}
+	}
+	if _, ok, err := p.store.get(entryInstrumentedModule, eff.CodeHash[:]); err != nil || !ok {
+		t.Fatalf("instrumented module after Prune(5): ok %v, err %v", ok, err)
+	}
+}
+
+func TestPruneDeletesUpgradeStaging(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	h2 := seedDeployment(t, p, raw, d, immutableMetadata)
+	ctx := domain.InputContext{GlobalInputIndex: 5, L1Sender: d}
+	if _, err := p.DecodeInput(ctx, encodeInput(t, codec.UpgradeArgs{ContractID: types.Hash{0x20}, NewCodeHash: h2})); err != nil {
+		t.Fatalf("DecodeInput(upgrade): %v", err)
+	}
+	wantEntries(t, p, d, h2, true, true, true)
+
+	if err := p.Prune(5); err != nil {
+		t.Fatalf("Prune(5): %v", err)
+	}
+	wantEntries(t, p, d, h2, false, false, false)
+}
+
+func TestPruneKeepsRestagedDeployment(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, d, immutableMetadata)
+	decodeFinalize(t, p, d, 5, codeHash)
+	stageDeployment(t, p, raw, codeHash, d, immutableMetadata)
+
+	if err := p.Prune(6); err != nil {
+		t.Fatalf("Prune(6): %v", err)
+	}
+	wantEntries(t, p, d, codeHash, true, true, false)
+	decodeFinalize(t, p, d, 9, codeHash)
+}
+
+func TestPruneLeavesOtherDeployer(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	a := types.Address{1}
+	b := types.Address{2}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, a, immutableMetadata)
+	seedDeployment(t, p, raw, b, immutableMetadata)
+	decodeFinalize(t, p, a, 5, codeHash)
+
+	if err := p.Prune(5); err != nil {
+		t.Fatalf("Prune(5): %v", err)
+	}
+	wantEntries(t, p, a, codeHash, false, false, false)
+	wantEntries(t, p, b, codeHash, true, true, false)
+}
+
+func TestRewindDropsRetractedFinalize(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, d, immutableMetadata)
+	decodeFinalize(t, p, d, 5, codeHash)
+
+	if err := p.Rewind(3, false); err != nil {
+		t.Fatalf("Rewind(3, false): %v", err)
+	}
+	wantEntries(t, p, d, codeHash, true, true, false)
+	deposit := codec.DepositArgs{TargetContract: types.Hash{0x20}, PlasmaLimit: 1000, DepositAmount: u256(1)}
+	if _, err := p.DecodeInput(domain.InputContext{GlobalInputIndex: 7, L1Sender: d}, encodeInput(t, deposit)); err != nil {
+		t.Fatalf("DecodeInput(deposit): %v", err)
+	}
+	if err := p.Prune(7); err != nil {
+		t.Fatalf("Prune(7): %v", err)
+	}
+	decodeFinalize(t, p, d, 12, codeHash)
+
+	other := types.Address{2}
+	otherHash := seedDeployment(t, p, raw, other, immutableMetadata)
+	decodeFinalize(t, p, other, 0, otherHash)
+	if err := p.Rewind(0, false); err != nil {
+		t.Fatalf("Rewind(0, false): %v", err)
+	}
+	if _, _, consumed := deployEntries(t, p, other, otherHash); !consumed {
+		t.Fatal("Rewind(0, false) dropped the entry at index 0")
+	}
+	if err := p.Rewind(0, true); err != nil {
+		t.Fatalf("Rewind(0, true): %v", err)
+	}
+	if _, _, consumed := deployEntries(t, p, other, otherHash); consumed {
+		t.Fatal("Rewind(0, true) kept the entry at index 0")
+	}
+}
+
+func TestPruneSimulateMode(t *testing.T) {
+	var calls int
+	p := simPlugin(t, nil, &calls)
+	if err := p.Prune(1 << 40); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if err := p.Rewind(0, true); err != nil {
+		t.Fatalf("Rewind: %v", err)
+	}
+	ctx := domain.InputContext{GlobalInputIndex: 5, L1Sender: types.Address{1}}
+	if _, err := p.DecodeInput(ctx, encodeInput(t, codec.DeployFinalizeArgs{CodeHash: types.Hash{0x07}})); err != nil {
+		t.Fatalf("DecodeInput(finalize): %v", err)
+	}
+	if _, err := p.DecodeInput(ctx, encodeInput(t, codec.UpgradeArgs{ContractID: types.Hash{0x20}, NewCodeHash: types.Hash{0x07}})); err != nil {
+		t.Fatalf("DecodeInput(upgrade): %v", err)
+	}
+}
+
+func TestPruneResumesAfterPartialDelete(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, d, immutableMetadata)
+	decodeFinalize(t, p, d, 5, codeHash)
+
+	// An interrupted Prune removed the chunks and the record but not the entry.
+	s := p.store.(*codeStore)
+	if err := s.delete(entryDeployChunk, deployChunkKey(d, codeHash, 0)); err != nil {
+		t.Fatalf("delete chunk: %v", err)
+	}
+	if err := s.delete(entryPendingRecord, pendingRecordKey(d, codeHash)); err != nil {
+		t.Fatalf("delete record: %v", err)
+	}
+	wantEntries(t, p, d, codeHash, false, false, true)
+
+	for i := 0; i < 2; i++ {
+		if err := p.Prune(5); err != nil {
+			t.Fatalf("Prune(5) call %d: %v", i, err)
+		}
+		wantEntries(t, p, d, codeHash, false, false, false)
+	}
+}
+
+func TestPruneKeepsRestagedUpgrade(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	h2 := seedDeployment(t, p, raw, d, immutableMetadata)
+	ctx := domain.InputContext{GlobalInputIndex: 5, L1Sender: d}
+	if _, err := p.DecodeInput(ctx, encodeInput(t, codec.UpgradeArgs{ContractID: types.Hash{0x20}, NewCodeHash: h2})); err != nil {
+		t.Fatalf("DecodeInput(upgrade): %v", err)
+	}
+	stageDeployment(t, p, raw, h2, d, immutableMetadata)
+
+	if err := p.Prune(1 << 40); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	wantEntries(t, p, d, h2, true, true, false)
+}
+
+func TestRewindBoundary(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, d, immutableMetadata)
+	decodeFinalize(t, p, d, 5, codeHash)
+
+	if err := p.Rewind(5, false); err != nil {
+		t.Fatalf("Rewind(5, false): %v", err)
+	}
+	wantEntries(t, p, d, codeHash, true, true, true)
+	if err := p.Rewind(4, false); err != nil {
+		t.Fatalf("Rewind(4, false): %v", err)
+	}
+	wantEntries(t, p, d, codeHash, true, true, false)
+}
+
+func TestPruneWithoutEntriesIsNoop(t *testing.T) {
+	raw := buildModule(nil, []byte{0x00}, []byte{0x42, 0x00, 0x0B}, 1)
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	codeHash := seedDeployment(t, p, raw, d, immutableMetadata)
+	if err := p.Prune(1 << 40); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if err := p.Rewind(0, true); err != nil {
+		t.Fatalf("Rewind: %v", err)
+	}
+	wantEntries(t, p, d, codeHash, true, true, false)
+}
+
+func TestFinalizeWithoutStagingWritesEntryAndPruneIsHarmless(t *testing.T) {
+	d := types.Address{1}
+	p := newTestPlugin(t)
+	h := types.Hash{0x33}
+	ctx := domain.InputContext{GlobalInputIndex: 5, L1Sender: d}
+	if _, err := p.DecodeInput(ctx, encodeInput(t, codec.DeployFinalizeArgs{CodeHash: h})); err != nil {
+		t.Fatalf("DecodeInput(finalize): %v", err)
+	}
+	if _, _, consumed := deployEntries(t, p, d, h); !consumed {
+		t.Fatal("decode of a finalize wrote no entry")
+	}
+	if err := p.Prune(5); err != nil {
+		t.Fatalf("Prune(5): %v", err)
+	}
+	wantEntries(t, p, d, h, false, false, false)
 }

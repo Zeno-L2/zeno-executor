@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 // wasmFuncType is one declared function type: raw value-type bytes for params and results.

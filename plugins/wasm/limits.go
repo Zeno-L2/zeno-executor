@@ -1,6 +1,6 @@
 package wasm
 
-import "github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+import "github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 
 // Size and structural limits the codec package deliberately omits (the
 // codec enforces only its own encoding bounds). These are the plugin's

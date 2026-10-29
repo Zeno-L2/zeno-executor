@@ -17,10 +17,10 @@ import (
 
 	"github.com/zenon-network/go-zenon/wallet"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/lease"
-	"github.com/digitalSloth/go-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/lease"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
 )
 
 // serveDrainTimeout bounds how long runOnce waits for serve to return after a worker's exit is

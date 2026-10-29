@@ -8,7 +8,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // countingCaps answers a value derived from the key and counts its calls. failFirst, when set,

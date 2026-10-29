@@ -12,7 +12,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // snapshotExt is the extension state.SaveSnapshot gives a snapshot

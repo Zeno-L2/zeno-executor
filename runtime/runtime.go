@@ -16,12 +16,12 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/batch"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/lease"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/batch"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/lease"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 var (

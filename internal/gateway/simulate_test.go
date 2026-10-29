@@ -27,15 +27,15 @@ import (
 	"github.com/zenon-network/go-zenon/common/trie"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/simipc"
-	"github.com/digitalSloth/go-executor/internal/state"
-	"github.com/digitalSloth/go-executor/internal/workerproc"
-	"github.com/digitalSloth/go-executor/plugins/wasm"
-	wasmreader "github.com/digitalSloth/go-executor/plugins/wasm/reader"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/simipc"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm"
+	wasmreader "github.com/Zeno-L2/zeno-executor/plugins/wasm/reader"
 )
 
 var (
@@ -79,8 +79,8 @@ func simBinaries(t *testing.T) string {
 		simBinTest = filepath.Join(dir, "worker")
 		simBinWasm = filepath.Join(dir, "worker-wasm")
 		out, err := exec.Command("go", "build", "-o", dir+string(filepath.Separator),
-			"github.com/digitalSloth/go-executor/internal/testbin/worker",
-			"github.com/digitalSloth/go-executor/cmd/worker-wasm").CombinedOutput()
+			"github.com/Zeno-L2/zeno-executor/internal/testbin/worker",
+			"github.com/Zeno-L2/zeno-executor/cmd/worker-wasm").CombinedOutput()
 		if err != nil {
 			simBinErr = fmt.Errorf("build the simulator binaries: %v\n%s", err, out)
 		}

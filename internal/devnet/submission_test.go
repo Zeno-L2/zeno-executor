@@ -10,10 +10,10 @@ import (
 
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/supervisor"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/supervisor"
 )
 
 // TestSubmissionOnDevnet runs the executor binaries against the devnet and checks that

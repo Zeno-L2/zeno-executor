@@ -5,7 +5,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/vm/constants"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 func TestModuleLimitsMapping(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 )

@@ -9,7 +9,7 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/ipc/ipctest"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc/ipctest"
 )
 
 func addr(b byte) types.Address {

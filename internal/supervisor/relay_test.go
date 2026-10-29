@@ -14,10 +14,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
 )
 
 var relayRecipient = types.Address{0x0A}

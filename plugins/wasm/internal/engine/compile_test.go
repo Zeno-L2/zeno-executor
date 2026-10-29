@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/plugins/wasm/internal/module"
+	"github.com/Zeno-L2/zeno-executor/plugins/wasm/internal/module"
 )
 
 // wasmHeader is the \0asm magic and version 1.

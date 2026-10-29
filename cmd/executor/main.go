@@ -12,11 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/settlement"
-	"github.com/digitalSloth/go-executor/internal/supervisor"
-	"github.com/digitalSloth/go-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/settlement"
+	"github.com/Zeno-L2/zeno-executor/internal/supervisor"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
 )
 
 func main() {

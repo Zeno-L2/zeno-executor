@@ -7,8 +7,8 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
 )
 
 // Assignment implements ledger.AssignmentSource.

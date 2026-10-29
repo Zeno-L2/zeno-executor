@@ -8,10 +8,10 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/ledger"
-	"github.com/digitalSloth/go-executor/internal/ledger/ledgertest"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger"
+	"github.com/Zeno-L2/zeno-executor/internal/ledger/ledgertest"
 )
 
 // This file drives Driver.NextBatch through a real *ledger.Follower (as opposed to the

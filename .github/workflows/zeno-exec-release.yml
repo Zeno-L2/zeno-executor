@@ -6,10 +6,10 @@ on:
 
 env:
   GO_VERSION: "1.23.12"
-  # go.mod replaces go-zenon with ../go-zenon, so the build needs this
+  # go.mod replaces go-zenon with ../../zenon-network/go-zenon, so the build needs this
   # exact commit. Push it to GO_ZENON_REPO before pushing a release tag.
   GO_ZENON_REPO: digitalSloth/go-zenon
-  GO_ZENON_REF: b2fa918366486105691fa970f35ca5ea727f3501
+  GO_ZENON_REF: 938fca3b7787da86827a5eb63371509b36e14761
 
 jobs:
   release:
@@ -20,18 +20,18 @@ jobs:
       attestations: write
     defaults:
       run:
-        working-directory: go-executor
+        working-directory: zeno/zeno-executor
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          path: go-executor
+          path: zeno/zeno-executor
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
           repository: ${{ env.GO_ZENON_REPO }}
           ref: ${{ env.GO_ZENON_REF }}
-          path: go-zenon
+          path: zenon-network/go-zenon
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -42,7 +42,7 @@ jobs:
           scripts/release-zeno-exec.sh "$VERSION"
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: go-executor/dist/zeno-exec-v*/zeno-exec-*
+          subject-path: zeno/zeno-executor/dist/zeno-exec-v*/zeno-exec-*
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}

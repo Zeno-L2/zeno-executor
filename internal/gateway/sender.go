@@ -8,7 +8,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
 )
 
 // SenderSource reads the L1 sender of the send block hashed sendHash,

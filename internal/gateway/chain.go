@@ -24,10 +24,10 @@ import (
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // Status is a served domain's status in zeno_getHead.

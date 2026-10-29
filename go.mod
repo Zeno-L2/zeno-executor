@@ -1,4 +1,4 @@
-module github.com/digitalSloth/go-executor
+module github.com/Zeno-L2/zeno-executor
 
 go 1.23
 
@@ -36,4 +36,4 @@ require (
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
 )
 
-replace github.com/zenon-network/go-zenon => ../go-zenon
+replace github.com/zenon-network/go-zenon => ../../zenon-network/go-zenon

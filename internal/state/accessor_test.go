@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/domain"
 )
 
 // TestAccessorUnreleasedReadsPreStateAcrossApply covers the probeAcc shape

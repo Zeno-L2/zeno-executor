@@ -19,8 +19,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 // tagJSON and headJSON decode zeno_getHead's result.

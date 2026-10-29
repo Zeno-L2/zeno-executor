@@ -5,7 +5,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/trie"
 
-	"github.com/digitalSloth/go-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/domain"
 )
 
 // TestDoubleHashTrap proves a proof this package produces is only valid through the

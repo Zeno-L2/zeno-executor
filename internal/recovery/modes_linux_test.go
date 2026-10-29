@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/digitalSloth/go-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
 )
 
 // TestMain runs the helper modes of TestModesUnderUIDSeparation when this binary is exec'd as a

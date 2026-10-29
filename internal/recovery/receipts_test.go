@@ -6,7 +6,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/common/types"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
 )
 
 func sidecarFor(t *testing.T, inputIndex uint64) (sidecar []byte, root types.Hash) {

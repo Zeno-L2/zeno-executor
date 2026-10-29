@@ -8,8 +8,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/trie"
 
-	"github.com/digitalSloth/go-executor/domain"
-	"github.com/digitalSloth/go-executor/internal/state"
+	"github.com/Zeno-L2/zeno-executor/domain"
+	"github.com/Zeno-L2/zeno-executor/internal/state"
 )
 
 // be8 is the big-endian 8-byte encoding of i, the index every leaf and probe path in this

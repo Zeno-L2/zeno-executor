@@ -13,7 +13,7 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
 )
 
 // keyPath is set with -ldflags "-X main.keyPath=<path>"; "" skips the keyFile attempt.

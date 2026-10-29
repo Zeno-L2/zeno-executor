@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/digitalSloth/go-executor/internal/ipc"
-	"github.com/digitalSloth/go-executor/internal/workerproc"
+	"github.com/Zeno-L2/zeno-executor/internal/ipc"
+	"github.com/Zeno-L2/zeno-executor/internal/workerproc"
 )
 
 func TestPolicyWithDefaults(t *testing.T) {

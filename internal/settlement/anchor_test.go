@@ -13,10 +13,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
-	"github.com/digitalSloth/go-executor/internal/codec"
-	"github.com/digitalSloth/go-executor/internal/recovery"
-	"github.com/digitalSloth/go-executor/internal/znnd"
-	"github.com/digitalSloth/go-executor/internal/znnd/znndtest"
+	"github.com/Zeno-L2/zeno-executor/internal/codec"
+	"github.com/Zeno-L2/zeno-executor/internal/recovery"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd"
+	"github.com/Zeno-L2/zeno-executor/internal/znnd/znndtest"
 )
 
 type fakeBatches struct {
